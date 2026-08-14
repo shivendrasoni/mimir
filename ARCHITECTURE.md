@@ -2,7 +2,7 @@
 
 ## Runtime flow
 
-1. `cli` validates workspace and state roots, resolves typed credentials, and selects a native, migrated custom, or extension-provided model transport.
+1. `cli` validates workspace and state roots, resolves typed credentials, and selects a native, custom, or extension-provided model transport.
 2. `resources` loads context, package, user, project, explicit skill, prompt-template, and theme resources with deterministic precedence.
 3. `runtime` restores the versioned session, persists the user message, and starts a bounded provider/tool loop.
 4. `provider` translates typed messages and tool schemas for OpenAI/Codex, Anthropic, Bedrock, Vertex/Google, Mistral, Cloudflare-routed, and compatible custom transports; catalog limits and compatibility flags shape each request.
@@ -35,7 +35,7 @@
 - Tools are registered explicitly. File operations cannot escape the canonical workspace.
 - Process execution fails closed, requires explicit authority plus an exact non-empty allowlist, rejects compound shell syntax, clears the environment, and uses process groups, timeouts, and bounded output.
 - Internal state rejects symlinked path components and shares path-scoped mutation locks across store instances.
-- Auth and migrated credential files are owner-readable only on Unix.
+- Auth and imported credential files are owner-readable only on Unix.
 - Daemon metadata persists timestamps and lease state but not raw prompt text.
 - Daemon IPC frames are capped at 1 MiB, and shutdown cancels in-flight connection tasks before reporting completion.
 - A corrupt incomplete final JSONL record is recoverable; interior corruption is not silently ignored.

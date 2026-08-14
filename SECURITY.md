@@ -9,7 +9,7 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 - API keys are held in `SecretString`, omitted from request previews, redacted from `Debug`, and never included in diagnostics.
 - `.env` loading is optional convenience; the file is never parsed into logs or persisted state.
 - Provider adapters use TLS, request timeouts, an 8 MiB stream/response ceiling, sanitized errors, and redacted debug output.
-- Anthropic API-key and OAuth bearer authentication are separate typed paths. Migrated custom providers accept only HTTPS or loopback HTTP endpoints and environment-variable credential references.
+- Anthropic API-key and OAuth bearer authentication are separate typed paths. Custom providers accept only HTTPS or loopback HTTP endpoints and environment-variable credential references.
 - File tools canonicalize a workspace root, reject traversal and escaping symlinks, cap reads/writes/searches, and atomically replace writes.
 - Process execution is disabled by default. When enabled, a missing allowlist denies all execution. Matching is exact; `/tmp/cargo` does not match `cargo`. Commands receive direct argv, cleared environment, a fixed PATH, null stdin, bounded combined output, timeout, and process-group termination.
 - State writes use atomic replacement, path-scoped in-process locks, and reject symlinked state components. Credential, daemon-metadata, and session files are mode `0600` on Unix.

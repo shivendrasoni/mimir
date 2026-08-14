@@ -1,6 +1,6 @@
 # Mimir — Rust
 
-A standalone, bounded agentic harness written in safe Rust. This is the migrated implementation of the high-value Mimir runtime: provider adaptation, model/tool loop, workspace tools, durable sessions, context and skill loading, goals, schedules, subagents, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, RLM state, migration helpers, and deterministic offline testing.
+A standalone, bounded agentic runtime written in safe Rust. Mimir combines provider adaptation, model/tool execution, workspace tools, durable sessions, context and skill loading, goals, schedules, subagents, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, RLM state, state migration helpers, and deterministic offline testing.
 
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
@@ -49,9 +49,9 @@ mimir login openai-codex
 printf '%s\n' "$ANTHROPIC_API_KEY" | mimir login anthropic --api-key-stdin
 ```
 
-Inside the TUI, use `/login`; credentials are masked while entered. ChatGPT Codex OAuth uses the native Codex Responses transport. Anthropic is native and distinguishes API-key authentication (`x-api-key`) from OAuth bearer authentication; the two credential types are not interchangeable. Bedrock, Vertex, Google, Mistral, OpenAI-compatible, migrated safe custom providers, and extension-provided transports are selected through the same typed runtime factory.
+Inside the TUI, use `/login`; credentials are masked while entered. ChatGPT Codex OAuth uses the native Codex Responses transport. Anthropic is native and distinguishes API-key authentication (`x-api-key`) from OAuth bearer authentication; the two credential types are not interchangeable. Bedrock, Vertex, Google, Mistral, OpenAI-compatible, safe custom providers, and extension-provided transports are selected through the same typed runtime factory.
 
-Providers that are discovery-only or excluded from this migration fail closed before runtime execution.
+Providers that are discovery-only or unsupported by the selected runtime fail closed before execution.
 
 ## State and management
 
@@ -70,7 +70,7 @@ mimir migrate plan --legacy-root <legacy-state-directory>
 mimir migrate apply --legacy-root <legacy-state-directory>
 # Use the journal_path printed by apply:
 mimir migrate rollback --journal <journal-path>
-mimir goal set "finish the migration" --token-budget 80000
+mimir goal set "finish the next milestone" --token-budget 80000
 mimir goal show
 mimir schedule add heartbeat "continue the goal" --every-seconds 300
 mimir schedule list
@@ -90,4 +90,4 @@ cargo build --release
 cargo audit --deny warnings --no-fetch
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [MIGRATION.md](MIGRATION.md), [SECURITY.md](SECURITY.md), and [BENCHMARKS.md](BENCHMARKS.md). The legacy TypeScript tree is intentionally unchanged.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [MIGRATION.md](MIGRATION.md), [SECURITY.md](SECURITY.md), and [BENCHMARKS.md](BENCHMARKS.md).

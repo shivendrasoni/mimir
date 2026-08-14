@@ -1,6 +1,6 @@
 # Performance evidence
 
-Benchmarks are captured from the release binary on the migration machine after all quality gates pass. Reproduce with:
+Benchmarks are captured from the release binary on the benchmark machine after all quality gates pass. Reproduce with:
 
 ```bash
 cargo build --release

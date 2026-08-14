@@ -90,4 +90,4 @@ cargo build --release
 cargo audit --deny warnings --no-fetch
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [MIGRATION.md](MIGRATION.md), [SECURITY.md](SECURITY.md), and [BENCHMARKS.md](BENCHMARKS.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md), [STATE-MIGRATION.md](STATE-MIGRATION.md), [SECURITY.md](SECURITY.md), and [BENCHMARKS.md](BENCHMARKS.md).

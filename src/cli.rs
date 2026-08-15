@@ -2639,20 +2639,22 @@ async fn write_output_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 async fn safe_output_path(path: &Path) -> Result<PathBuf> {
-    let mut absolute = if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
         std::env::current_dir()?.join(path)
     };
     #[cfg(target_os = "macos")]
-    {
+    let absolute = {
+        let mut absolute = absolute;
         for (alias, canonical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
             if let Ok(relative) = absolute.strip_prefix(alias) {
                 absolute = Path::new(canonical).join(relative);
                 break;
             }
         }
-    }
+        absolute
+    };
     if absolute.components().any(|component| {
         matches!(
             component,

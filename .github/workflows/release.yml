@@ -59,6 +59,7 @@ jobs:
             runner: windows-latest
             archive: zip
     runs-on: ${{ matrix.runner }}
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -102,9 +103,23 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [verify, build]
+    if: ${{ always() && needs.verify.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Require at least one successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          artifact_count="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("release-")) | select(.expired == false)] | length')"
+          if [[ "$artifact_count" -eq 0 ]]; then
+            echo "All release targets failed; no release artifacts were uploaded."
+            exit 1
+          fi
+          echo "Found $artifact_count successful release artifact(s)."
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*

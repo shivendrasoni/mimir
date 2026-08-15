@@ -13,6 +13,29 @@ cargo build --release
 
 The binary is `target/release/mimir`.
 
+## Releases and installation
+
+Pushing a version tag such as `v0.1.0` starts the release workflow. It verifies the tag against the version in `Cargo.toml`, builds native binaries for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64, and publishes archives with SHA-256 checksums on the GitHub Releases page.
+
+Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
+
+```bash
+version=v0.1.0
+curl -fL "https://github.com/shivendrasoni/mimir/releases/latest/download/mimir-${version}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mimir.tar.gz
+tar -xzf /tmp/mimir.tar.gz -C /tmp
+mkdir -p "$HOME/.local/bin"
+install -m 755 /tmp/mimir "$HOME/.local/bin/mimir"
+```
+
+On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. On Windows, download the `x86_64-pc-windows-msvc.zip` archive, extract `mimir.exe`, and add its directory to `PATH`.
+
+To publish a release, update the package version, commit it, and push the matching tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Quick start
 
 ```bash

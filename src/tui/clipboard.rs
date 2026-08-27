@@ -1,5 +1,6 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::{
@@ -7,7 +8,10 @@ use crate::{
     runtime::AgentRuntime,
 };
 
+use super::ImageAttachment;
+
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,93 @@ pub(super) async fn copy_last_assistant_message(runtime: &AgentRuntime) -> Resul
         "Copied the last agent message ({} characters)",
         text.chars().count()
     ))
+}
+
+/// Reads a PNG image from the native clipboard without invoking a shell.
+///
+/// Text clipboard contents return `Ok(None)` so bracketed terminal paste can
+/// continue through the normal input path.
+pub(super) async fn read_image() -> Result<Option<ImageAttachment>> {
+    let Some((bytes, mime_type)) = read_platform_image().await? else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(MimirError::Configuration(format!(
+            "clipboard image exceeds the {MAX_CLIPBOARD_IMAGE_BYTES}-byte limit"
+        )));
+    }
+    Ok(Some(ImageAttachment {
+        byte_size: bytes.len(),
+        data: BASE64.encode(bytes),
+        mime_type,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+async fn read_platform_image() -> Result<Option<(Vec<u8>, String)>> {
+    const SCRIPT: &str = r#"try
+return the clipboard as «class PNGf»
+on error
+return "NO_IMAGE"
+end try"#;
+    let output = tokio::time::timeout(
+        CLIPBOARD_TIMEOUT,
+        Command::new("/usr/bin/osascript")
+            .args(["-e", SCRIPT])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| MimirError::Configuration("clipboard image read timed out".into()))??;
+    let descriptor = String::from_utf8_lossy(&output.stdout);
+    let descriptor = descriptor.trim();
+    if output.status.success() && descriptor == "NO_IMAGE" {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(MimirError::Configuration(format!(
+            "failed to read clipboard image: {}",
+            detail.trim()
+        )));
+    }
+    let bytes = decode_macos_png_descriptor(descriptor)?;
+    Ok(Some((bytes, "image/png".into())))
+}
+
+#[cfg(target_os = "macos")]
+fn decode_macos_png_descriptor(descriptor: &str) -> Result<Vec<u8>> {
+    let hex = descriptor
+        .strip_prefix("«data PNGf")
+        .and_then(|value| value.strip_suffix('»'))
+        .ok_or_else(|| {
+            MimirError::Configuration("clipboard returned an invalid PNG descriptor".into())
+        })?;
+    if hex.len() / 2 > MAX_CLIPBOARD_IMAGE_BYTES || hex.len() % 2 != 0 {
+        return Err(MimirError::Configuration(
+            "clipboard image descriptor is invalid or too large".into(),
+        ));
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|error| {
+                MimirError::Configuration(format!("clipboard image is not valid hex: {error}"))
+            })?;
+            u8::from_str_radix(pair, 16).map_err(|error| {
+                MimirError::Configuration(format!("clipboard image is not valid hex: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn read_platform_image() -> Result<Option<(Vec<u8>, String)>> {
+    Ok(None)
 }
 
 async fn copy_text(text: &str) -> Result<()> {
@@ -151,5 +242,13 @@ mod tests {
             .await
             .expect_err("oversized clipboard payload");
         assert!(error.to_string().contains("1048576-byte limit"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_png_clipboard_descriptor_decodes_without_a_shell_or_temp_file() {
+        let bytes =
+            decode_macos_png_descriptor("«data PNGf89504E470D0A1A0A»").expect("PNG descriptor");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
     }
 }

@@ -10,7 +10,10 @@ use std::{
 use async_trait::async_trait;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode as CrosstermKeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode as CrosstermKeyCode,
+        KeyEventKind, KeyModifiers,
+    },
     execute, queue,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -22,7 +25,7 @@ use crate::{
     auth::{AuthStore, DeviceAuthorization, OAuthProvider, PendingOAuth},
     error::Result,
     mcp::{McpAuthCoordinator, McpOAuthAuthorization, McpOAuthClient, McpOAuthCodeReceiver},
-    model::{Content, Role},
+    model::{Content, Message, Role},
     orchestration::{
         GoalStatus, GoalStore, HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule,
         ScheduleStore,
@@ -33,7 +36,7 @@ use crate::{
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     session_compat::{ReferenceSessionMetadata, export_jsonl, import_jsonl},
     session_tree::{SessionBranchCatalog, SessionNodeKind},
-    tools::BashResult,
+    tools::{BashResult, ObservationStatus},
 };
 use uuid::Uuid;
 
@@ -41,7 +44,8 @@ use super::{
     App, AppConfig, AppPreferenceState, AutonomousLimits, AutonomousState, KeyCode, KeyEvent,
     RenderOptions, SideQuestionSession, StreamEvent, TerminalCapabilities, TerminalSize,
     TreeFilterMode, TuiAction, TuiResourceSnapshot, UiRequest,
-    autonomous::apply_autonomous_command, clipboard::copy_last_assistant_message,
+    autonomous::apply_autonomous_command,
+    clipboard::{copy_last_assistant_message, read_image as read_clipboard_image},
     side_question::ask_side_question,
 };
 
@@ -188,18 +192,33 @@ impl McpOAuthCodeReceiver for TerminalMcpOAuthReceiver {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Hide
+        )?;
         Ok(Self { fullscreen: true })
     }
 
     fn suspend() -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), Show, LeaveAlternateScreen)
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            Show,
+            LeaveAlternateScreen
+        )
     }
 
     fn resume() -> io::Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            Hide
+        )
     }
 
     fn set_fullscreen(&mut self, enabled: bool) -> io::Result<()> {
@@ -227,7 +246,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            Show,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -320,6 +344,29 @@ pub trait TuiRuntimeFactory: Send + Sync {
 #[async_trait]
 impl EventSink for TuiSink {
     async fn emit(&self, event: RuntimeEvent) {
+        if let RuntimeEvent::MessageCompleted { message } = &event {
+            let mut state = self
+                .app
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for content in &message.content {
+                match content {
+                    Content::Thinking {
+                        text,
+                        redacted: false,
+                        ..
+                    } => state.apply_stream_event(StreamEvent::Thinking(text.clone())),
+                    Content::Image { mime_type, .. } => {
+                        state.apply_stream_event(StreamEvent::Images(vec![mime_type.clone()]));
+                    }
+                    Content::Text { .. }
+                    | Content::Thinking { .. }
+                    | Content::ToolCall(_)
+                    | Content::ToolResult(_) => {}
+                }
+            }
+            return;
+        }
         let event = match event {
             RuntimeEvent::RunStarted => Some(StreamEvent::RunStarted),
             RuntimeEvent::TextDelta { text } => Some(StreamEvent::TextDelta(text)),
@@ -344,29 +391,17 @@ impl EventSink for TuiSink {
             }),
             RuntimeEvent::Completed { text } => Some(StreamEvent::Completed(text)),
             RuntimeEvent::Failed { message } => Some(StreamEvent::Failed(message)),
-            RuntimeEvent::MessageCompleted { message } => {
-                let mime_types = message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Image { mime_type, .. } => Some(mime_type.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                (!mime_types.is_empty()).then_some(StreamEvent::Images(mime_types))
-            }
-            RuntimeEvent::ProviderRequest { turn } => Some(StreamEvent::Progress(format!(
-                "provider turn {turn} started"
-            ))),
+            RuntimeEvent::ProviderRequest { .. } => Some(StreamEvent::Activity("Thinking…".into())),
             RuntimeEvent::ToolStarted { name, .. } => {
-                Some(StreamEvent::Progress(format!("tool {name} started")))
+                Some(StreamEvent::Activity(tool_activity(&name)))
             }
             RuntimeEvent::ToolFinished {
                 name, observation, ..
-            } => Some(StreamEvent::Progress(format!(
-                "tool {name} finished: {}",
-                observation.summary
-            ))),
+            } => Some(StreamEvent::ToolFinished {
+                name,
+                summary: observation.summary,
+                failed: observation.status == ObservationStatus::Error,
+            }),
             RuntimeEvent::ExtensionError {
                 extension_path,
                 event,
@@ -380,10 +415,9 @@ impl EventSink for TuiSink {
             RuntimeEvent::ExtensionRendered { custom_type, lines } => {
                 Some(StreamEvent::ExtensionRendered { custom_type, lines })
             }
-            RuntimeEvent::SessionEvent { event } => Some(StreamEvent::SessionMetadata {
-                summary: summarize_session_event(&event),
-            }),
-            RuntimeEvent::MessageStarted { .. }
+            RuntimeEvent::MessageCompleted { .. }
+            | RuntimeEvent::SessionEvent { .. }
+            | RuntimeEvent::MessageStarted { .. }
             | RuntimeEvent::TurnCompleted { .. }
             | RuntimeEvent::ToolUpdated { .. } => None,
         };
@@ -396,8 +430,21 @@ impl EventSink for TuiSink {
     }
 }
 
+fn tool_activity(name: &str) -> String {
+    match name {
+        "read_file" | "read" => "Reading files…".into(),
+        "list_files" | "glob" => "Exploring files…".into(),
+        "search" | "grep" => "Searching the codebase…".into(),
+        "write_file" | "edit_file" | "apply_patch" => "Editing files…".into(),
+        "bash" | "process" | "exec" => "Running a command…".into(),
+        other => format!("Using {}…", other.replace('_', " ")),
+    }
+}
+
+#[cfg(test)]
 const MAX_SESSION_EVENT_FIELD_CHARS: usize = 128;
 
+#[cfg(test)]
 fn summarize_session_event(event: &serde_json::Value) -> String {
     let Some(object) = event.as_object() else {
         return "session event: non-object metadata".into();
@@ -432,6 +479,7 @@ fn summarize_session_event(event: &serde_json::Value) -> String {
     format!("session event: {}", details.join(" "))
 }
 
+#[cfg(test)]
 fn bounded_session_event_string(value: Option<&serde_json::Value>) -> Option<String> {
     value
         .and_then(serde_json::Value::as_str)
@@ -567,9 +615,36 @@ pub async fn run_tui_with_autonomous(
         .await
         .map_err(|error| io::Error::other(error.to_string()))??;
 
+        if let Some(Event::Paste(text)) = terminal_event.as_ref() {
+            app.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_text(text);
+            continue;
+        }
+
         if let Some(Event::Key(key)) = terminal_event
             && key.kind != KeyEventKind::Release
         {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, CrosstermKeyCode::Char('v' | 'V'))
+            {
+                match read_clipboard_image().await {
+                    Ok(Some(image)) => {
+                        let mut state = app
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Err(error) = state.attach_image(image) {
+                            state.push_warning_message(error);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => app
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_warning_message(format!("Could not attach clipboard image: {error}")),
+                }
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, CrosstermKeyCode::Char('c'))
             {
@@ -594,7 +669,7 @@ pub async fn run_tui_with_autonomous(
                 return Ok(());
             }
             if let Some(key) = convert_key(key) {
-                let (prompt, ui_request, tui_action, selected_model, selected_session) = {
+                let (prompt, images, ui_request, tui_action, selected_model, selected_session) = {
                     let mut state = app
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -603,8 +678,14 @@ pub async fn run_tui_with_autonomous(
                     if prompt.is_some() {
                         state.clear_pending_submission();
                     }
+                    let images = if prompt.is_some() {
+                        state.take_submitted_images()
+                    } else {
+                        Vec::new()
+                    };
                     (
                         prompt,
+                        images,
                         state.take_ui_request(),
                         state.take_tui_action(),
                         state.selected_model().map(str::to_owned),
@@ -671,10 +752,10 @@ pub async fn run_tui_with_autonomous(
                         let mut state = app
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match state.queue_follow_up(prompt.clone()) {
+                        match state.queue_follow_up_with_images(prompt.clone(), images.clone()) {
                             Ok(()) => {
                                 let follow_up_mode = state.follow_up_mode().as_str().to_owned();
-                                state.push_user_message(&prompt);
+                                state.push_user_submission(&prompt, images.len());
                                 state.push_system_message(format!(
                                     "Follow-up queued ({follow_up_mode})"
                                 ));
@@ -723,12 +804,13 @@ pub async fn run_tui_with_autonomous(
                         .set_run_active(true);
                     app.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push_user_message(&prompt);
+                        .push_user_submission(&prompt, images.len());
+                    let message = user_message(&prompt, images);
                     let runtime = runtime.clone();
                     let app_for_run = app.clone();
                     let autonomous = autonomous.clone();
                     tokio::spawn(async move {
-                        run_tui_prompt_loop(runtime, app_for_run, autonomous, prompt).await;
+                        run_tui_prompt_loop(runtime, app_for_run, autonomous, message).await;
                     });
                 }
                 if let Some(request) = ui_request {
@@ -838,17 +920,21 @@ async fn run_tui_prompt_loop(
     runtime: Arc<AgentRuntime>,
     app: Arc<Mutex<App>>,
     autonomous: Arc<Mutex<AutonomousState>>,
-    prompt: String,
+    message: Message,
 ) {
     let generation = autonomous
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .begin_run(Instant::now());
-    let mut next_prompts = vec![prompt];
+    let mut next_messages = vec![message];
     loop {
         let before = runtime.messages_snapshot().await.len();
         let sink = TuiSink { app: app.clone() };
-        if runtime.run_batch(&next_prompts, &sink).await.is_err() {
+        if runtime
+            .run_batch_messages(&next_messages, &sink)
+            .await
+            .is_err()
+        {
             app.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_run_active(false);
@@ -876,15 +962,18 @@ async fn run_tui_prompt_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.push_system_message("Autonomous continuation started");
             state.push_user_message(&continuation);
-            next_prompts = vec![continuation];
+            next_messages = vec![Message::user(continuation)];
             continue;
         }
         let follow_ups = app
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_next_follow_ups();
+            .take_next_follow_up_messages();
         if !follow_ups.is_empty() {
-            next_prompts = follow_ups;
+            next_messages = follow_ups
+                .into_iter()
+                .map(|(prompt, images)| user_message(&prompt, images))
+                .collect();
             continue;
         }
         if let Some(status) = status {
@@ -897,6 +986,20 @@ async fn run_tui_prompt_loop(
             .set_run_active(false);
         return;
     }
+}
+
+fn user_message(prompt: &str, images: Vec<super::ImageAttachment>) -> Message {
+    let mut content = Vec::with_capacity(images.len().saturating_add(1));
+    if !prompt.trim().is_empty() {
+        content.push(Content::Text {
+            text: prompt.trim().to_owned(),
+        });
+    }
+    content.extend(images.into_iter().map(|image| Content::Image {
+        data: image.data,
+        mime_type: image.mime_type,
+    }));
+    Message::user_content(content)
 }
 
 #[allow(
@@ -2972,7 +3075,7 @@ fn render_frame(app: &Arc<Mutex<App>>, frame_cache: &mut TerminalFrameCache) -> 
 
 fn prompt_cursor_x(width: usize, padding: usize, cursor_chars: usize) -> usize {
     padding
-        .saturating_add("Prompt: ".len())
+        .saturating_add("❯ ".chars().count())
         .saturating_add(cursor_chars)
         % width.max(1)
 }
@@ -3052,8 +3155,8 @@ mod local_command_tests {
 
     #[test]
     fn hardware_cursor_column_tracks_wrapped_prompt_text() {
-        assert_eq!(prompt_cursor_x(10, 3, 0), 1);
-        assert_eq!(prompt_cursor_x(10, 3, 15), 6);
+        assert_eq!(prompt_cursor_x(10, 3, 0), 5);
+        assert_eq!(prompt_cursor_x(10, 3, 15), 0);
         assert_eq!(prompt_cursor_x(0, 3, 15), 0);
     }
 
@@ -3246,12 +3349,27 @@ mod local_command_tests {
             runtime,
             app,
             Arc::new(Mutex::new(AutonomousState::default())),
-            "initial".into(),
+            user_message(
+                "initial",
+                vec![crate::tui::ImageAttachment {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                    byte_size: 5,
+                }],
+            ),
         )
         .await;
 
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 2);
+        assert!(requests[0].messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::Image { mime_type, .. } if mime_type == "image/png"
+                )
+            })
+        }));
         let user_texts = requests[1]
             .messages
             .iter()

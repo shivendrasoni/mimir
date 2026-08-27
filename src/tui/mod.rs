@@ -11,8 +11,8 @@ mod term;
 
 pub use actions::TuiAction;
 pub use app::{
-    App, AppConfig, AppPreferenceState, Overlay, OverlayKind, SelectorOverlay, StreamEvent,
-    ThemeName, TranscriptEntry, TreeFilterMode, TuiResourceSnapshot, UiRequest,
+    App, AppConfig, AppPreferenceState, ImageAttachment, Overlay, OverlayKind, SelectorOverlay,
+    StreamEvent, ThemeName, TranscriptEntry, TreeFilterMode, TuiResourceSnapshot, UiRequest,
 };
 pub use autonomous::{
     AutonomousGateCommand, AutonomousLimitReason, AutonomousLimits, AutonomousState,

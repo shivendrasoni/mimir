@@ -212,6 +212,7 @@ pub enum UiRequest {
 pub enum StreamEvent {
     RunStarted,
     TextDelta(String),
+    Thinking(String),
     RetryStarted {
         attempt: u32,
         max_attempts: u32,
@@ -236,7 +237,12 @@ pub enum StreamEvent {
         summary: String,
     },
     Images(Vec<String>),
-    Progress(String),
+    Activity(String),
+    ToolFinished {
+        name: String,
+        summary: String,
+        failed: bool,
+    },
     Warning(String),
     BashStarted {
         command: String,
@@ -257,7 +263,11 @@ pub enum StreamEvent {
 pub enum TranscriptRole {
     User,
     Assistant,
+    Thinking,
+    Tool,
     System,
+    Warning,
+    Error,
 }
 
 impl TranscriptRole {
@@ -266,9 +276,26 @@ impl TranscriptRole {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Thinking => "thinking",
+            Self::Tool => "tool",
             Self::System => "system",
+            Self::Warning => "warning",
+            Self::Error => "error",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub data: String,
+    pub mime_type: String,
+    pub byte_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPrompt {
+    text: String,
+    images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +378,9 @@ pub struct App {
     overlay: Overlay,
     transcript: Vec<TranscriptEntry>,
     active_assistant: Option<String>,
+    current_activity: Option<String>,
+    pending_images: Vec<ImageAttachment>,
+    submitted_images: Vec<ImageAttachment>,
     run_active: bool,
     bash_active: bool,
     selected_model: Option<String>,
@@ -363,7 +393,7 @@ pub struct App {
     heartbeat_entries: Vec<(Uuid, String, bool)>,
     heartbeat_target: Option<(Uuid, String, bool)>,
     extension_commands: Vec<String>,
-    follow_ups: VecDeque<String>,
+    follow_ups: VecDeque<QueuedPrompt>,
     resource_snapshot: TuiResourceSnapshot,
     preferences: AppPreferenceState,
     bindings: Vec<InputBinding>,
@@ -385,6 +415,9 @@ impl App {
             overlay: Overlay::None,
             transcript: Vec::new(),
             active_assistant: None,
+            current_activity: None,
+            pending_images: Vec::new(),
+            submitted_images: Vec::new(),
             run_active: false,
             bash_active: false,
             selected_model: None,
@@ -419,6 +452,10 @@ impl App {
         self.pending_submission = None;
     }
 
+    pub fn take_submitted_images(&mut self) -> Vec<ImageAttachment> {
+        std::mem::take(&mut self.submitted_images)
+    }
+
     pub fn take_ui_request(&mut self) -> Option<UiRequest> {
         self.pending_ui_request.take()
     }
@@ -434,9 +471,51 @@ impl App {
         });
     }
 
+    pub fn push_warning_message(&mut self, text: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            role: TranscriptRole::Warning,
+            text: text.into(),
+        });
+    }
+
     pub fn set_prompt(&mut self, text: impl Into<String>) {
         self.prompt = text.into();
         self.cursor_chars = self.prompt.chars().count();
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        let byte = byte_index(&self.prompt, self.cursor_chars);
+        self.prompt.insert_str(byte, text);
+        self.cursor_chars = self.cursor_chars.saturating_add(text.chars().count());
+    }
+
+    /// Adds one bounded image to the current composer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the per-prompt count or decoded-byte limit is exceeded.
+    pub fn attach_image(&mut self, image: ImageAttachment) -> Result<(), &'static str> {
+        const MAX_IMAGES: usize = 4;
+        const MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+        if self.pending_images.len() >= MAX_IMAGES {
+            return Err("A prompt can contain at most 4 images");
+        }
+        let total = self
+            .pending_images
+            .iter()
+            .map(|image| image.byte_size)
+            .sum::<usize>()
+            .saturating_add(image.byte_size);
+        if total > MAX_TOTAL_BYTES {
+            return Err("Prompt images exceed the 20 MiB limit");
+        }
+        self.pending_images.push(image);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn pending_images(&self) -> &[ImageAttachment] {
+        &self.pending_images
     }
 
     pub fn open_fork_selector(&mut self, options: Vec<(Uuid, String)>) {
@@ -548,6 +627,11 @@ impl App {
     }
 
     #[must_use]
+    pub fn current_activity(&self) -> Option<&str> {
+        self.current_activity.as_deref()
+    }
+
+    #[must_use]
     pub const fn run_active(&self) -> bool {
         self.run_active
     }
@@ -655,22 +739,49 @@ impl App {
     ///
     /// Returns an error for blank input or when the 64-message queue is full.
     pub fn queue_follow_up(&mut self, prompt: impl Into<String>) -> Result<(), &'static str> {
+        self.queue_follow_up_with_images(prompt, Vec::new())
+    }
+
+    pub(crate) fn queue_follow_up_with_images(
+        &mut self,
+        prompt: impl Into<String>,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), &'static str> {
         let prompt = prompt.into();
-        if prompt.trim().is_empty() {
+        if prompt.trim().is_empty() && images.is_empty() {
             return Err("follow-up must not be blank");
         }
         if self.follow_ups.len() >= 64 {
             return Err("follow-up queue reached its 64-message limit");
         }
-        self.follow_ups.push_back(prompt);
+        self.follow_ups.push_back(QueuedPrompt {
+            text: prompt,
+            images,
+        });
         Ok(())
     }
 
     /// Drains one or all queued follow-ups according to the selected mode.
     pub fn take_next_follow_ups(&mut self) -> Vec<String> {
+        self.take_next_follow_up_messages()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    pub(crate) fn take_next_follow_up_messages(&mut self) -> Vec<(String, Vec<ImageAttachment>)> {
         match self.preferences.follow_up_mode {
-            QueueMode::All => self.follow_ups.drain(..).collect(),
-            QueueMode::OneAtATime => self.follow_ups.pop_front().into_iter().collect(),
+            QueueMode::All => self
+                .follow_ups
+                .drain(..)
+                .map(|queued| (queued.text, queued.images))
+                .collect(),
+            QueueMode::OneAtATime => self
+                .follow_ups
+                .pop_front()
+                .map(|queued| (queued.text, queued.images))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -810,6 +921,21 @@ impl App {
             role: TranscriptRole::User,
             text: text.into(),
         });
+    }
+
+    pub(crate) fn push_user_submission(&mut self, text: &str, image_count: usize) {
+        let image_label = match image_count {
+            0 => String::new(),
+            1 => "▣ 1 image".into(),
+            count => format!("▣ {count} images"),
+        };
+        let display = match (text.trim().is_empty(), image_label.is_empty()) {
+            (false, false) => format!("{}\n{image_label}", text.trim()),
+            (false, true) => text.trim().to_owned(),
+            (true, false) => image_label,
+            (true, true) => String::new(),
+        };
+        self.push_user_message(display);
     }
 
     pub fn open_overlay(&mut self, kind: OverlayKind) {
@@ -994,11 +1120,22 @@ impl App {
     )]
     pub fn apply_stream_event(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::RunStarted => {}
+            StreamEvent::RunStarted => {
+                self.current_activity = Some("Thinking…".into());
+            }
             StreamEvent::TextDelta(text) => {
+                self.current_activity = Some("Writing…".into());
                 self.active_assistant
                     .get_or_insert_with(String::new)
                     .push_str(&text);
+            }
+            StreamEvent::Thinking(text) => {
+                if let Some(summary) = compact_thinking(&text) {
+                    self.transcript.push(TranscriptEntry {
+                        role: TranscriptRole::Thinking,
+                        text: summary,
+                    });
+                }
             }
             StreamEvent::RetryStarted {
                 attempt,
@@ -1006,12 +1143,9 @@ impl App {
                 delay_ms,
             } => {
                 if self.preferences.show_terminal_progress {
-                    self.transcript.push(TranscriptEntry {
-                        role: TranscriptRole::System,
-                        text: format!(
-                            "retrying provider request {attempt}/{max_attempts} in {delay_ms} ms"
-                        ),
-                    });
+                    self.current_activity = Some(format!(
+                        "Retrying request {attempt}/{max_attempts} in {delay_ms} ms…"
+                    ));
                 }
             }
             StreamEvent::RetryFinished {
@@ -1020,20 +1154,22 @@ impl App {
                 final_error,
             } => {
                 if self.preferences.show_terminal_progress {
-                    self.transcript.push(TranscriptEntry {
-                        role: TranscriptRole::System,
-                        text: if success {
-                            format!("provider retry {attempt} succeeded")
-                        } else {
-                            format!(
-                                "provider retry {attempt} failed: {}",
+                    if success {
+                        self.current_activity =
+                            Some(format!("Request recovered on attempt {attempt}"));
+                    } else {
+                        self.transcript.push(TranscriptEntry {
+                            role: TranscriptRole::Warning,
+                            text: format!(
+                                "Request retry {attempt} failed: {}",
                                 final_error.unwrap_or_else(|| "unknown error".into())
-                            )
-                        },
-                    });
+                            ),
+                        });
+                    }
                 }
             }
             StreamEvent::Completed(text) => {
+                self.current_activity = None;
                 let final_text = if text.is_empty() {
                     self.active_assistant.take().unwrap_or_default()
                 } else {
@@ -1049,9 +1185,10 @@ impl App {
             }
             StreamEvent::Failed(message) => {
                 self.active_assistant = None;
+                self.current_activity = None;
                 self.transcript.push(TranscriptEntry {
-                    role: TranscriptRole::System,
-                    text: format!("error: {message}"),
+                    role: TranscriptRole::Error,
+                    text: message,
                 });
             }
             StreamEvent::ExtensionUi { extension, request } => {
@@ -1091,18 +1228,30 @@ impl App {
                     text,
                 });
             }
-            StreamEvent::Progress(text) => {
+            StreamEvent::Activity(text) => {
                 if self.preferences.show_terminal_progress {
-                    self.transcript.push(TranscriptEntry {
-                        role: TranscriptRole::System,
-                        text,
-                    });
+                    self.current_activity = Some(text);
                 }
+            }
+            StreamEvent::ToolFinished {
+                name,
+                summary,
+                failed,
+            } => {
+                self.current_activity = Some("Thinking…".into());
+                self.transcript.push(TranscriptEntry {
+                    role: if failed {
+                        TranscriptRole::Warning
+                    } else {
+                        TranscriptRole::Tool
+                    },
+                    text: format!("{} · {summary}", humanize_tool_name(&name)),
+                });
             }
             StreamEvent::Warning(text) => {
                 if self.preferences.show_warnings {
                     self.transcript.push(TranscriptEntry {
-                        role: TranscriptRole::System,
+                        role: TranscriptRole::Warning,
                         text,
                     });
                 }
@@ -1274,10 +1423,12 @@ impl App {
         self.history_index = None;
         self.history_draft = None;
         let trimmed = prompt.trim().to_owned();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && self.pending_images.is_empty() {
             return;
         }
-        self.history.push(trimmed.clone());
+        if !trimmed.is_empty() {
+            self.history.push(trimmed.clone());
+        }
         if let Some(rest) = trimmed.strip_prefix('/') {
             let split = rest.find(char::is_whitespace).unwrap_or(rest.len());
             let name = &rest[..split];
@@ -1297,10 +1448,12 @@ impl App {
             self.handle_slash_command(command);
             return;
         }
-        self.pending_submission = Some(expand_prompt_template(
-            &trimmed,
-            &self.resource_snapshot.prompt_templates,
-        ));
+        self.submitted_images = std::mem::take(&mut self.pending_images);
+        self.pending_submission = Some(if trimmed.is_empty() {
+            String::new()
+        } else {
+            expand_prompt_template(&trimmed, &self.resource_snapshot.prompt_templates)
+        });
     }
 
     #[allow(
@@ -1805,6 +1958,31 @@ impl App {
         let end = byte_index(&self.prompt, self.cursor_chars + 1);
         self.prompt.replace_range(start..end, "");
     }
+}
+
+fn humanize_tool_name(name: &str) -> String {
+    name.replace('_', " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_thinking(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut summary = normalized.chars().take(240).collect::<String>();
+    if normalized.chars().count() > 240 {
+        summary.push('…');
+    }
+    Some(summary)
 }
 
 const fn on_off(enabled: bool) -> &'static str {

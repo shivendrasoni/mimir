@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::{App, Overlay, ThemeName, term::TerminalCapabilities};
+use super::{App, Overlay, ThemeName, app::TranscriptRole, term::TerminalCapabilities};
 
 #[derive(Debug, Clone, Copy)]
 struct Rgb(u8, u8, u8);
@@ -11,7 +11,10 @@ struct Palette {
     muted: Rgb,
     user: Rgb,
     assistant: Rgb,
+    thinking: Rgb,
+    tool: Rgb,
     system: Rgb,
+    error: Rgb,
     prompt: Rgb,
 }
 
@@ -22,7 +25,10 @@ impl Palette {
             muted: Rgb(148, 163, 184),
             user: Rgb(125, 211, 252),
             assistant: Rgb(134, 239, 172),
+            thinking: Rgb(167, 139, 250),
+            tool: Rgb(148, 163, 184),
             system: Rgb(251, 191, 36),
+            error: Rgb(248, 113, 113),
             prompt: Rgb(196, 181, 253),
         }
     }
@@ -33,7 +39,10 @@ impl Palette {
             muted: Rgb(71, 85, 105),
             user: Rgb(3, 105, 161),
             assistant: Rgb(21, 128, 61),
+            thinking: Rgb(109, 40, 217),
+            tool: Rgb(71, 85, 105),
             system: Rgb(180, 83, 9),
+            error: Rgb(185, 28, 28),
             prompt: Rgb(109, 40, 217),
         }
     }
@@ -51,44 +60,87 @@ pub struct RenderOptions {
 }
 
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the renderer keeps one explicit top-to-bottom terminal layout pipeline"
+)]
 pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     if size.width == 0 || size.height == 0 {
         return String::new();
     }
+    let rule = "─".repeat(size.width.min(120));
     let mut lines = vec![
-        format!("Mimir Rust TUI [{}]", app.theme_label()),
+        "◆ Mimir".into(),
         format!(
-            "Model: {} | Effort: {} | Session: {}",
-            app.selected_model().unwrap_or("unset"),
+            "  {}  ·  {} effort  ·  {} session",
+            app.selected_model().unwrap_or("select a model"),
             app.selected_effort().as_str(),
             app.selected_session().unwrap_or("default")
         ),
+        rule.clone(),
         String::new(),
     ];
 
-    let transcript_budget = size.height.saturating_sub(3);
-    let transcript_start = app.transcript().len().saturating_sub(transcript_budget);
+    let transcript_start = app.transcript().len().saturating_sub(size.height);
     for entry in &app.transcript()[transcript_start..] {
-        lines.push(format!("{}> {}", entry.role.label(), entry.text));
+        let prefix = match entry.role {
+            TranscriptRole::User => "❯",
+            TranscriptRole::Assistant => "●",
+            TranscriptRole::Thinking => "✦ Thinking ·",
+            TranscriptRole::Tool => "  └",
+            TranscriptRole::System => "•",
+            TranscriptRole::Warning => "▲",
+            TranscriptRole::Error => "✕",
+        };
+        lines.push(format!("{prefix} {}", entry.text));
+        lines.push(String::new());
     }
 
     if let Some(active) = app.active_assistant_text() {
-        lines.push(format!("assistant…> {active}"));
+        lines.push(format!("● {active}"));
     }
 
     append_overlay(app, &mut lines);
 
-    lines.push(String::new());
-    let prompt = format!(
-        "{}Prompt: {}",
+    let mut composer = Vec::new();
+    if let Some(activity) = app.current_activity() {
+        composer.push(format!("✦ {activity}"));
+    } else if app.run_active() {
+        composer.push("✦ Working…".into());
+    }
+    if !app.pending_images().is_empty() {
+        let bytes = app
+            .pending_images()
+            .iter()
+            .map(|image| image.byte_size)
+            .sum::<usize>();
+        composer.push(format!(
+            "▣ {} image{} attached · {}",
+            app.pending_images().len(),
+            if app.pending_images().len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            human_bytes(bytes)
+        ));
+    }
+    composer.push(rule);
+    composer.push(format!(
+        "{} · {} · /help  ·  ctrl+v attach image  ·  ctrl+c interrupt",
+        app.selected_model().unwrap_or("model unset"),
+        app.selected_effort().as_str()
+    ));
+    composer.push(format!(
+        "{}❯ {}",
         " ".repeat(usize::from(app.editor_padding_x())),
         app.prompt()
-    );
+    ));
 
     let wrapped = wrap_lines(&lines, size.width);
-    let prompt_lines = wrap_lines(&[prompt], size.width);
-    let prompt_height = prompt_lines.len().min(size.height);
-    let content_height = size.height.saturating_sub(prompt_height);
+    let composer_lines = wrap_lines(&composer, size.width);
+    let composer_height = composer_lines.len().min(size.height);
+    let content_height = size.height.saturating_sub(composer_height);
     let visible_content = if wrapped.len() > content_height {
         wrapped[wrapped.len() - content_height..].to_vec()
     } else {
@@ -100,14 +152,15 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
         String::new(),
         content_height.saturating_sub(visible.len()),
     ));
-    let prompt_start = prompt_lines.len().saturating_sub(prompt_height);
-    visible.extend(prompt_lines.into_iter().skip(prompt_start));
+    let composer_start = composer_lines.len().saturating_sub(composer_height);
+    visible.extend(composer_lines.into_iter().skip(composer_start));
     let body = if options.capabilities.ansi && options.capabilities.color {
         let palette = resolved_palette(app);
+        let last_line = visible.len().saturating_sub(1);
         visible
             .iter()
             .enumerate()
-            .map(|(index, line)| style_line(line, index, palette))
+            .map(|(index, line)| style_line(line, index, last_line, palette))
             .collect::<Vec<_>>()
             .join("\r\n")
     } else {
@@ -141,7 +194,14 @@ fn resolved_palette(app: &App) -> Palette {
         &["assistant", "text", "assistantText"],
         &mut palette.assistant,
     );
+    apply_color_aliases(
+        definition,
+        &["thinking", "reasoning"],
+        &mut palette.thinking,
+    );
+    apply_color_aliases(definition, &["tool", "muted"], &mut palette.tool);
     apply_color_aliases(definition, &["system", "warning"], &mut palette.system);
+    apply_color_aliases(definition, &["error", "danger"], &mut palette.error);
     apply_color_aliases(definition, &["prompt", "accent"], &mut palette.prompt);
     palette
 }
@@ -186,20 +246,26 @@ fn parse_hex_color(value: &str) -> Option<Rgb> {
     ))
 }
 
-fn style_line(line: &str, index: usize, palette: Palette) -> String {
+fn style_line(line: &str, index: usize, last_line: usize, palette: Palette) -> String {
     if line.is_empty() {
         return String::new();
     }
-    let color = if index == 0 {
-        palette.accent
-    } else if line.trim_start().starts_with("user>") {
-        palette.user
-    } else if line.trim_start().starts_with("assistant") {
-        palette.assistant
-    } else if line.trim_start().starts_with("system>") {
-        palette.system
-    } else if line.trim_start().starts_with("Prompt:") {
+    let color = if index == last_line {
         palette.prompt
+    } else if index == 0 || line.starts_with('◆') {
+        palette.accent
+    } else if line.trim_start().starts_with('❯') {
+        palette.user
+    } else if line.trim_start().starts_with('●') {
+        palette.assistant
+    } else if line.trim_start().starts_with('✦') {
+        palette.thinking
+    } else if line.trim_start().starts_with('└') {
+        palette.tool
+    } else if line.trim_start().starts_with('✕') {
+        palette.error
+    } else if line.trim_start().starts_with('▲') || line.trim_start().starts_with('•') {
+        palette.system
     } else {
         palette.muted
     };
@@ -207,6 +273,18 @@ fn style_line(line: &str, index: usize, palette: Palette) -> String {
         "\u{1b}[38;2;{};{};{}m{line}\u{1b}[0m",
         color.0, color.1, color.2
     )
+}
+
+fn human_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    if bytes < 1024 * 1024 {
+        let tenths = bytes.saturating_mul(10) / 1024;
+        return format!("{}.{:01} KiB", tenths / 10, tenths % 10);
+    }
+    let tenths = bytes.saturating_mul(10) / (1024 * 1024);
+    format!("{}.{:01} MiB", tenths / 10, tenths % 10)
 }
 
 fn append_overlay(app: &App, lines: &mut Vec<String>) {
@@ -231,7 +309,9 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
             lines.push("Keyboard shortcuts".into());
             lines.push("Enter submit/confirm · Esc close overlay or quit".into());
             lines.push("Up/Down history or selector · Left/Right move cursor".into());
-            lines.push("Backspace/Delete edit · Ctrl+C cancel run · Ctrl+D quit".into());
+            lines.push(
+                "Backspace/Delete edit · Ctrl+V attach image · Ctrl+C cancel · Ctrl+D quit".into(),
+            );
         }
         Overlay::Confirm { title, message, .. } => {
             lines.push(String::new());

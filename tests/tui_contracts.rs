@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use mimir::model::{Message, ThinkingLevel};
 use mimir::tui::{
-    Action, App, AppConfig, AppPreferenceState, InputBinding, KeyCode, KeyEvent, McpCommand,
-    Overlay, OverlayKind, RenderOptions, SlashCommand, StreamEvent, TerminalCapabilities,
-    TerminalSize, ThemeName, TreeFilterMode, TuiAction, UiRequest, dispatch_persistent_action,
-    dispatch_runtime_action, export_tui_session, handle_ui_request, parse_slash_command,
+    Action, App, AppConfig, AppPreferenceState, ImageAttachment, InputBinding, KeyCode, KeyEvent,
+    McpCommand, Overlay, OverlayKind, RenderOptions, SlashCommand, StreamEvent,
+    TerminalCapabilities, TerminalSize, ThemeName, TreeFilterMode, TuiAction, UiRequest,
+    dispatch_persistent_action, dispatch_runtime_action, export_tui_session, handle_ui_request,
+    parse_slash_command,
 };
 use mimir::{
     mcp::{McpAuthCoordinator, McpCatalogServer, McpCatalogStdio, McpServerCatalog},
@@ -434,7 +435,8 @@ fn extended_reference_commands_emit_actions_and_render_hotkeys() {
         },
     );
     assert!(rendered.contains("Keyboard shortcuts"));
-    assert!(rendered.contains("Ctrl+C cancel run"));
+    assert!(rendered.contains("Ctrl+V attach image"));
+    assert!(rendered.contains("Ctrl+C cancel"));
     assert!(rendered.contains("Ctrl+D quit"));
 }
 
@@ -787,6 +789,23 @@ fn editable_prompt_history_and_custom_bindings_are_pure_state_transitions() {
 }
 
 #[test]
+fn image_only_prompt_moves_bounded_clipboard_attachment_into_submission() {
+    let mut app = App::new(AppConfig::default());
+    app.attach_image(ImageAttachment {
+        data: "aW1hZ2U=".into(),
+        mime_type: "image/png".into(),
+        byte_size: 5,
+    })
+    .expect("attach image");
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+
+    assert_eq!(app.pending_submission().as_deref(), Some(""));
+    let images = app.take_submitted_images();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+}
+
+#[test]
 fn selectors_and_overlays_switch_and_confirm_choices() {
     let mut app = App::new(AppConfig::default());
     app.set_models(vec!["gpt-5-mini".into(), "gpt-5".into()]);
@@ -926,7 +945,7 @@ fn fullscreen_renderer_anchors_prompt_to_bottom_and_uses_raw_mode_safe_rows() {
     );
     let plain_lines = plain.lines().collect::<Vec<_>>();
     assert_eq!(plain_lines.len(), size.height);
-    assert!(plain_lines.last().is_some_and(|line| line == &"Prompt: "));
+    assert!(plain_lines.last().is_some_and(|line| line == &"❯ "));
 
     let ansi = app.render(
         size,
@@ -975,7 +994,7 @@ fn display_preferences_drive_autocomplete_followups_images_progress_and_layout()
     assert_eq!(app.take_next_follow_ups(), vec!["first", "second"]);
 
     app.apply_stream_event(StreamEvent::Images(vec!["image/png".into()]));
-    app.apply_stream_event(StreamEvent::Progress("tool read started".into()));
+    app.apply_stream_event(StreamEvent::Activity("Reading files…".into()));
     app.apply_stream_event(StreamEvent::Warning("extension warning".into()));
     app.set_bash_active(true);
     app.apply_stream_event(StreamEvent::BashStarted {
@@ -997,11 +1016,7 @@ fn display_preferences_drive_autocomplete_followups_images_progress_and_layout()
             .iter()
             .any(|entry| entry.text.contains("image/png"))
     );
-    assert!(
-        app.transcript()
-            .iter()
-            .any(|entry| entry.text == "tool read started")
-    );
+    assert_eq!(app.current_activity(), Some("Reading files…"));
     assert!(
         app.transcript()
             .iter()
@@ -1030,7 +1045,7 @@ fn display_preferences_drive_autocomplete_followups_images_progress_and_layout()
             capabilities: TerminalCapabilities::plain(),
         },
     );
-    assert!(rendered.contains("   Prompt: /"));
+    assert!(rendered.contains("   ❯ /"));
 }
 
 #[test]
@@ -1043,7 +1058,7 @@ fn blocked_or_disabled_runtime_visuals_are_not_rendered_as_if_enabled() {
         ..AppPreferenceState::default()
     });
     app.apply_stream_event(StreamEvent::Images(vec!["image/png".into()]));
-    app.apply_stream_event(StreamEvent::Progress("hidden progress".into()));
+    app.apply_stream_event(StreamEvent::Activity("hidden progress".into()));
     app.apply_stream_event(StreamEvent::Warning("hidden warning".into()));
     assert!(app.transcript().is_empty());
 
@@ -1076,7 +1091,7 @@ fn stream_events_accumulate_transcript_and_pending_assistant_text() {
 }
 
 #[test]
-fn retry_lifecycle_is_visible_in_the_tui_transcript() {
+fn retry_lifecycle_uses_transient_activity_instead_of_noisy_transcript_rows() {
     let mut app = App::new(AppConfig::default());
     app.apply_stream_event(StreamEvent::RetryStarted {
         attempt: 1,
@@ -1089,12 +1104,11 @@ fn retry_lifecycle_is_visible_in_the_tui_transcript() {
         final_error: None,
     });
 
-    assert_eq!(app.transcript().len(), 2);
+    assert!(app.transcript().is_empty());
     assert_eq!(
-        app.transcript()[0].text,
-        "retrying provider request 1/3 in 2000 ms"
+        app.current_activity(),
+        Some("Request recovered on attempt 1")
     );
-    assert_eq!(app.transcript()[1].text, "provider retry 1 succeeded");
 }
 
 #[test]
@@ -1127,7 +1141,7 @@ fn renderer_is_resize_safe_and_has_plaintext_fallback() {
         },
     );
     assert!(!plain.contains("\u{1b}["));
-    assert!(plain.contains("Prompt"));
+    assert!(plain.contains('❯'));
     assert!(plain.lines().count() <= 5);
 }
 

@@ -17,7 +17,7 @@ impl Default for Budget {
         Self {
             max_turns: 12,
             max_tool_calls: 48,
-            max_tokens: 80_000,
+            max_tokens: 1_000_000,
             max_elapsed: Duration::from_secs(30 * 60),
             max_context_messages: 200,
         }

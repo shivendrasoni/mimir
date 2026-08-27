@@ -1,6 +1,15 @@
-# Mimir — Rust
+# Mimir — a bounded RLM runtime in Rust
 
-A standalone, bounded agentic runtime written in safe Rust. Mimir combines provider adaptation, model/tool execution, workspace tools, durable sessions, context and skill loading, goals, schedules, subagents, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, RLM state, state migration helpers, and deterministic offline testing.
+Mimir is a standalone, bounded agentic runtime written in safe Rust. Its core is a **Recursive Language Model (RLM) runtime**: an agent can programmatically start model-backed child agents, observe them, and cancel or remove them while their work remains durable and scoped to the parent session.
+
+The RLM runtime is built for long-running, inspectable work:
+
+- **Recursive execution:** `rlm_run` admits a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
+- **Bounded by design:** recursion depth, child count and concurrency, prompt and state size, duration, output tokens, and authenticated model discovery are all limited by the runtime.
+- **Durable session state:** child sessions and namespaced RLM extension state persist under Mimir's state root, so orchestration can survive an interrupted terminal session.
+- **Continual Harness:** `/refine` turns evidence from a session into small, structured updates to supplemental prompts, memories, skills, or reusable subagent specifications. It never rewrites the base system prompt, records refinement history, and supports rollback with `/refine rollback <refinement-id>`.
+
+Around that RLM foundation, Mimir provides provider adaptation, model/tool execution, workspace tools, context and skill loading, goals, schedules, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, state migration helpers, and deterministic offline testing.
 
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
@@ -101,6 +110,20 @@ mimir extension list
 mimir rlm list sample-extension workspace
 mimir --provider fake --fake-response ok benchmark prompt "smoke test"
 ```
+
+## RLM and continual harness
+
+When running an interactive, session-backed agent, Mimir registers its RLM tools automatically. The agent can choose from its currently authenticated models and recursively delegate bounded work; each child is tracked independently from admission through completion, cancellation, or deletion. The default maximum recursion depth is 3, and all child work remains subject to the runtime's budgets and tool policy.
+
+Use `/rlm-max-depth` in the TUI to inspect or set the recursion limit for a session. Use `/refine <instructions>` when you want Mimir to review the current trajectory and persist a focused lesson. Refinements are local to the session by default; pass `--global` only when a lesson should be shared, and undo a recorded update with:
+
+```text
+/refine rollback <refinement-id>
+# or, for a global refinement
+/refine rollback <refinement-id> --global
+```
+
+This is harness refinement, not model-weight training: Mimir proposes and validates small durable operating-context changes, then records the before/after state needed to inspect or reverse them.
 
 ## Quality gates
 

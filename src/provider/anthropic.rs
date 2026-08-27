@@ -293,7 +293,7 @@ fn build_request_body(request: &ModelRequest, credential_kind: AnthropicCredenti
         system.push(request.system_prompt.trim().into());
     }
     let mut messages = Vec::new();
-    for message in &request.messages {
+    for message in anthropic_message_sequence(&request.messages) {
         if message.role == Role::System {
             let text = message.text();
             if !text.trim().is_empty() {
@@ -301,7 +301,7 @@ fn build_request_body(request: &ModelRequest, credential_kind: AnthropicCredenti
             }
             continue;
         }
-        if let Some(message) = translate_message(message) {
+        if let Some(message) = translate_message(&message) {
             messages.push(message);
         }
     }
@@ -331,6 +331,75 @@ fn build_request_body(request: &ModelRequest, credential_kind: AnthropicCredenti
     body
 }
 
+/// Rebuilds tool exchanges into the adjacency required by the Messages API.
+///
+/// A session can be resumed after an assistant tool-call turn was persisted but
+/// before the corresponding tool result was written. Compaction can also leave
+/// the two sides on opposite sides of its retained suffix. Anthropic rejects
+/// either history shape, so preserve completed exchanges as one user result
+/// turn and make an interrupted exchange explicit to the model.
+fn anthropic_message_sequence(messages: &[Message]) -> Vec<Message> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut index = 0;
+
+    while let Some(message) = messages.get(index) {
+        normalized.push(message.clone());
+        index += 1;
+
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let calls = message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            continue;
+        }
+
+        let mut results = Vec::new();
+        while let Some(result_message) = messages.get(index) {
+            if result_message.role != Role::Tool {
+                break;
+            }
+            results.extend(
+                result_message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::ToolResult(result)
+                            if calls.iter().any(|call| call.id == result.tool_call_id) =>
+                        {
+                            Some(Content::ToolResult(result.clone()))
+                        }
+                        _ => None,
+                    }),
+            );
+            index += 1;
+        }
+
+        for call in calls {
+            if !results.iter().any(|content| {
+                matches!(content, Content::ToolResult(result) if result.tool_call_id == call.id)
+            }) {
+                results.push(Content::ToolResult(crate::model::ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: "Tool execution did not complete before this session was resumed. Retry the work if it is still needed.".into(),
+                    is_error: true,
+                }));
+            }
+        }
+        normalized.push(Message::user_content(results));
+    }
+
+    normalized
+}
+
 fn translate_message(message: &Message) -> Option<Value> {
     let mut blocks = Vec::new();
     match message.role {
@@ -353,10 +422,13 @@ fn translate_message(message: &Message) -> Option<Value> {
                             "data": data
                         }
                     })),
-                    Content::Text { .. }
-                    | Content::Thinking { .. }
-                    | Content::ToolCall(_)
-                    | Content::ToolResult(_) => {}
+                    Content::ToolResult(result) => blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": normalize_tool_call_id(&result.tool_call_id),
+                        "content": result.content,
+                        "is_error": result.is_error
+                    })),
+                    Content::Text { .. } | Content::Thinking { .. } | Content::ToolCall(_) => {}
                 }
             }
         }
@@ -950,5 +1022,60 @@ fn trim_newline(line: &mut Vec<u8>) {
         .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
     {
         line.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn tool_call(id: &str) -> Content {
+        Content::ToolCall(ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "README.md"}),
+        })
+    }
+
+    #[test]
+    fn repairs_an_interrupted_tool_exchange_before_replay() {
+        let messages = vec![
+            Message::user("inspect the README"),
+            Message::assistant(vec![tool_call("toolu_missing")], StopReason::ToolUse),
+            Message::user("continue"),
+        ];
+
+        let normalized = anthropic_message_sequence(&messages);
+
+        assert_eq!(normalized.len(), 4);
+        assert!(matches!(
+            &normalized[2].content[..],
+            [Content::ToolResult(result)]
+                if result.tool_call_id == "toolu_missing" && result.is_error
+        ));
+        assert_eq!(normalized[3].text(), "continue");
+    }
+
+    #[test]
+    fn combines_multiple_persisted_tool_results_after_one_tool_turn() {
+        let messages = vec![
+            Message::assistant(
+                vec![tool_call("toolu_first"), tool_call("toolu_second")],
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("toolu_first", "read_file", "first", false),
+            Message::tool_result("toolu_second", "read_file", "second", false),
+        ];
+
+        let normalized = anthropic_message_sequence(&messages);
+
+        assert_eq!(normalized.len(), 2);
+        assert!(matches!(
+            &normalized[1].content[..],
+            [Content::ToolResult(first), Content::ToolResult(second)]
+                if first.tool_call_id == "toolu_first" && second.tool_call_id == "toolu_second"
+        ));
     }
 }

@@ -5745,6 +5745,50 @@ fn activate_migrated_preferences(
     activated
 }
 
+/// Uses an unambiguous saved login when the caller did not choose a provider.
+///
+/// The CLI historically defaulted to OpenAI before consulting the auth store,
+/// which made `mimir login anthropic` insufficient for a bare `mimir` launch.
+/// A command-line provider and migrated preferences retain precedence; this
+/// fallback applies only when one stored credential can run natively.
+async fn activate_single_stored_provider(
+    build: &RuntimeBuildConfig,
+    state: &std::path::Path,
+) -> Result<RuntimeBuildConfig> {
+    if build.provider_explicit {
+        return Ok(build.clone());
+    }
+    let registry = ProviderRegistry::builtin();
+    let mut providers = AuthStore::new(state)?
+        .statuses()
+        .await?
+        .into_iter()
+        .filter_map(|status| {
+            registry
+                .get(&status.provider)
+                .filter(|provider| provider.supports_runtime())
+                .map(|_| status.provider)
+        })
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    let [provider] = providers.as_slice() else {
+        return Ok(build.clone());
+    };
+
+    let mut activated = build.clone();
+    activated.provider = provider.clone();
+    activated.base_url = None;
+    if !activated.model_explicit {
+        activated.model = registry
+            .get(provider)
+            .and_then(|definition| definition.default_model)
+            .unwrap_or("gpt-5-mini")
+            .to_owned();
+    }
+    Ok(activated)
+}
+
 fn runtime_model_definition(build: &RuntimeBuildConfig) -> Result<ModelDefinition> {
     if build.provider == "fake" {
         return Ok(ModelDefinition::fake(&build.model));
@@ -6347,7 +6391,8 @@ async fn build_runtime_for_session(
     let state = resolve_state_dir(&build.state_dir)?;
     let session_root = resolve_session_root(build, &state)?;
     let activation = MigratedRuntimeState::load(&state)?;
-    let activated_build = activate_migrated_preferences(build, &activation);
+    let stored_provider_build = activate_single_stored_provider(build, &state).await?;
+    let activated_build = activate_migrated_preferences(&stored_provider_build, &activation);
     let (effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
     let build = &effective_build;
@@ -9023,6 +9068,7 @@ mod tui_model_selection_tests {
     use std::path::PathBuf;
 
     use crate::{
+        auth::{AuthStore, OAuthCredential},
         daemon::{PromptHandler, PublicDaemonCommand},
         model::{Message, ThinkingLevel},
         runtime::QueueMode,
@@ -9033,10 +9079,10 @@ mod tui_model_selection_tests {
 
     use super::{
         Cli, Command, ConfigCommand, OutputMode, PackageCommand, RuntimeBuildConfig,
-        RuntimePromptHandler, ScheduleCommand, UpdateAction, build_runtime_for_session,
-        parse_recovered_goal_create, parse_recovered_refine_args, resolve_extension_flags,
-        resolve_runtime_thinking_level, resolve_tui_model_selection, run_self_update,
-        runtime_model_definition, send_public_command, tui_model_options,
+        RuntimePromptHandler, ScheduleCommand, UpdateAction, activate_single_stored_provider,
+        build_runtime_for_session, parse_recovered_goal_create, parse_recovered_refine_args,
+        resolve_extension_flags, resolve_runtime_thinking_level, resolve_tui_model_selection,
+        run_self_update, runtime_model_definition, send_public_command, tui_model_options,
     };
 
     #[test]
@@ -9250,6 +9296,35 @@ mod tui_model_selection_tests {
         let options = tui_model_options("openai", "gpt-5-mini");
         assert!(options.iter().any(|value| value.starts_with("anthropic/")));
         assert!(options.iter().any(|value| value.starts_with("google/")));
+    }
+
+    #[tokio::test]
+    async fn sole_stored_anthropic_oauth_login_becomes_the_implicit_provider() {
+        let state = tempfile::TempDir::new().expect("state");
+        AuthStore::new(state.path())
+            .expect("auth store")
+            .set_oauth(
+                "anthropic",
+                OAuthCredential {
+                    access: "test-access".into(),
+                    refresh: "test-refresh".into(),
+                    expires_at_ms: u64::MAX,
+                    account_id: None,
+                    enterprise_url: None,
+                },
+            )
+            .await
+            .expect("stored OAuth");
+        let mut config = build("openai", "gpt-5-mini");
+        config.provider_explicit = false;
+        config.model_explicit = false;
+
+        let selected = activate_single_stored_provider(&config, state.path())
+            .await
+            .expect("implicit provider");
+
+        assert_eq!(selected.provider, "anthropic");
+        assert_eq!(selected.model, "claude-sonnet-4-6");
     }
 
     #[test]

@@ -42,22 +42,34 @@ impl WorkspacePathPolicy {
         self.ensure_inside(requested, resolved)
     }
 
-    /// Resolves a writable relative target through a canonical existing parent.
+    /// Resolves a writable relative target through its nearest canonical existing ancestor.
     ///
     /// # Errors
     ///
-    /// Returns a policy or I/O error for traversal, missing parents, and escaping symlinks.
+    /// Returns a policy or I/O error for traversal and escaping symlinks.
+    /// Missing parent directories are permitted so a caller can create them
+    /// after this policy check.
     pub fn resolve_for_write(&self, requested: &str) -> Result<PathBuf, ToolError> {
         let candidate = self.candidate(requested)?;
         if candidate.exists() {
             return self.ensure_inside(requested, candidate.canonicalize()?);
         }
-        let parent = candidate
+        let mut parent = candidate
             .parent()
             .ok_or_else(|| ToolError::WorkspaceDenied {
                 path: requested.into(),
                 reason: "path has no parent".into(),
-            })?;
+            })?
+            .to_owned();
+        while !parent.exists() {
+            parent = parent
+                .parent()
+                .ok_or_else(|| ToolError::WorkspaceDenied {
+                    path: requested.into(),
+                    reason: "path has no existing workspace ancestor".into(),
+                })?
+                .to_owned();
+        }
         let resolved_parent = parent
             .canonicalize()
             .map_err(|error| ToolError::Execution {

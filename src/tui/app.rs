@@ -9,6 +9,7 @@ use crate::{
     orchestration::HeartbeatManagementAction,
     resources::{CustomTheme, PromptTemplate, Skill, expand_prompt_template},
     runtime::QueueMode,
+    tools::{ApprovalDecision, PermissionRequest},
 };
 use uuid::Uuid;
 
@@ -189,6 +190,10 @@ pub enum Overlay {
         title: String,
         message: String,
         action: Box<TuiAction>,
+    },
+    WorkspacePermission {
+        request: PermissionRequest,
+        selected: usize,
     },
     Selector(SelectorOverlay),
 }
@@ -601,6 +606,13 @@ impl App {
             title: title.into(),
             message: message.into(),
             action: Box::new(action),
+        };
+    }
+
+    pub fn open_workspace_permission(&mut self, request: PermissionRequest) {
+        self.overlay = Overlay::WorkspacePermission {
+            request,
+            selected: 0,
         };
     }
 
@@ -1352,9 +1364,18 @@ impl App {
         }
 
         match (&self.overlay, &event.code) {
-            (Overlay::Selector(_), KeyCode::Up) => self.apply_action(Action::SelectPrev),
-            (Overlay::Selector(_), KeyCode::Down) => self.apply_action(Action::SelectNext),
-            (Overlay::Selector(_) | Overlay::Confirm { .. }, KeyCode::Enter) => {
+            (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Up) => {
+                self.apply_action(Action::SelectPrev)
+            }
+            (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Down) => {
+                self.apply_action(Action::SelectNext)
+            }
+            (
+                Overlay::Selector(_)
+                | Overlay::Confirm { .. }
+                | Overlay::WorkspacePermission { .. },
+                KeyCode::Enter,
+            ) => {
                 self.apply_action(Action::Confirm);
             }
             (
@@ -1364,7 +1385,8 @@ impl App {
                 | Overlay::Login { .. }
                 | Overlay::Logout { .. }
                 | Overlay::McpLogin { .. }
-                | Overlay::Confirm { .. },
+                | Overlay::Confirm { .. }
+                | Overlay::WorkspacePermission { .. },
                 KeyCode::Esc,
             ) => {
                 self.apply_action(Action::CloseOverlay);
@@ -1388,7 +1410,15 @@ impl App {
     pub fn apply_action(&mut self, action: Action) {
         match action {
             Action::OpenOverlay(kind) => self.open_overlay(kind),
-            Action::CloseOverlay => self.overlay = Overlay::None,
+            Action::CloseOverlay => {
+                if let Overlay::WorkspacePermission { request, .. } = &self.overlay {
+                    self.pending_tui_action = Some(TuiAction::WorkspacePermission {
+                        request: request.clone(),
+                        decision: ApprovalDecision::Deny,
+                    });
+                }
+                self.overlay = Overlay::None;
+            }
             Action::Confirm => self.confirm_overlay(),
             Action::SelectNext => self.move_selection(1),
             Action::SelectPrev => self.move_selection(-1),
@@ -1648,13 +1678,27 @@ impl App {
             | Overlay::Help
             | Overlay::Hotkeys
             | Overlay::Selector(_)
-            | Overlay::Confirm { .. } => {}
+            | Overlay::Confirm { .. }
+            | Overlay::WorkspacePermission { .. } => {}
         }
     }
 
     fn confirm_overlay(&mut self) {
         if let Overlay::Confirm { action, .. } = &self.overlay {
             self.pending_tui_action = Some((**action).clone());
+            self.overlay = Overlay::None;
+            return;
+        }
+        if let Overlay::WorkspacePermission { request, selected } = &self.overlay {
+            let decision = match selected {
+                0 => ApprovalDecision::AllowOnce,
+                1 => ApprovalDecision::AlwaysAllowWorkspace,
+                _ => ApprovalDecision::Deny,
+            };
+            self.pending_tui_action = Some(TuiAction::WorkspacePermission {
+                request: request.clone(),
+                decision,
+            });
             self.overlay = Overlay::None;
             return;
         }
@@ -1864,6 +1908,10 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        if let Overlay::WorkspacePermission { selected, .. } = &mut self.overlay {
+            *selected = (*selected as isize + delta).rem_euclid(3) as usize;
+            return;
+        }
         let Overlay::Selector(selector) = &mut self.overlay else {
             return;
         };

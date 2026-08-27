@@ -36,7 +36,7 @@ use crate::{
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     session_compat::{ReferenceSessionMetadata, export_jsonl, import_jsonl},
     session_tree::{SessionBranchCatalog, SessionNodeKind},
-    tools::{BashResult, ObservationStatus},
+    tools::{ApprovalDecision, BashResult, ObservationStatus, PermissionRequest},
 };
 use uuid::Uuid;
 
@@ -281,6 +281,17 @@ pub trait TuiRuntimeFactory: Send + Sync {
     /// Cancels the currently running user shell command, when one exists.
     fn abort_user_bash(&self) {}
 
+    /// Persists an explicit workspace-owner choice for a displayed request.
+    async fn record_workspace_permission(
+        &self,
+        _request: PermissionRequest,
+        _decision: ApprovalDecision,
+    ) -> Result<String> {
+        Err(crate::error::MimirError::Configuration(
+            "workspace permission decisions are unavailable in this TUI runtime".into(),
+        ))
+    }
+
     /// Returns the bounded resource catalogs available to interactive selectors.
     async fn resource_snapshot(&self) -> Result<TuiResourceSnapshot> {
         Ok(TuiResourceSnapshot::default())
@@ -394,6 +405,13 @@ impl EventSink for TuiSink {
             RuntimeEvent::ProviderRequest { .. } => Some(StreamEvent::Activity("Thinking…".into())),
             RuntimeEvent::ToolStarted { name, .. } => {
                 Some(StreamEvent::Activity(tool_activity(&name)))
+            }
+            RuntimeEvent::PermissionRequested { request } => {
+                self.app
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .open_workspace_permission(request);
+                None
             }
             RuntimeEvent::ToolFinished {
                 name, observation, ..
@@ -1019,6 +1037,10 @@ async fn dispatch_coordinator_action(
     terminal_guard: &mut TerminalGuard,
 ) -> Result<Option<String>> {
     match action {
+        TuiAction::WorkspacePermission { request, decision } => runtime_factory
+            .record_workspace_permission(request.clone(), decision.clone())
+            .await
+            .map(Some),
         TuiAction::Resume { session } => {
             resume_tui_session(
                 runtime,
@@ -2835,7 +2857,8 @@ pub async fn dispatch_runtime_action(
         }
         TuiAction::ShowContext => render_context_tree(runtime).await.map(Some),
         TuiAction::CopyLastMessage => copy_last_assistant_message(runtime).await.map(Some),
-        TuiAction::Resume { .. }
+        TuiAction::WorkspacePermission { .. }
+        | TuiAction::Resume { .. }
         | TuiAction::NewSession { .. }
         | TuiAction::SetSessionName { .. }
         | TuiAction::ShowSessionInfo

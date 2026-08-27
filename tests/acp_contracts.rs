@@ -552,7 +552,15 @@ async fn acp_never_bypasses_runtime_tool_permissions() {
             StopReason::Stop,
         ),
     ]);
-    let runtime = runtime(root.path(), Arc::new(provider)).await;
+    let tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            allow_process: false,
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("tools");
+    let runtime = runtime_with_tools(Arc::new(provider), tools).await;
     let (mut client, server) = start(runtime, root.path());
     let session_id = initialize_and_create(&mut client, root.path()).await;
 

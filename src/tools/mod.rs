@@ -1,3 +1,4 @@
+mod approval;
 mod bash;
 mod extension;
 mod file;
@@ -22,6 +23,9 @@ use thiserror::Error;
 use crate::model::ToolDefinition;
 use tokio_util::sync::CancellationToken;
 
+pub use approval::{
+    ApprovalDecision, DestructiveAction, PermissionRequest, WorkspaceApprovalStore,
+};
 pub use bash::{BashResult, BashRunner};
 pub use mcp::{McpRegistrationReport, McpUnavailableServer};
 pub use path_policy::WorkspacePathPolicy;
@@ -34,6 +38,7 @@ pub struct ToolPolicy {
     pub allow_write: bool,
     pub allow_process: bool,
     pub allowed_programs: Option<Vec<String>>,
+    pub approvals: Option<Arc<WorkspaceApprovalStore>>,
 }
 
 impl Default for ToolPolicy {
@@ -43,23 +48,9 @@ impl Default for ToolPolicy {
             max_output_bytes: 64 * 1024,
             max_write_bytes: 2 * 1024 * 1024,
             allow_write: true,
-            allow_process: false,
-            allowed_programs: Some(vec![
-                "cargo".into(),
-                "git".into(),
-                "rg".into(),
-                "find".into(),
-                "ls".into(),
-                "pwd".into(),
-                "wc".into(),
-                "sed".into(),
-                "head".into(),
-                "tail".into(),
-                "printf".into(),
-                "echo".into(),
-                "rustc".into(),
-                "rustfmt".into(),
-            ]),
+            allow_process: true,
+            allowed_programs: None,
+            approvals: None,
         }
     }
 }
@@ -101,6 +92,8 @@ pub enum ToolError {
     WorkspaceDenied { path: String, reason: String },
     #[error("tool {tool} is disabled by policy")]
     Disabled { tool: String },
+    #[error("workspace approval required to {}: {command}", request.action.label(), command = request.command)]
+    ApprovalRequired { request: PermissionRequest },
     #[error("tool {tool} failed: {message}")]
     Execution { tool: String, message: String },
     #[error(transparent)]
@@ -143,12 +136,7 @@ impl ToolRegistry {
         registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
         registry.register(file::SearchTool::new(paths.clone(), policy.clone()));
-        if policy.allow_process
-            && policy
-                .allowed_programs
-                .as_ref()
-                .is_some_and(|programs| !programs.is_empty())
-        {
+        if policy.allow_process {
             registry.register(process::ProcessTool::new(paths, policy));
         }
         Ok(registry)

@@ -14,6 +14,7 @@ fn registry(root: &TempDir) -> ToolRegistry {
             allow_write: true,
             allow_process: true,
             allowed_programs: Some(vec!["sleep".into(), "printf".into()]),
+            approvals: None,
         },
     )
     .expect("registry should initialize")
@@ -71,6 +72,27 @@ async fn write_edit_and_read_use_the_same_canonical_workspace_policy() {
 }
 
 #[tokio::test]
+async fn write_file_creates_missing_nested_workspace_directories() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = registry(&root);
+
+    let written = tools
+        .execute(
+            "write_file",
+            json!({"path": "mockup/react-app/src/main.tsx", "content": "export {};"}),
+        )
+        .await
+        .expect("nested write should create parents");
+
+    assert_eq!(written.status, ObservationStatus::Success);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mockup/react-app/src/main.tsx"))
+            .expect("written file"),
+        "export {};"
+    );
+}
+
+#[tokio::test]
 async fn process_tool_times_out_and_returns_a_recovery_hint() {
     let root = TempDir::new().expect("tempdir");
     let tools = registry(&root);
@@ -97,6 +119,7 @@ async fn process_tool_caps_observation_bytes() {
             allow_write: true,
             allow_process: true,
             allowed_programs: Some(vec!["printf".into()]),
+            approvals: None,
         },
     )
     .expect("registry should initialize");

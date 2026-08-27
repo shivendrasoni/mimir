@@ -69,17 +69,24 @@ impl Tool for ProcessTool {
                 message: "program must not be empty".into(),
             });
         }
-        let allowed = self
+        if self
             .policy
             .allowed_programs
             .as_ref()
-            .ok_or_else(|| ToolError::Disabled {
-                tool: "run_process:no_allowlist".into(),
-            })?;
-        if !allowed.iter().any(|candidate| candidate == &input.program) {
+            .is_some_and(|allowed| !allowed.iter().any(|candidate| candidate == &input.program))
+        {
             return Err(ToolError::Disabled {
                 tool: format!("run_process:{}", input.program),
             });
+        }
+        let command = std::iter::once(input.program.as_str())
+            .chain(input.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(approvals) = &self.policy.approvals
+            && let Some(request) = approvals.requires_approval(&command)?
+        {
+            return Err(ToolError::ApprovalRequired { request });
         }
         let mut command = Command::new(&input.program);
         command

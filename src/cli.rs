@@ -71,7 +71,9 @@ use crate::{
         ReferenceSessionMetadata, export_jsonl, prepare_share_payload, prepare_switch_session,
     },
     skills::SkillRuntime,
-    tools::{BashResult, BashRunner, ObservationStatus, ToolPolicy, ToolRegistry},
+    tools::{
+        BashResult, BashRunner, ObservationStatus, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
+    },
     tui::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
         load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
@@ -191,6 +193,14 @@ pub struct Cli {
     offline: bool,
     #[arg(long)]
     verbose: bool,
+    #[arg(
+        long,
+        env = "MIMIR_PROVIDER_TIMEOUT_SECONDS",
+        default_value_t = 900,
+        value_parser = parse_positive_u64,
+        help = "Maximum time to wait for one provider request before treating it as unavailable"
+    )]
+    provider_timeout_seconds: u64,
     #[arg(long = "socket", visible_alias = "daemon-socket", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[arg(long)]
@@ -269,6 +279,7 @@ struct RuntimeBuildConfig {
     extension_flags: Vec<String>,
     offline: bool,
     verbose: bool,
+    provider_timeout_seconds: u64,
     autonomous_limits: Option<AutonomousLimits>,
     fake_responses: Vec<String>,
     fake_delay_ms: u64,
@@ -289,7 +300,10 @@ impl RuntimeBuildConfig {
             state_dir: cli.state_dir.clone(),
             session_dir: cli.session_dir.clone(),
             no_session: cli.no_session,
-            allow_process: cli.allow_process,
+            // Process execution is workspace-scoped by default. The legacy flag
+            // remains accepted for CLI compatibility, but no longer grants the
+            // baseline capability on its own.
+            allow_process: true,
             allowed_programs: cli.allowed_programs.clone(),
             tool_allowlist: if cli.no_tools {
                 Some(BTreeSet::new())
@@ -315,6 +329,7 @@ impl RuntimeBuildConfig {
             extension_flags: cli.extension_flags.clone(),
             offline: cli.offline,
             verbose: cli.verbose,
+            provider_timeout_seconds: cli.provider_timeout_seconds,
             autonomous_limits: cli_autonomous_limits(cli),
             fake_responses: cli.fake_responses.clone(),
             fake_delay_ms: cli.fake_delay_ms,
@@ -995,6 +1010,9 @@ impl EventSink for LegacyRpcEventSink {
                 "type": "turn_end",
                 "message": message,
                 "toolResults": tool_results
+            })],
+            RuntimeEvent::PermissionRequested { request } => vec![json!({
+                "type": "workspace_permission_required", "request": request
             })],
             RuntimeEvent::TextDelta { text } => {
                 let partial = {
@@ -4162,6 +4180,30 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
         self.bash_runner.abort();
     }
 
+    async fn record_workspace_permission(
+        &self,
+        request: crate::tools::PermissionRequest,
+        decision: crate::tools::ApprovalDecision,
+    ) -> Result<String> {
+        let store = WorkspaceApprovalStore::new(&self.build.workspace)
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+        store
+            .record(&request, decision.clone())
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+        Ok(match decision {
+            crate::tools::ApprovalDecision::AllowOnce => {
+                "Allowed once. Retry the command to run it.".into()
+            }
+            crate::tools::ApprovalDecision::AlwaysAllowWorkspace => {
+                "Allowed for this workspace and recorded in .mimir/workspace-permissions.json."
+                    .into()
+            }
+            crate::tools::ApprovalDecision::Deny => {
+                "Denied. The decision was recorded in the workspace audit log.".into()
+            }
+        })
+    }
+
     async fn resource_snapshot(&self) -> Result<TuiResourceSnapshot> {
         let workspace = std::fs::canonicalize(&self.build.workspace).map_err(|error| {
             MimirError::Configuration(format!("workspace is inaccessible: {error}"))
@@ -6268,8 +6310,13 @@ fn build_bash_runner(build: &RuntimeBuildConfig) -> Result<Arc<BashRunner>> {
         MimirError::Configuration(format!("workspace is inaccessible: {error}"))
     })?;
     let policy = ToolPolicy {
-        allow_process: build.allow_process,
-        allowed_programs: Some(build.allowed_programs.clone()),
+        allow_process: true,
+        allowed_programs: (!build.allowed_programs.is_empty())
+            .then(|| build.allowed_programs.clone()),
+        approvals: Some(Arc::new(
+            WorkspaceApprovalStore::new(&workspace)
+                .map_err(|error| MimirError::Tool(error.to_string()))?,
+        )),
         ..ToolPolicy::default()
     };
     BashRunner::new(&workspace, policy)
@@ -6462,8 +6509,13 @@ async fn build_runtime_for_session(
     )?;
     let process_tools_authorized = build.allow_process && !build.allowed_programs.is_empty();
     let policy = ToolPolicy {
-        allow_process: build.allow_process,
-        allowed_programs: Some(build.allowed_programs.clone()),
+        allow_process: true,
+        allowed_programs: (!build.allowed_programs.is_empty())
+            .then(|| build.allowed_programs.clone()),
+        approvals: Some(Arc::new(
+            WorkspaceApprovalStore::new(&workspace)
+                .map_err(|error| MimirError::Tool(error.to_string()))?,
+        )),
         ..ToolPolicy::default()
     };
     let mut tool_registry = ToolRegistry::with_default_tools(&workspace, policy.clone())
@@ -6593,6 +6645,7 @@ async fn build_runtime_for_session(
     config.thinking_level = thinking_level;
     config.supported_thinking_levels = supported_thinking_levels;
     config.thinking_level_map = thinking_level_map;
+    config.provider_timeout = std::time::Duration::from_secs(build.provider_timeout_seconds);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
         .system_prompt
@@ -9103,6 +9156,16 @@ mod tui_model_selection_tests {
     }
 
     #[test]
+    fn provider_timeout_defaults_to_fifteen_minutes_and_accepts_an_override() {
+        let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
+        assert_eq!(defaults.provider_timeout_seconds, 900);
+
+        let overridden = Cli::try_parse_from(["mimir", "--provider-timeout-seconds", "1800"])
+            .expect("timeout override");
+        assert_eq!(overridden.provider_timeout_seconds, 1_800);
+    }
+
+    #[test]
     fn top_level_compatibility_commands_and_local_package_scope_parse() {
         let cli = Cli::try_parse_from(["mimir", "providers"]).expect("providers");
         assert!(matches!(cli.command, Some(Command::Providers)));
@@ -9414,6 +9477,7 @@ mod tui_model_selection_tests {
             extension_flags: Vec::new(),
             offline: false,
             verbose: false,
+            provider_timeout_seconds: 900,
             autonomous_limits: None,
             fake_responses: Vec::new(),
             fake_delay_ms: 0,

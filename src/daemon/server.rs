@@ -2711,6 +2711,10 @@ fn public_runtime_event(
             "toolName": name,
             "args": arguments
         }),
+        RuntimeEvent::PermissionRequested { request } => json!({
+            "type": "workspace_permission_required",
+            "request": request
+        }),
         RuntimeEvent::ToolUpdated {
             id,
             name,

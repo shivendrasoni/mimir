@@ -1,4 +1,9 @@
-use crate::{model::ThinkingLevel, orchestration::HeartbeatManagementAction, runtime::QueueMode};
+use crate::{
+    model::ThinkingLevel,
+    orchestration::HeartbeatManagementAction,
+    runtime::QueueMode,
+    tools::{ApprovalDecision, PermissionRequest},
+};
 use uuid::Uuid;
 
 use super::commands::McpCommand;
@@ -6,6 +11,10 @@ use super::commands::McpCommand;
 /// Typed, side-effect-free requests emitted by TUI slash commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
+    WorkspacePermission {
+        request: PermissionRequest,
+        decision: ApprovalDecision,
+    },
     SetEffort(ThinkingLevel),
     ToggleFast,
     ConfigureScopedModels,

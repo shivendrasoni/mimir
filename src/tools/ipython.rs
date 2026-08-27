@@ -223,12 +223,7 @@ impl IpythonTool {
         session: &str,
         policy: ToolPolicy,
     ) -> Result<Self, ToolError> {
-        if !(policy.allow_process
-            && policy
-                .allowed_programs
-                .as_ref()
-                .is_some_and(|programs| !programs.is_empty()))
-        {
+        if !policy.allow_process || policy.allowed_programs.as_ref().is_some_and(Vec::is_empty) {
             return Err(ToolError::Disabled {
                 tool: "ipython".into(),
             });

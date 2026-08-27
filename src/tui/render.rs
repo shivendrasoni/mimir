@@ -319,6 +319,21 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
             lines.push(message.clone());
             lines.push("Enter confirm · Esc cancel".into());
         }
+        Overlay::WorkspacePermission { request, selected } => {
+            lines.push(String::new());
+            lines.push("Workspace permission required".into());
+            lines.push(request.message());
+            for (index, option) in ["Allow once", "Always allow for this workspace", "Deny"]
+                .iter()
+                .enumerate()
+            {
+                lines.push(format!(
+                    "{} {option}",
+                    if *selected == index { ">" } else { " " }
+                ));
+            }
+            lines.push("Up/Down choose · Enter decide · Esc deny".into());
+        }
         Overlay::Login { provider, input } => {
             lines.push(String::new());
             lines.push("Login".into());

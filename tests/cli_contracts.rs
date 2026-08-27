@@ -1100,7 +1100,7 @@ fn legacy_rpc_configures_auto_retry_and_streams_retry_lifecycle_events() {
 }
 
 #[test]
-fn legacy_rpc_bash_is_disabled_without_explicit_process_permission() {
+fn legacy_rpc_bash_runs_by_default_inside_the_workspace() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
     Command::cargo_bin("mimir")
@@ -1117,12 +1117,12 @@ fn legacy_rpc_bash_is_disabled_without_explicit_process_permission() {
             "--output",
             "rpc",
         ])
-        .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf forbidden\"}\n")
+        .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf permitted\"}\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("\"command\":\"bash\""))
-        .stdout(predicate::str::contains("\"success\":false"))
-        .stdout(predicate::str::contains("disabled"));
+        .stdout(predicate::str::contains("\"success\":true"))
+        .stdout(predicate::str::contains("permitted"));
 }
 
 #[test]

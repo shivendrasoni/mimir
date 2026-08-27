@@ -27,13 +27,6 @@ use super::{ToolError, ToolPolicy, WorkspacePathPolicy};
 const MAX_FULL_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ShellQuote {
-    None,
-    Single,
-    Double,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BashResult {
@@ -113,6 +106,11 @@ impl BashRunner {
             });
         }
         validate_allowlisted_command(command, self.policy.allowed_programs.as_deref())?;
+        if let Some(approvals) = &self.policy.approvals
+            && let Some(request) = approvals.requires_approval(command)?
+        {
+            return Err(ToolError::ApprovalRequired { request });
+        }
         let _guard = self.run_lock.lock().await;
         let cancellation = CancellationToken::new();
         *self
@@ -165,67 +163,26 @@ fn validate_allowlisted_command(
             message: format!("command exceeds the {MAX_COMMAND_BYTES}-byte limit"),
         });
     }
-    let Some(allowed_programs) = allowed_programs.filter(|programs| !programs.is_empty()) else {
-        return Err(ToolError::Disabled {
-            tool: "bash".into(),
-        });
-    };
+    let allowed_programs = allowed_programs.filter(|programs| !programs.is_empty());
 
-    let mut quote = ShellQuote::None;
-    let mut program = String::new();
-    let mut collecting_program = true;
-    for character in command.chars() {
-        if (character.is_control() && character != '\t')
-            || matches!(
-                character,
-                ';' | '&'
-                    | '|'
-                    | '<'
-                    | '>'
-                    | '$'
-                    | '`'
-                    | '\\'
-                    | '('
-                    | ')'
-                    | '{'
-                    | '}'
-                    | '['
-                    | ']'
-                    | '*'
-                    | '?'
-                    | '#'
-            )
-        {
-            return Err(ToolError::InvalidArguments {
-                tool: "bash".into(),
-                message: "compound commands, expansion, redirection, and control characters are not allowed"
-                    .into(),
-            });
-        }
-        match (quote, character) {
-            (ShellQuote::None, '\'') => quote = ShellQuote::Single,
-            (ShellQuote::None, '"') => quote = ShellQuote::Double,
-            (ShellQuote::Single, '\'') | (ShellQuote::Double, '"') => {
-                quote = ShellQuote::None;
-            }
-            (ShellQuote::None, value) if value.is_whitespace() => collecting_program = false,
-            (_, value) if collecting_program => program.push(value),
-            _ => {}
-        }
-    }
-    if quote != ShellQuote::None {
+    if command
+        .chars()
+        .any(|character| character.is_control() && character != '\t' && character != '\n')
+    {
         return Err(ToolError::InvalidArguments {
             tool: "bash".into(),
-            message: "command contains an unterminated quote".into(),
+            message: "command contains control characters".into(),
         });
     }
+    let program = command.split_whitespace().next().unwrap_or_default();
     if program.is_empty() {
         return Err(ToolError::InvalidArguments {
             tool: "bash".into(),
             message: "command must start with a program".into(),
         });
     }
-    if !allowed_programs.iter().any(|allowed| allowed == &program) {
+    if allowed_programs.is_some_and(|allowed| !allowed.iter().any(|candidate| candidate == program))
+    {
         return Err(ToolError::Disabled {
             tool: format!("bash program {program}"),
         });

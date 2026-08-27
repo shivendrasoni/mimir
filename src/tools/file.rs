@@ -86,7 +86,9 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".into(),
-            description: "Write a UTF-8 file inside the workspace".into(),
+            description:
+                "Write a UTF-8 file inside the workspace, creating missing parent directories"
+                    .into(),
             parameters: object_schema(
                 &json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
@@ -107,6 +109,14 @@ impl Tool for WriteFileTool {
                 message: format!("content exceeds {} bytes", self.policy.max_write_bytes),
             });
         }
+        let path = self.paths.resolve_for_write(&input.path)?;
+        let parent = path.parent().ok_or_else(|| ToolError::Execution {
+            tool: "write_file".into(),
+            message: "target path has no parent directory".into(),
+        })?;
+        tokio::fs::create_dir_all(parent).await?;
+        // Re-resolve after creating directories so a newly introduced symlink
+        // cannot redirect the subsequent atomic replacement outside the workspace.
         let path = self.paths.resolve_for_write(&input.path)?;
         atomic_replace(&path, input.content.as_bytes()).await?;
         let mut observation = ToolObservation::success("file written", "");

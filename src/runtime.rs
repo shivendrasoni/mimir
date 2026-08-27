@@ -26,7 +26,7 @@ use crate::{
     runtime_events::{RuntimeEventBus, RuntimeEventEnvelope, RuntimeEventSource},
     session::{SessionPayload, SessionRecord, SessionStore},
     skills::{SkillInvocationError, SkillRuntime},
-    tools::{ObservationStatus, ToolObservation, ToolRegistry},
+    tools::{ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry},
 };
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
@@ -70,7 +70,7 @@ impl RuntimeConfig {
             thinking_level_map: None,
             system_prompt: String::new(),
             budget: Budget::default(),
-            provider_timeout: Duration::from_secs(120),
+            provider_timeout: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -133,6 +133,9 @@ pub enum RuntimeEvent {
         name: String,
         arguments: serde_json::Value,
     },
+    PermissionRequested {
+        request: PermissionRequest,
+    },
     ToolUpdated {
         id: String,
         name: String,
@@ -192,6 +195,7 @@ impl RuntimeEvent {
             Self::MessageCompleted { .. } => "message_completed",
             Self::TurnCompleted { .. } => "turn_completed",
             Self::ToolStarted { .. } => "tool_started",
+            Self::PermissionRequested { .. } => "permission_requested",
             Self::ToolUpdated { .. } => "tool_updated",
             Self::ToolFinished { .. } => "tool_finished",
             Self::TextDelta { .. } => "text_delta",
@@ -2467,7 +2471,7 @@ impl AgentRuntime {
                     sink,
                 )
                 .await?;
-                let observation = match if let Some(reason) = blocked_reason {
+                let execution = if let Some(reason) = blocked_reason {
                     Err(crate::tools::ToolError::Execution {
                         tool: call.name.clone(),
                         message: reason,
@@ -2480,7 +2484,14 @@ impl AgentRuntime {
                     Err(crate::tools::ToolError::Disabled {
                         tool: call.name.clone(),
                     })
-                } {
+                };
+                if let Err(crate::tools::ToolError::ApprovalRequired { request }) = &execution {
+                    sink.emit(RuntimeEvent::PermissionRequested {
+                        request: request.clone(),
+                    })
+                    .await;
+                }
+                let observation = match execution {
                     Ok(observation) => observation,
                     Err(error) => ToolObservation {
                         status: ObservationStatus::Error,

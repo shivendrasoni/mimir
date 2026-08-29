@@ -13,6 +13,7 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 - File tools canonicalize a workspace root, reject traversal and escaping symlinks, cap reads/writes/searches, and atomically replace writes.
 - Process execution is disabled by default. When enabled, a missing allowlist denies all execution. Matching is exact; `/tmp/cargo` does not match `cargo`. Commands receive direct argv, cleared environment, a fixed PATH, null stdin, bounded combined output, timeout, and process-group termination.
 - State writes use atomic replacement, path-scoped in-process locks, and reject symlinked state components. Credential, daemon-metadata, and session files are mode `0600` on Unix.
+- Diagnostic bundles are metadata-only, redact absolute paths and credential-like literals, use mode `0700` directories and `0600` files on Unix, and enforce event-count, file-size, total-size, and retained-run bounds.
 - Daemon IPC rejects frames larger than 1 MiB, refuses to unlink non-socket paths, bounds inactive history, and cancels in-flight connections during shutdown.
 - Migration plans hash every source artifact, revalidate hashes before apply, journal before destination replacement, and support deterministic rollback.
 - RPC errors contain no stack traces. JSON parsing and tool schemas reject malformed or unknown fields.

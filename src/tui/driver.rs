@@ -166,6 +166,8 @@ struct LocalTracePreview<'a> {
     record_count: usize,
     message_count: usize,
     event_counts: BTreeMap<String, usize>,
+    diagnostic_run_ids: Vec<uuid::Uuid>,
+    diagnostic_bundle_root: String,
     contains_message_text: bool,
     uploaded: bool,
 }
@@ -2293,6 +2295,15 @@ pub async fn preview_tui_traces(
         record_count: records.len(),
         message_count,
         event_counts,
+        diagnostic_run_ids: crate::diagnostics::list_runs(&crate::diagnostics::diagnostics_root(
+            state_root,
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|run| run.session_id == session)
+        .map(|run| run.run_id)
+        .collect(),
+        diagnostic_bundle_root: "$STATE/diagnostics".into(),
         contains_message_text: false,
         uploaded: false,
     };

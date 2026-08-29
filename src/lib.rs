@@ -10,6 +10,7 @@ pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod diagnostics;
 pub mod error;
 pub mod extensions;
 pub mod mcp;

@@ -28,6 +28,11 @@ use crate::{
         DaemonError, DaemonServer, PromptHandler, PromptRequest, PublicDaemonCommand,
         PublicImageContent, ScheduledPromptDelivery, ServerResponse,
     },
+    diagnostics::{
+        DiagnosticAnalysisInput, DiagnosticConfiguration, DiagnosticJournal, DiagnosticManifest,
+        DiagnosticOutcome, DiagnosticPrivacy, RuntimeDiagnosticRecorder, append_analysis,
+        diagnostics_root, list_runs, load_bundle, query_events, replay_bundle,
+    },
     error::{MimirError, Result},
     extensions::{
         AgentRuntimeChildExecutor, AuthStoreModelCatalog, AuthenticatedModelCatalog, Capability,
@@ -87,6 +92,18 @@ enum OutputMode {
     Rpc,
     Acp,
     Daemon,
+}
+
+impl OutputMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+            Self::Rpc => "rpc",
+            Self::Acp => "acp",
+            Self::Daemon => "daemon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -575,6 +592,11 @@ enum Command {
         #[command(subcommand)]
         action: SessionCommand,
     },
+    /// Inspect, export, annotate, or safely replay local diagnostic evidence.
+    Diagnose {
+        #[command(subcommand)]
+        action: DiagnoseCommand,
+    },
     /// Configure, authenticate, and invoke local or remote MCP servers.
     Mcp {
         #[command(subcommand)]
@@ -745,6 +767,40 @@ enum SessionCommand {
         #[arg(long)]
         gist_id: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnoseCommand {
+    /// List diagnostic runs, newest first.
+    List,
+    /// Show one complete redacted diagnostic bundle.
+    Show { run_id: String },
+    /// Filter one run's typed events.
+    Query {
+        run_id: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export one portable redacted JSON bundle.
+    Export {
+        run_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        redacted: bool,
+    },
+    /// Append an external harness assessment from a JSON file.
+    Annotate {
+        run_id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Deterministically validate recorded evidence without executing tools or providers.
+    Replay { run_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1613,7 +1669,85 @@ pub async fn entrypoint() -> Result<()> {
     }
     prepare_run_session(&mut cli).await?;
     let runtime = build_runtime(&cli).await?;
-    dispatch_run(&cli, runtime, initial_prompt.as_deref()).await
+    dispatch_run_with_diagnostics(&cli, runtime, initial_prompt.as_deref()).await
+}
+
+async fn dispatch_run_with_diagnostics(
+    cli: &Cli,
+    runtime: Arc<AgentRuntime>,
+    initial_prompt: Option<&str>,
+) -> Result<()> {
+    let state = resolve_state_dir(&cli.state_dir)?;
+    let (provider, model, _) = runtime.model_selection().await;
+    let run_id = Uuid::new_v4();
+    let journal = DiagnosticJournal::start(
+        diagnostics_root(&state),
+        DiagnosticManifest {
+            schema_version: crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
+            run_id,
+            session_id: cli.session.clone(),
+            started_at: chrono::Utc::now(),
+            mimir_version: env!("CARGO_PKG_VERSION").into(),
+            provider,
+            model,
+            workspace: "$WORKSPACE".into(),
+            configuration: DiagnosticConfiguration {
+                output_mode: cli.output.as_str().into(),
+                offline: cli.offline,
+                autonomous: RuntimeBuildConfig::from_cli(cli)
+                    .autonomous_limits
+                    .is_some(),
+            },
+            privacy: DiagnosticPrivacy::default(),
+        },
+    );
+    let mut receiver = runtime.subscribe_events();
+    let collector_journal = journal.clone();
+    let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let mut recorder = RuntimeDiagnosticRecorder::default();
+        loop {
+            tokio::select! {
+                event_result = receiver.recv() => match event_result {
+                    Ok(envelope) => recorder.record(&collector_journal, &envelope.event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        collector_journal.note_dropped(skipped);
+                        recorder.record(
+                            &collector_journal,
+                            &RuntimeEvent::SessionEvent {
+                                event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
+                            },
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut stop_receiver => {
+                    while let Ok(envelope) = receiver.try_recv() {
+                        recorder.record(&collector_journal, &envelope.event);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    let result = dispatch_run(cli, runtime, initial_prompt).await;
+    let _ = stop_sender.send(());
+    let _ = collector.await;
+    let outcome = match &result {
+        Ok(()) => DiagnosticOutcome::Completed,
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("budget") || message.contains("token budget") {
+                DiagnosticOutcome::BudgetPaused
+            } else if message.contains("cancel") || message.contains("abort") {
+                DiagnosticOutcome::Cancelled
+            } else {
+                DiagnosticOutcome::Failed
+            }
+        }
+    };
+    journal.finish(outcome);
+    result
 }
 
 async fn dispatch_run(
@@ -2023,6 +2157,7 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
             "sessions": FileSessionStore::list_ids(&state).await?,
         })),
         Command::Session { action } => run_session_management(cli, action, &state).await,
+        Command::Diagnose { action } => run_diagnose_management(action, &state).await,
         Command::Mcp { action } => run_mcp_management(action, &state).await,
         Command::Goal { action } => {
             let store = GoalStore::new(&state);
@@ -2570,6 +2705,81 @@ async fn run_session_management(cli: &Cli, action: &SessionCommand, state: &Path
                 "byte_length": payload.bytes.len(),
                 "viewer_url": viewer_url,
             }))
+        }
+    }
+}
+
+async fn run_diagnose_management(action: &DiagnoseCommand, state: &Path) -> Result<()> {
+    const MAX_ANALYSIS_BYTES: u64 = 1024 * 1024;
+    let root = diagnostics_root(state);
+    match action {
+        DiagnoseCommand::List => print_json(&json!({
+            "schema_version": crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
+            "runs": list_runs(&root)?,
+        })),
+        DiagnoseCommand::Show { run_id } => {
+            print_json(&serde_json::to_value(load_bundle(&root, run_id)?)?)
+        }
+        DiagnoseCommand::Query {
+            run_id,
+            kind,
+            status,
+            json,
+        } => {
+            let events = query_events(&root, run_id, kind.as_deref(), status.as_deref())?;
+            if *json {
+                print_json(&json!({
+                    "schema_version": crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "events": events,
+                }))
+            } else {
+                if events.is_empty() {
+                    println!("No matching diagnostic events.");
+                } else {
+                    for event in events {
+                        println!(
+                            "{:06} +{:>8}ms {:<24} turn={} tool={}",
+                            event.sequence,
+                            event.elapsed_ms,
+                            event.kind.name(),
+                            event.turn_id.as_deref().unwrap_or("-"),
+                            event.tool_call_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        DiagnoseCommand::Export {
+            run_id,
+            output,
+            redacted,
+        } => {
+            let bundle = load_bundle(&root, run_id)?;
+            if let Some(output) = output {
+                let bytes = serde_json::to_vec_pretty(&bundle)?;
+                write_output_atomic(output, &bytes).await?;
+                print_json(&json!({
+                    "schema_version": crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "redacted": true,
+                    "redaction_requested": redacted,
+                    "output": output,
+                }))
+            } else {
+                print_json(&serde_json::to_value(bundle)?)
+            }
+        }
+        DiagnoseCommand::Annotate { run_id, file } => {
+            let bytes = read_bounded_regular_file(file, MAX_ANALYSIS_BYTES).await?;
+            let input: DiagnosticAnalysisInput = serde_json::from_slice(&bytes)?;
+            print_json(&serde_json::to_value(append_analysis(
+                &root, run_id, input,
+            )?)?)
+        }
+        DiagnoseCommand::Replay { run_id } => {
+            print_json(&serde_json::to_value(replay_bundle(&root, run_id)?)?)
         }
     }
 }

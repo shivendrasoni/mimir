@@ -24,6 +24,7 @@
 | `orchestration` | Durable goals/schedules, message bus, bounded child agents |
 | `tui` | Full-screen terminal UI, selectors/settings/themes, auth, sessions, streamed rendering, and bounded `!`/`!!` execution |
 | `daemon` | Versioned Unix-socket IPC and public 97-command protocol with leases, recovery, scheduling, controls, and live events |
+| `diagnostics` | Best-effort privacy-safe run journal, summaries, portable export, append-only external analysis, and offline verification replay |
 | `extensions` | Manifest/package discovery, embedded QuickJS TypeScript ABI, native subprocess ABI, lifecycle/provider/OAuth/stream bridges, and RLM persistence |
 | `migration` | Legacy state planning, apply, journal, and rollback |
 | `cli` | Human output, versioned JSON events, JSON-RPC 2.0, management commands |
@@ -37,6 +38,7 @@
 - Internal state rejects symlinked path components and shares path-scoped mutation locks across store instances.
 - Auth and imported credential files are owner-readable only on Unix.
 - Daemon metadata persists timestamps and lease state but not raw prompt text.
+- Diagnostics are separate from transcripts and contain metadata only; raw prompts, model/tool payloads, environment values, credentials, and absolute host paths are excluded.
 - Daemon IPC frames are capped at 1 MiB, and shutdown cancels in-flight connection tasks before reporting completion.
 - A corrupt incomplete final JSONL record is recoverable; interior corruption is not silently ignored.
 - Provider and tool activity is bounded by budgets, response sizes, timeouts, and concurrency admission.

@@ -25,12 +25,15 @@ Every release must preserve these invariants:
 7. Workspace file tools accept only non-empty workspace-relative paths without
    parent traversal. Process argument checks are advisory; real process isolation
    requires an operating-system sandbox.
-8. Diagnostic persistence never prevents a run from completing. A diagnostic
+8. Recursive file discovery excludes harness state, version-control metadata,
+   dependency trees, and generated output. In particular, search cannot ingest
+   `.mimir/` session or diagnostic data and amplify its own active context.
+9. Diagnostic persistence never prevents a run from completing. A diagnostic
    write failure becomes a bounded warning and terminal state is still attempted.
-9. Diagnostic exports do not contain credentials, authorization headers, raw
+10. Diagnostic exports do not contain credentials, authorization headers, raw
    environment values, home-directory paths, or unredacted workspace paths by
    default.
-10. Raw evidence is immutable. Later harnesses append analysis with evidence
+11. Raw evidence is immutable. Later harnesses append analysis with evidence
     references; they do not rewrite the observed event stream.
 
 ## Failure taxonomy
@@ -103,6 +106,7 @@ until its control is wired and documented by its implementation.
 | `context.token_compaction` | Compact from projected token pressure | Restore message-count compaction |
 | `context.bounded_projection` | Send bounded tool output while retaining full session evidence | Reduce the projection limit; never discard durable evidence |
 | `workspace.path_guidance` | Publish `$WORKSPACE` contract and actionable errors | Restore legacy descriptions, never weaken canonical file checks |
+| `workspace.discovery_hygiene` | Exclude internal state and generated trees from bounded recursive discovery | Narrow exclusions only; never allow recursive `.mimir` ingestion |
 | `integrity.tool_pairs` | Validate/repair orphan tool calls before provider use | Stop with a classified session error |
 | `integrity.provenance` | Warn or pause on unsupported source-derived claims | Emit warning-only observations |
 

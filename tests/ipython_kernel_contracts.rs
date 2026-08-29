@@ -207,15 +207,14 @@ async fn runtime_cancellation_interrupts_a_cell_and_kernel_remains_usable() {
 async fn bash_magic_is_policy_gated_and_bounded() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let disabled_policy = ToolPolicy {
+        allow_process: false,
+        ..ToolPolicy::default()
+    };
     let mut disabled =
-        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
+        ToolRegistry::with_default_tools(workspace.path(), disabled_policy.clone()).expect("tools");
     let error = disabled
-        .register_ipython_kernel(
-            workspace.path(),
-            state.path(),
-            "disabled",
-            ToolPolicy::default(),
-        )
+        .register_ipython_kernel(workspace.path(), state.path(), "disabled", disabled_policy)
         .expect_err("process policy");
     assert!(error.to_string().contains("disabled by policy"));
 

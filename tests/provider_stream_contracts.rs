@@ -1,3 +1,7 @@
+#[path = "support/reliability.rs"]
+#[allow(dead_code)]
+mod reliability;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,6 +15,8 @@ use tokio::{
     net::TcpListener,
     sync::Mutex,
 };
+
+use reliability::{minimal_request, serve_sse};
 
 #[derive(Default)]
 struct Events(Mutex<Vec<ProviderEvent>>);
@@ -129,4 +135,54 @@ async fn openai_sse_stream_keeps_a_final_frame_without_a_newline() {
         sink.0.lock().await.as_slice(),
         [ProviderEvent::TextDelta("kept".into())]
     );
+}
+
+#[tokio::test]
+async fn malformed_sse_event_is_a_protocol_error_and_emits_no_partial_text() {
+    let server = serve_sse(b"data: {\"choices\": [not-json}\n\ndata: [DONE]\n\n".to_vec()).await;
+    let provider = OpenAiProvider::new(
+        ProviderConfig::openai(&server.base_url, "reliability-fixture", "fixture-secret")
+            .expect("config"),
+    )
+    .expect("provider");
+    let sink = Events::default();
+
+    let error = provider
+        .stream(minimal_request(), &sink)
+        .await
+        .expect_err("malformed event must fail closed");
+    server.finish().await;
+
+    assert!(error.to_string().contains("protocol error"));
+    assert!(error.to_string().contains("invalid provider stream event"));
+    assert!(sink.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn truncated_tool_arguments_never_become_an_executable_tool_call() {
+    let body = concat!(
+        "data: {\"id\":\"truncated\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = serve_sse(body.as_bytes().to_vec()).await;
+    let provider = OpenAiProvider::new(
+        ProviderConfig::openai(&server.base_url, "reliability-fixture", "fixture-secret")
+            .expect("config"),
+    )
+    .expect("provider");
+    let sink = Events::default();
+
+    let error = provider
+        .stream(minimal_request(), &sink)
+        .await
+        .expect_err("incomplete tool JSON must fail before tool execution");
+    server.finish().await;
+
+    assert!(error.to_string().contains("protocol error"));
+    assert!(
+        error
+            .to_string()
+            .contains("tool arguments are invalid JSON")
+    );
+    assert!(sink.0.lock().await.is_empty());
 }

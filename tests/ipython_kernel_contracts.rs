@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 fn policy(timeout: Duration, output: usize) -> ToolPolicy {
     ToolPolicy {
         allow_process: true,
+        allowed_programs: Some(vec!["printf".into()]),
         command_timeout: timeout,
         max_output_bytes: output,
         ..ToolPolicy::default()

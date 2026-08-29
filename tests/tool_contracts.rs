@@ -898,6 +898,33 @@ fn registry_does_not_advertise_explicitly_disabled_process_execution() {
     );
 }
 
+#[test]
+fn default_and_missing_allowlist_policies_do_not_advertise_process_execution() {
+    let root = TempDir::new().expect("tempdir");
+    for policy in [
+        ToolPolicy::default(),
+        ToolPolicy {
+            allow_process: true,
+            allowed_programs: None,
+            ..ToolPolicy::default()
+        },
+        ToolPolicy {
+            allow_process: true,
+            allowed_programs: Some(Vec::new()),
+            ..ToolPolicy::default()
+        },
+    ] {
+        let tools = ToolRegistry::with_default_tools(root.path(), policy).expect("registry");
+        assert!(
+            tools
+                .definitions()
+                .iter()
+                .all(|definition| definition.name != "run_process"),
+            "process execution must stay hidden until an exact allowlist is configured"
+        );
+    }
+}
+
 #[tokio::test]
 async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
     let root = TempDir::new().expect("tempdir");
@@ -957,6 +984,20 @@ async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
         .execute("printf denied")
         .await
         .expect_err("disabled process policy must fail closed");
+
+    let enabled_without_allowlist = BashRunner::new(
+        root.path(),
+        ToolPolicy {
+            allow_process: true,
+            allowed_programs: None,
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("runner");
+    enabled_without_allowlist
+        .execute("printf denied")
+        .await
+        .expect_err("an enabled process policy without an allowlist must fail closed");
 
     let runner = BashRunner::new(
         root.path(),

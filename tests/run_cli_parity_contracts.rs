@@ -77,6 +77,73 @@ fn help_exposes_reference_run_flags_and_rejects_unsafe_combinations() {
         .expect("unsupported socket");
     assert!(!socket.status.success());
     assert!(String::from_utf8_lossy(&socket.stderr).contains("requires a prompt"));
+
+    let missing_allowlist = binary()
+        .args(["--allow-process", "--provider", "fake", "--print", "hello"])
+        .output()
+        .expect("missing process allowlist");
+    assert!(!missing_allowlist.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_allowlist.stderr)
+            .contains("requires an explicit non-empty --allowed-programs allowlist")
+    );
+
+    let missing_authorization = binary()
+        .args([
+            "--allowed-programs",
+            "printf",
+            "--provider",
+            "fake",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .expect("missing process authorization");
+    assert!(!missing_authorization.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_authorization.stderr)
+            .contains("--allowed-programs requires --allow-process")
+    );
+}
+
+#[test]
+fn process_tool_selection_requires_explicit_authorization_and_an_exact_allowlist() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = workspace.path().join("state");
+    let common = [
+        "--provider",
+        "fake",
+        "--workspace",
+        workspace.path().to_str().expect("workspace"),
+        "--state-dir",
+        state.to_str().expect("state"),
+        "--tools",
+        "run_process",
+        "--fake-response",
+        "done",
+        "--print",
+        "hello",
+    ];
+
+    let denied = binary()
+        .args(common)
+        .output()
+        .expect("default process selection");
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("unknown tool selection: run_process")
+    );
+
+    let authorized = binary()
+        .args(common)
+        .args(["--allow-process", "--allowed-programs", "printf"])
+        .output()
+        .expect("authorized process selection");
+    assert!(
+        authorized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authorized.stderr)
+    );
 }
 
 #[test]

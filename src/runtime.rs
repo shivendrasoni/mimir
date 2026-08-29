@@ -2599,10 +2599,12 @@ impl AgentRuntime {
 
     async fn combined_system_prompt(&self, active_skill_context: Option<&str>) -> String {
         let harness = self.harness_context.read().await;
-        let mut parts = Vec::with_capacity(3);
+        let workspace = self.tools.workspace_context();
+        let mut parts = Vec::with_capacity(4);
         if !self.config.system_prompt.is_empty() {
             parts.push(self.config.system_prompt.as_str());
         }
+        parts.push(workspace.as_str());
         if !harness.is_empty() {
             parts.push(harness.as_str());
         }

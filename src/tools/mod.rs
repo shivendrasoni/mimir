@@ -10,7 +10,7 @@ mod rlm;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -117,6 +117,7 @@ trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     rlm_runtime: Option<Arc<crate::extensions::RlmRuntime>>,
+    workspace_root: Arc<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -130,6 +131,7 @@ impl ToolRegistry {
         let mut registry = Self {
             tools: BTreeMap::new(),
             rlm_runtime: None,
+            workspace_root: Arc::new(paths.root().to_owned()),
         };
         registry.register(file::ReadFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::WriteFileTool::new(paths.clone(), policy.clone()));
@@ -140,6 +142,15 @@ impl ToolRegistry {
             registry.register(process::ProcessTool::new(paths, policy));
         }
         Ok(registry)
+    }
+
+    /// Returns a single system-prompt section describing the effective workspace contract.
+    #[must_use]
+    pub fn workspace_context(&self) -> String {
+        format!(
+            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace, copy the target into this workspace, or use a separately approved external-access mechanism. run_process argument screening is advisory and is not an OS sandbox.",
+            self.workspace_root.display()
+        )
     }
 
     fn register(&mut self, tool: impl Tool + 'static) {
@@ -247,6 +258,7 @@ impl ToolRegistry {
                 .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
                 .collect(),
             rlm_runtime: None,
+            workspace_root: Arc::clone(&self.workspace_root),
         }
     }
 

@@ -686,7 +686,17 @@ async fn fake_provider_drives_tool_result_and_final_response_through_persistence
         std::fs::read_to_string(root.path().join("answer.txt")).expect("file"),
         "forty-two"
     );
-    assert_eq!(provider.requests().await.len(), 2);
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    let canonical_workspace = root.path().canonicalize().expect("canonical workspace");
+    assert!(requests[0].system_prompt.contains("Use tools carefully."));
+    assert!(
+        requests[0]
+            .system_prompt
+            .contains(&canonical_workspace.display().to_string())
+    );
+    assert!(requests[0].system_prompt.contains("$WORKSPACE"));
+    assert!(requests[0].system_prompt.contains("not an OS sandbox"));
     let loaded = store.load().await.expect("session");
     assert_eq!(
         loaded

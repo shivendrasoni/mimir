@@ -26,6 +26,44 @@ impl WorkspacePathPolicy {
         self.root.as_ref()
     }
 
+    /// Returns model-facing guidance for paths accepted by workspace tools.
+    #[must_use]
+    pub fn path_guidance(&self) -> String {
+        "Paths must be non-empty and relative to $WORKSPACE (for example, 'src/main.rs'). Absolute paths and '..' parent traversal are rejected."
+            .into()
+    }
+
+    /// Rejects path-like process arguments that obviously escape the workspace contract.
+    ///
+    /// This is intentionally a conservative argument check, not an operating-system sandbox.
+    /// It catches standalone absolute paths and relative paths containing `..`, while leaving
+    /// flags, URLs, expressions, and source-code arguments untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workspace policy error for an obvious absolute path or parent traversal.
+    pub fn validate_obvious_process_path_argument(&self, argument: &str) -> Result<(), ToolError> {
+        if argument.is_empty()
+            || (argument.starts_with('-') && argument != "-")
+            || argument.contains("://")
+            || !looks_like_literal_path(argument)
+        {
+            return Ok(());
+        }
+        let path = Path::new(argument);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            self.validate_requested_path(argument)?;
+        }
+        Ok(())
+    }
+
     /// Resolves an existing relative path and denies canonical workspace escape.
     ///
     /// # Errors
@@ -81,21 +119,80 @@ impl WorkspacePathPolicy {
     }
 
     fn candidate(&self, requested: &str) -> Result<PathBuf, ToolError> {
+        self.validate_requested_path(requested)?;
         let path = Path::new(requested);
-        let unsafe_component = path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            });
-        if unsafe_component || requested.is_empty() {
+        Ok(self.root.join(path))
+    }
+
+    fn validate_requested_path(&self, requested: &str) -> Result<(), ToolError> {
+        if requested.is_empty() {
             return Err(ToolError::WorkspaceDenied {
                 path: requested.into(),
-                reason: "path must be a non-empty relative path without parent traversal".into(),
+                reason: format!(
+                    "path must be non-empty and relative to workspace root '{}'",
+                    self.root.display()
+                ),
             });
         }
-        Ok(self.root.join(path))
+        let path = Path::new(requested);
+        if path.is_absolute() {
+            return Err(self.absolute_path_error(requested, path));
+        }
+        if path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(ToolError::WorkspaceDenied {
+                path: requested.into(),
+                reason: format!(
+                    "'..' parent traversal is not allowed; use a path relative to workspace root '{}'. If the target is outside that root, restart Mimir with a broader --workspace, copy it into the workspace, or use a separately approved external-access mechanism",
+                    self.root.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn absolute_path_error(&self, requested: &str, path: &Path) -> ToolError {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let relative = resolved
+            .strip_prefix(self.root.as_ref())
+            .ok()
+            .filter(|relative| {
+                !relative.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            });
+        let reason = if let Some(relative) = relative {
+            let suggestion = if relative.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                relative.display().to_string()
+            };
+            format!(
+                "absolute paths are not accepted; this target is inside workspace root '{}', so use the relative path '{suggestion}'",
+                self.root.display()
+            )
+        } else {
+            self.outside_workspace_reason(&resolved)
+        };
+        ToolError::WorkspaceDenied {
+            path: requested.into(),
+            reason,
+        }
+    }
+
+    fn outside_workspace_reason(&self, resolved: &Path) -> String {
+        format!(
+            "target '{}' is outside workspace root '{}'; restart Mimir with a broader --workspace that contains the target, copy it into the workspace, or use a separately approved external-access mechanism",
+            resolved.display(),
+            self.root.display()
+        )
     }
 
     fn ensure_inside(&self, requested: &str, resolved: PathBuf) -> Result<PathBuf, ToolError> {
@@ -104,8 +201,18 @@ impl WorkspacePathPolicy {
         } else {
             Err(ToolError::WorkspaceDenied {
                 path: requested.into(),
-                reason: "canonical target escapes the workspace".into(),
+                reason: self.outside_workspace_reason(&resolved),
             })
         }
     }
+}
+
+fn looks_like_literal_path(argument: &str) -> bool {
+    !argument.chars().any(|character| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '|' | '^' | '$' | '\'' | '"'
+            )
+    })
 }

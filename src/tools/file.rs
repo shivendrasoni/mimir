@@ -43,11 +43,7 @@ struct PathInput {
 #[async_trait]
 impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
-        definition(
-            "read_file",
-            "Read a UTF-8 file inside the workspace",
-            &["path"],
-        )
+        definition(&self.paths, "read_file", "Read a UTF-8 file", &["path"])
     }
 
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {
@@ -86,11 +82,15 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".into(),
-            description:
-                "Write a UTF-8 file inside the workspace, creating missing parent directories"
-                    .into(),
+            description: format!(
+                "Write a UTF-8 file, creating missing parent directories. {}",
+                self.paths.path_guidance()
+            ),
             parameters: object_schema(
-                &json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+                &json!({
+                    "path": workspace_path_schema(&self.paths),
+                    "content": {"type": "string"}
+                }),
                 &["path", "content"],
             ),
         }
@@ -138,10 +138,13 @@ impl Tool for EditFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit_file".into(),
-            description: "Replace one exact text occurrence in a workspace file".into(),
+            description: format!(
+                "Replace one exact text occurrence in a file. {}",
+                self.paths.path_guidance()
+            ),
             parameters: object_schema(
                 &json!({
-                    "path": {"type": "string"},
+                    "path": workspace_path_schema(&self.paths),
                     "old_text": {"type": "string"},
                     "new_text": {"type": "string"}
                 }),
@@ -197,7 +200,12 @@ struct ListInput {
 #[async_trait]
 impl Tool for ListFilesTool {
     fn definition(&self) -> ToolDefinition {
-        definition("list_files", "List files under a workspace directory", &[])
+        definition(
+            &self.paths,
+            "list_files",
+            "List files under a directory",
+            &[],
+        )
     }
 
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {
@@ -244,9 +252,15 @@ impl Tool for SearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search".into(),
-            description: "Search UTF-8 workspace files with a regular expression".into(),
+            description: format!(
+                "Search UTF-8 files with a regular expression. {}",
+                self.paths.path_guidance()
+            ),
             parameters: object_schema(
-                &json!({"pattern": {"type": "string"}, "path": {"type": "string"}}),
+                &json!({
+                    "pattern": {"type": "string"},
+                    "path": workspace_path_schema(&self.paths)
+                }),
                 &["pattern"],
             ),
         }
@@ -309,12 +323,24 @@ impl Tool for SearchTool {
     }
 }
 
-fn definition(name: &str, description: &str, required: &[&str]) -> ToolDefinition {
+fn definition(
+    paths: &WorkspacePathPolicy,
+    name: &str,
+    description: &str,
+    required: &[&str],
+) -> ToolDefinition {
     ToolDefinition {
         name: name.into(),
-        description: description.into(),
-        parameters: object_schema(&json!({"path": {"type": "string"}}), required),
+        description: format!("{description}. {}", paths.path_guidance()),
+        parameters: object_schema(&json!({"path": workspace_path_schema(paths)}), required),
     }
+}
+
+fn workspace_path_schema(paths: &WorkspacePathPolicy) -> Value {
+    json!({
+        "type": "string",
+        "description": paths.path_guidance()
+    })
 }
 
 fn dot() -> String {

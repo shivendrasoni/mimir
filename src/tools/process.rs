@@ -33,6 +33,20 @@ impl ProcessTool {
     pub fn new(paths: WorkspacePathPolicy, policy: ToolPolicy) -> Self {
         Self { paths, policy }
     }
+
+    fn validate_workspace_arguments(&self, arguments: &[String]) -> Result<(), ToolError> {
+        for argument in arguments {
+            if let Err(error) = self.paths.validate_obvious_process_path_argument(argument) {
+                return Err(ToolError::InvalidArguments {
+                    tool: "run_process".into(),
+                    message: format!(
+                        "advisory path preflight rejected an obvious literal path argument (this check is not a security boundary or OS sandbox): {error}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -48,7 +62,10 @@ impl Tool for ProcessTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "run_process".into(),
-            description: "Run one program with an explicit argument vector in the workspace".into(),
+            description: format!(
+                "Run one program with an explicit argument vector and working directory set to $WORKSPACE. {} An advisory preflight check rejects obvious standalone literal absolute-path and '..' arguments. This check is not a security boundary or OS sandbox: flags, regexes, source code, shell/interpreter payloads, and subprocess behavior cannot be reliably interpreted. Real isolation for those cases requires an OS sandbox and explicit approval, so commands must not access paths outside $WORKSPACE.",
+                self.paths.path_guidance()
+            ),
             parameters: object_schema(
                 &json!({
                     "program": {"type": "string"},
@@ -100,6 +117,7 @@ impl ProcessTool {
                 tool: format!("run_process:{}", input.program),
             });
         }
+        self.validate_workspace_arguments(&input.args)?;
         let command = std::iter::once(input.program.as_str())
             .chain(input.args.iter().map(String::as_str))
             .collect::<Vec<_>>()

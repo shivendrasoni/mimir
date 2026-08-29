@@ -35,6 +35,190 @@ async fn file_tools_reject_workspace_traversal_before_io() {
 }
 
 #[tokio::test]
+async fn absolute_workspace_path_error_suggests_the_relative_form() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(root.path().join("inside.txt"), "inside").expect("fixture");
+    let tools = registry(&root);
+
+    let error = tools
+        .execute(
+            "read_file",
+            json!({"path": root.path().join("inside.txt").display().to_string()}),
+        )
+        .await
+        .expect_err("absolute paths must be rejected consistently");
+    let message = error.to_string();
+
+    assert!(
+        message.contains("absolute paths are not accepted"),
+        "{message}"
+    );
+    assert!(message.contains("inside.txt"), "{message}");
+    assert!(message.contains("use the relative path"), "{message}");
+}
+
+#[tokio::test]
+async fn mockup_workspace_explains_how_to_access_a_sibling_vv_file() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("ca-viveka");
+    let mockup = project.join("mockup");
+    let sibling = project.join("vv/css/camuquotes.tokens.css");
+    std::fs::create_dir_all(&mockup).expect("mockup workspace");
+    std::fs::create_dir_all(sibling.parent().expect("sibling parent")).expect("sibling directory");
+    std::fs::write(&sibling, ":root {}").expect("sibling fixture");
+    let tools = ToolRegistry::with_default_tools(
+        &mockup,
+        ToolPolicy {
+            command_timeout: Duration::from_secs(2),
+            max_output_bytes: 1024,
+            max_write_bytes: 1024,
+            allow_write: true,
+            allow_process: true,
+            allowed_programs: Some(vec!["find".into()]),
+            approvals: None,
+        },
+    )
+    .expect("registry");
+
+    let absolute_error = tools
+        .execute("read_file", json!({"path": sibling.display().to_string()}))
+        .await
+        .expect_err("sibling is outside the selected workspace");
+    let traversal_error = tools
+        .execute(
+            "read_file",
+            json!({"path": "../vv/css/camuquotes.tokens.css"}),
+        )
+        .await
+        .expect_err("parent traversal is rejected");
+    let process_error = tools
+        .execute(
+            "run_process",
+            json!({"program": "find", "args": [project.display().to_string()]}),
+        )
+        .await
+        .expect_err("run_process must reject the same obvious outside path");
+
+    for error in [absolute_error, process_error] {
+        let message = error.to_string();
+        assert!(message.contains("outside workspace root"), "{message}");
+        assert!(message.contains("broader --workspace"), "{message}");
+        assert!(message.contains("copy it into the workspace"), "{message}");
+    }
+    let traversal_message = traversal_error.to_string();
+    assert!(
+        traversal_message.contains("parent traversal is not allowed"),
+        "{traversal_message}"
+    );
+    assert!(
+        traversal_message.contains("broader --workspace"),
+        "{traversal_message}"
+    );
+}
+
+#[test]
+fn filesystem_tool_contracts_expose_the_effective_workspace_and_path_rules() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = registry(&root);
+    let canonical = root.path().canonicalize().expect("canonical root");
+
+    let workspace_context = tools.workspace_context();
+    assert!(workspace_context.contains(&canonical.display().to_string()));
+    assert!(workspace_context.contains("$WORKSPACE"));
+    assert!(workspace_context.contains("broader --workspace"));
+
+    for name in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_files",
+        "search",
+    ] {
+        let definition = tools
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(
+            definition.description.contains("$WORKSPACE"),
+            "{} did not expose the stable workspace alias: {}",
+            name,
+            definition.description
+        );
+        assert!(
+            !definition
+                .description
+                .contains(&canonical.display().to_string())
+        );
+        assert!(definition.description.contains("relative"));
+        assert!(definition.description.contains("'..'"));
+        assert!(
+            definition.parameters["properties"]["path"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("$WORKSPACE"))
+        );
+    }
+
+    let process = tools
+        .definitions()
+        .into_iter()
+        .find(|definition| definition.name == "run_process")
+        .expect("process definition");
+    assert!(process.description.contains("$WORKSPACE"));
+    assert!(process.description.contains("not a security boundary"));
+    assert!(process.description.contains("requires an OS sandbox"));
+    assert!(
+        !process
+            .description
+            .contains(&canonical.display().to_string())
+    );
+}
+
+#[tokio::test]
+async fn process_path_screening_preserves_normal_flags_and_urls() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            command_timeout: Duration::from_secs(2),
+            max_output_bytes: 1024,
+            max_write_bytes: 1024,
+            allow_write: true,
+            allow_process: true,
+            allowed_programs: Some(vec!["printf".into()]),
+            approvals: None,
+        },
+    )
+    .expect("registry");
+
+    for argument in [
+        "--color=always",
+        "https://example.invalid/a/../b",
+        "^/tmp/.*/../target$",
+        "open('/etc/passwd')",
+    ] {
+        let observation = tools
+            .execute(
+                "run_process",
+                json!({"program": "printf", "args": ["%s", argument]}),
+            )
+            .await
+            .expect("non-path argument should reach the process");
+        assert_eq!(observation.status, ObservationStatus::Success);
+    }
+
+    let traversal = tools
+        .execute(
+            "run_process",
+            json!({"program": "printf", "args": ["../outside.txt"]}),
+        )
+        .await
+        .expect_err("obvious parent traversal must be denied");
+    assert!(traversal.to_string().contains("parent traversal"));
+    assert!(traversal.to_string().contains("not a security boundary"));
+}
+
+#[tokio::test]
 async fn write_edit_and_read_use_the_same_canonical_workspace_policy() {
     let root = TempDir::new().expect("tempdir");
     let tools = registry(&root);

@@ -9,8 +9,10 @@ not sufficient by itself.
 
 Every release must preserve these invariants:
 
-1. Every started run reaches exactly one terminal outcome: `completed`,
-   `cancelled`, `budget_paused`, `failed`, or `crashed`.
+1. Every prompt attempt, including each prompt in a long-lived TUI, REPL, RPC,
+   daemon, or autonomous session, has its own diagnostic run ID and reaches
+   exactly one terminal outcome: `completed`, `cancelled`, `budget_paused`,
+   `failed`, or `crashed`. Frontend shutdown cannot overwrite that outcome.
 2. Every assistant tool call has exactly one tool result before the next provider
    request. Recovery may synthesize a clearly labelled non-executed result.
 3. Process outcomes distinguish spawn failure, non-zero exit, execution timeout,

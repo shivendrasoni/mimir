@@ -48,7 +48,7 @@ impl Default for ToolPolicy {
             max_output_bytes: 64 * 1024,
             max_write_bytes: 2 * 1024 * 1024,
             allow_write: true,
-            allow_process: true,
+            allow_process: false,
             allowed_programs: None,
             approvals: None,
         }
@@ -138,7 +138,12 @@ impl ToolRegistry {
         registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
         registry.register(file::SearchTool::new(paths.clone(), policy.clone()));
-        if policy.allow_process {
+        if policy.allow_process
+            && policy
+                .allowed_programs
+                .as_ref()
+                .is_some_and(|programs| !programs.is_empty())
+        {
             registry.register(process::ProcessTool::new(paths, policy));
         }
         Ok(registry)

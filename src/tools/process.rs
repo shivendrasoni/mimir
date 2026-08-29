@@ -111,11 +111,13 @@ impl ProcessTool {
                 message: "program must not be empty".into(),
             });
         }
-        if self
+        if !self
             .policy
             .allowed_programs
             .as_ref()
-            .is_some_and(|allowed| !allowed.iter().any(|candidate| candidate == &input.program))
+            .is_some_and(|allowed| {
+                !allowed.is_empty() && allowed.iter().any(|candidate| candidate == &input.program)
+            })
         {
             return Err(ToolError::Disabled {
                 tool: format!("run_process:{}", input.program),

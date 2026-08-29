@@ -1100,23 +1100,35 @@ fn legacy_rpc_configures_auto_retry_and_streams_retry_lifecycle_events() {
 }
 
 #[test]
-fn legacy_rpc_bash_runs_by_default_inside_the_workspace() {
+fn legacy_rpc_bash_is_disabled_by_default_and_requires_an_allowlist() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let common = [
+        "--provider",
+        "fake",
+        "--workspace",
+        workspace.path().to_str().expect("workspace path"),
+        "--state-dir",
+        state.path().to_str().expect("state path"),
+        "--fake-response",
+        "unused",
+        "--output",
+        "rpc",
+    ];
     Command::cargo_bin("mimir")
         .expect("binary")
-        .args([
-            "--provider",
-            "fake",
-            "--workspace",
-            workspace.path().to_str().expect("workspace path"),
-            "--state-dir",
-            state.path().to_str().expect("state path"),
-            "--fake-response",
-            "unused",
-            "--output",
-            "rpc",
-        ])
+        .args(common)
+        .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf denied\"}\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"command\":\"bash\""))
+        .stdout(predicate::str::contains("\"success\":false"))
+        .stdout(predicate::str::contains("pass --allow-process"));
+
+    Command::cargo_bin("mimir")
+        .expect("binary")
+        .args(common)
+        .args(["--allow-process", "--allowed-programs", "printf"])
         .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf permitted\"}\n")
         .assert()
         .success()

@@ -327,10 +327,7 @@ impl RuntimeBuildConfig {
             state_dir: cli.state_dir.clone(),
             session_dir: cli.session_dir.clone(),
             no_session: cli.no_session,
-            // Process execution is workspace-scoped by default. The legacy flag
-            // remains accepted for CLI compatibility, but no longer grants the
-            // baseline capability on its own.
-            allow_process: true,
+            allow_process: cli.allow_process,
             allowed_programs: cli.allowed_programs.clone(),
             tool_allowlist: if cli.no_tools {
                 Some(BTreeSet::new())
@@ -1245,7 +1242,22 @@ fn parse_gate_command(command: &str) -> Result<ParsedGateCommand> {
     })
 }
 
+fn validate_process_options(cli: &Cli) -> Result<()> {
+    if cli.allow_process && cli.allowed_programs.is_empty() {
+        return Err(MimirError::Configuration(
+            "--allow-process requires an explicit non-empty --allowed-programs allowlist".into(),
+        ));
+    }
+    if !cli.allow_process && !cli.allowed_programs.is_empty() {
+        return Err(MimirError::Configuration(
+            "--allowed-programs requires --allow-process".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_run_options(cli: &Cli) -> Result<()> {
+    validate_process_options(cli)?;
     if cli.socket.is_some() && matches!(cli.output, OutputMode::Rpc | OutputMode::Acp) {
         return Err(MimirError::Configuration(
             "--socket/--daemon-socket is only supported by text/json prompt mode".into(),
@@ -6655,9 +6667,8 @@ fn build_bash_runner(build: &RuntimeBuildConfig) -> Result<Arc<BashRunner>> {
         MimirError::Configuration(format!("workspace is inaccessible: {error}"))
     })?;
     let policy = ToolPolicy {
-        allow_process: true,
-        allowed_programs: (!build.allowed_programs.is_empty())
-            .then(|| build.allowed_programs.clone()),
+        allow_process: build.allow_process,
+        allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
             WorkspaceApprovalStore::new(&workspace)
                 .map_err(|error| MimirError::Tool(error.to_string()))?,
@@ -6854,11 +6865,10 @@ async fn build_runtime_for_session(
         &build.provider,
         &build.model,
     )?;
-    let process_tools_authorized = build.allow_process && !build.allowed_programs.is_empty();
+    let process_tools_authorized = build.allow_process;
     let policy = ToolPolicy {
-        allow_process: true,
-        allowed_programs: (!build.allowed_programs.is_empty())
-            .then(|| build.allowed_programs.clone()),
+        allow_process: build.allow_process,
+        allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
             WorkspaceApprovalStore::new(&workspace)
                 .map_err(|error| MimirError::Tool(error.to_string()))?,

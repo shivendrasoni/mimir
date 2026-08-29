@@ -163,7 +163,11 @@ fn validate_allowlisted_command(
             message: format!("command exceeds the {MAX_COMMAND_BYTES}-byte limit"),
         });
     }
-    let allowed_programs = allowed_programs.filter(|programs| !programs.is_empty());
+    let allowed_programs = allowed_programs
+        .filter(|programs| !programs.is_empty())
+        .ok_or_else(|| ToolError::Disabled {
+            tool: "bash: no programs were explicitly allowlisted".into(),
+        })?;
 
     if command
         .chars()
@@ -181,7 +185,9 @@ fn validate_allowlisted_command(
             message: "command must start with a program".into(),
         });
     }
-    if allowed_programs.is_some_and(|allowed| !allowed.iter().any(|candidate| candidate == program))
+    if !allowed_programs
+        .iter()
+        .any(|candidate| candidate == program)
     {
         return Err(ToolError::Disabled {
             tool: format!("bash program {program}"),

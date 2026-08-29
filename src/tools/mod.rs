@@ -148,7 +148,7 @@ impl ToolRegistry {
     #[must_use]
     pub fn workspace_context(&self) -> String {
         format!(
-            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace, copy the target into this workspace, or use a separately approved external-access mechanism. Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. run_process argument screening is advisory and is not an OS sandbox.",
+            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. Writes inside the workspace require explicit approval. Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. run_process argument screening is advisory and is not an OS sandbox.",
             self.workspace_root.display()
         )
     }

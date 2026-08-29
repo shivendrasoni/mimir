@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use mimir::tools::{BashRunner, ObservationStatus, ToolPolicy, ToolRegistry};
+use mimir::tools::{
+    ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus, ToolError, ToolPolicy,
+    ToolRegistry, WorkspaceApprovalStore,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +22,24 @@ fn registry(root: &TempDir) -> ToolRegistry {
         },
     )
     .expect("registry should initialize")
+}
+
+fn approval_registry(root: &TempDir) -> (ToolRegistry, Arc<WorkspaceApprovalStore>) {
+    let approvals = Arc::new(WorkspaceApprovalStore::new(root.path()).expect("approval store"));
+    let tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            command_timeout: Duration::from_millis(250),
+            max_output_bytes: 1024,
+            max_write_bytes: 1024,
+            allow_write: true,
+            allow_process: false,
+            allowed_programs: None,
+            approvals: Some(Arc::clone(&approvals)),
+        },
+    )
+    .expect("registry should initialize");
+    (tools, approvals)
 }
 
 #[tokio::test]
@@ -254,6 +275,149 @@ async fn write_edit_and_read_use_the_same_canonical_workspace_policy() {
                 .join("note.txt")
         ]
     );
+}
+
+#[tokio::test]
+async fn workspace_writes_require_approval_before_any_mutation() {
+    let root = TempDir::new().expect("tempdir");
+    let (tools, approvals) = approval_registry(&root);
+
+    let error = tools
+        .execute(
+            "write_file",
+            json!({"path": "nested/note.txt", "content": "alpha"}),
+        )
+        .await
+        .expect_err("write must require approval");
+    let request = match error {
+        ToolError::ApprovalRequired { request } => request,
+        other => panic!("expected approval request, got {other}"),
+    };
+    assert_eq!(request.action, DestructiveAction::FilesystemWrite);
+    assert!(request.command.contains("$WORKSPACE/nested/note.txt"));
+    assert!(!root.path().join("nested").exists());
+
+    approvals
+        .record(&request, ApprovalDecision::Deny)
+        .expect("record denial");
+    assert!(!root.path().join("nested/note.txt").exists());
+    assert!(matches!(
+        tools
+            .execute(
+                "write_file",
+                json!({"path": "nested/note.txt", "content": "alpha"})
+            )
+            .await,
+        Err(ToolError::ApprovalRequired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn allow_once_is_consumed_by_exactly_one_valid_workspace_write() {
+    let root = TempDir::new().expect("tempdir");
+    let (tools, approvals) = approval_registry(&root);
+    let request = match tools
+        .execute(
+            "write_file",
+            json!({"path": "note.txt", "content": "alpha"}),
+        )
+        .await
+        .expect_err("write must require approval")
+    {
+        ToolError::ApprovalRequired { request } => request,
+        other => panic!("expected approval request, got {other}"),
+    };
+    approvals
+        .record(&request, ApprovalDecision::AllowOnce)
+        .expect("allow once");
+
+    tools
+        .execute(
+            "write_file",
+            json!({"path": "note.txt", "content": "alpha"}),
+        )
+        .await
+        .expect("one approved write");
+    let edit_error = tools
+        .execute(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "alpha", "new_text": "beta"}),
+        )
+        .await
+        .expect_err("the next write needs a new approval");
+
+    assert!(matches!(edit_error, ToolError::ApprovalRequired { .. }));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("note.txt")).expect("written file"),
+        "alpha"
+    );
+}
+
+#[tokio::test]
+async fn persistent_write_approval_is_scoped_to_its_workspace() {
+    let first = TempDir::new().expect("first workspace");
+    let second = TempDir::new().expect("second workspace");
+    let (first_tools, first_approvals) = approval_registry(&first);
+    let request = match first_tools
+        .execute(
+            "write_file",
+            json!({"path": "note.txt", "content": "alpha"}),
+        )
+        .await
+        .expect_err("write must require approval")
+    {
+        ToolError::ApprovalRequired { request } => request,
+        other => panic!("expected approval request, got {other}"),
+    };
+    first_approvals
+        .record(&request, ApprovalDecision::AlwaysAllowWorkspace)
+        .expect("persistent approval");
+
+    first_tools
+        .execute(
+            "write_file",
+            json!({"path": "note.txt", "content": "alpha"}),
+        )
+        .await
+        .expect("approved write");
+    first_tools
+        .execute(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "alpha", "new_text": "beta"}),
+        )
+        .await
+        .expect("persistent approval covers edit");
+
+    let (second_tools, _) = approval_registry(&second);
+    assert!(matches!(
+        second_tools
+            .execute(
+                "write_file",
+                json!({"path": "note.txt", "content": "outside scope"})
+            )
+            .await,
+        Err(ToolError::ApprovalRequired { .. })
+    ));
+    assert!(!second.path().join("note.txt").exists());
+}
+
+#[tokio::test]
+async fn invalid_or_outside_write_paths_are_hard_denied_without_an_approval_prompt() {
+    let root = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("outside");
+    let (tools, _) = approval_registry(&root);
+
+    for path in [
+        "../outside.txt".to_owned(),
+        outside.path().join("outside.txt").display().to_string(),
+    ] {
+        let error = tools
+            .execute("write_file", json!({"path": path, "content": "blocked"}))
+            .await
+            .expect_err("outside target must be denied");
+        assert!(matches!(error, ToolError::WorkspaceDenied { .. }));
+    }
+    assert!(!outside.path().join("outside.txt").exists());
 }
 
 #[tokio::test]

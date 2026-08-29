@@ -13,10 +13,11 @@ use super::ToolError;
 const APPROVALS_FILE: &str = ".mimir/workspace-permissions.json";
 const AUDIT_FILE: &str = ".mimir/workspace-permissions.audit.jsonl";
 
-/// A destructive operation that needs an explicit workspace-owner decision.
+/// A bounded operation that needs an explicit workspace-owner decision.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestructiveAction {
+    FilesystemWrite,
     Delete,
     GitDestructive,
     ForcePush,
@@ -25,6 +26,7 @@ pub enum DestructiveAction {
 impl DestructiveAction {
     pub const fn label(&self) -> &'static str {
         match self {
+            Self::FilesystemWrite => "write or edit files in this workspace",
             Self::Delete => "delete files or directories",
             Self::GitDestructive => "perform a destructive Git operation",
             Self::ForcePush => "force-push Git history",
@@ -97,6 +99,23 @@ impl WorkspaceApprovalStore {
         let Some(action) = classify_command(command) else {
             return Ok(None);
         };
+        self.requires_action_approval(action, command)
+    }
+
+    /// Returns a request for a known bounded action when it is not covered by
+    /// a one-time or workspace-persistent grant.
+    ///
+    /// Callers must validate their target before invoking this method so an
+    /// approval prompt can never be used to bypass a hard policy denial.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval ledger cannot be read or updated.
+    pub fn requires_action_approval(
+        &self,
+        action: DestructiveAction,
+        command: &str,
+    ) -> Result<Option<PermissionRequest>, ToolError> {
         let mut state = self.load()?;
         if state.always_allowed.contains(&action) {
             Ok(None)
@@ -307,5 +326,21 @@ mod tests {
                 .expect("new request")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn explicit_filesystem_write_action_does_not_depend_on_command_parsing() {
+        let workspace = TempDir::new().expect("workspace");
+        let store = WorkspaceApprovalStore::new(workspace.path()).expect("store");
+        let request = store
+            .requires_action_approval(
+                DestructiveAction::FilesystemWrite,
+                "write_file $WORKSPACE/note.txt",
+            )
+            .expect("request")
+            .expect("approval required");
+
+        assert_eq!(request.action, DestructiveAction::FilesystemWrite);
+        assert_eq!(request.command, "write_file $WORKSPACE/note.txt");
     }
 }

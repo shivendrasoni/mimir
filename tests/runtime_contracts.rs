@@ -16,7 +16,7 @@ use mimir::{
     provider::{FakeProvider, Provider, ProviderError, ProviderEvent, ProviderEventSink},
     runtime::{AgentRuntime, QueueMode, RetryPolicy, RuntimeConfig, RuntimeEvent, VecEventSink},
     session::{InMemorySessionStore, LoadedSession, SessionPayload, SessionRecord, SessionStore},
-    tools::{ToolPolicy, ToolRegistry},
+    tools::{DestructiveAction, ToolPolicy, ToolRegistry, WorkspaceApprovalStore},
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -720,6 +720,63 @@ async fn fake_provider_drives_tool_result_and_final_response_through_persistence
             .iter()
             .any(|event| event.kind() == "completed")
     );
+}
+
+#[tokio::test]
+async fn unapproved_workspace_write_emits_permission_request_without_mutating() {
+    let root = TempDir::new().expect("tempdir");
+    let provider = Arc::new(FakeProvider::new(vec![
+        response(
+            vec![Content::ToolCall(ToolCall {
+                id: "call-write".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "answer.txt", "content": "forty-two"}),
+            })],
+            StopReason::ToolUse,
+            4,
+        ),
+        response(
+            vec![Content::Text {
+                text: "Waiting for approval.".into(),
+            }],
+            StopReason::Stop,
+            4,
+        ),
+    ]));
+    let approvals = Arc::new(WorkspaceApprovalStore::new(root.path()).expect("approval store"));
+    let runtime = AgentRuntime::resume(
+        provider,
+        Arc::new(
+            ToolRegistry::with_default_tools(
+                root.path(),
+                ToolPolicy {
+                    allow_process: false,
+                    approvals: Some(approvals),
+                    ..ToolPolicy::default()
+                },
+            )
+            .expect("tools"),
+        ),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+    let events = VecEventSink::default();
+
+    let answer = runtime
+        .run("write the answer", &events)
+        .await
+        .expect("runtime completes after reporting the blocked tool");
+
+    assert_eq!(answer, "Waiting for approval.");
+    assert!(!root.path().join("answer.txt").exists());
+    assert!(events.events().await.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::PermissionRequested { request }
+            if request.action == DestructiveAction::FilesystemWrite
+                && request.command.contains("$WORKSPACE/answer.txt")
+    )));
 }
 
 #[tokio::test]

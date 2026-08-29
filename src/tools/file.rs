@@ -9,8 +9,8 @@ use walkdir::{DirEntry, WalkDir};
 use crate::model::ToolDefinition;
 
 use super::{
-    Tool, ToolError, ToolObservation, ToolPolicy, WorkspacePathPolicy, object_schema, parse_input,
-    truncate_utf8,
+    DestructiveAction, Tool, ToolError, ToolObservation, ToolPolicy, WorkspacePathPolicy,
+    object_schema, parse_input, truncate_utf8,
 };
 
 macro_rules! file_tool {
@@ -138,6 +138,7 @@ impl Tool for WriteFileTool {
             });
         }
         let path = self.paths.resolve_for_write(&input.path)?;
+        require_write_approval(&self.policy, "write_file", &input.path)?;
         let parent = path.parent().ok_or_else(|| ToolError::Execution {
             tool: "write_file".into(),
             message: "target path has no parent directory".into(),
@@ -213,6 +214,7 @@ impl Tool for EditFileTool {
                 message: format!("result exceeds {} bytes", self.policy.max_write_bytes),
             });
         }
+        require_write_approval(&self.policy, "edit_file", &input.path)?;
         atomic_replace(&path, updated.as_bytes()).await?;
         let mut observation = ToolObservation::success("file edited", "");
         observation.artifacts.push(path);
@@ -467,6 +469,22 @@ fn dot() -> String {
 
 fn default_depth() -> usize {
     2
+}
+
+fn require_write_approval(
+    policy: &ToolPolicy,
+    tool: &str,
+    requested_path: &str,
+) -> Result<(), ToolError> {
+    if let Some(approvals) = &policy.approvals
+        && let Some(request) = approvals.requires_action_approval(
+            DestructiveAction::FilesystemWrite,
+            &format!("{tool} $WORKSPACE/{requested_path}"),
+        )?
+    {
+        return Err(ToolError::ApprovalRequired { request });
+    }
+    Ok(())
 }
 
 async fn atomic_replace(path: &std::path::Path, content: &[u8]) -> Result<(), ToolError> {

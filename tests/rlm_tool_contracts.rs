@@ -272,6 +272,35 @@ async fn tool_inputs_reject_unknown_fields_before_admission() {
 }
 
 #[tokio::test]
+async fn run_accepts_multiline_text_but_rejects_unsafe_controls() {
+    let state = TempDir::new().expect("state");
+    let workspace = TempDir::new().expect("workspace");
+    let (registry, runtime) = registry(&state, &workspace).await;
+
+    registry
+        .execute(
+            "rlm_run",
+            json!({
+                "prompt": "Review:\n\t- provider parity\r\n\t- cancellation",
+                "cellSourceCode": "await rlm.run(\n\t'Review provider parity'\n)"
+            }),
+        )
+        .await
+        .expect("multiline prompt and spawn code should be admitted");
+
+    let error = registry
+        .execute("rlm_run", json!({"prompt": "unsafe\u{0000}prompt"}))
+        .await
+        .expect_err("unsafe controls must still fail");
+    assert!(
+        error
+            .to_string()
+            .contains("control characters other than newlines and tabs")
+    );
+    assert_eq!(runtime.list_subagents().await.expect("children").len(), 1);
+}
+
+#[tokio::test]
 async fn tool_registry_owns_runtime_and_cancels_children_when_parent_is_dropped() {
     let state = TempDir::new().expect("state");
     let workspace = TempDir::new().expect("workspace");

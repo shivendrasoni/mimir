@@ -545,14 +545,14 @@ impl RlmRuntime {
     }
 
     fn validate_run_request(&self, request: &RlmRunRequest) -> Result<u64> {
-        validate_bounded_text(
+        validate_bounded_multiline_text(
             "run prompt",
             &request.prompt,
             self.inner.limits.max_prompt_bytes,
             false,
         )?;
         if let Some(code) = request.spawn_code.as_deref() {
-            validate_bounded_text(
+            validate_bounded_multiline_text(
                 "spawn code",
                 code,
                 self.inner.limits.max_spawn_code_bytes,
@@ -816,6 +816,29 @@ fn validate_bounded_text(
     if value.chars().any(char::is_control) {
         return Err(configuration(format!(
             "RLM {label} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bounded_multiline_text(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if (!allow_empty && value.trim().is_empty()) || value.len() > max_bytes {
+        return Err(configuration(format!(
+            "RLM {label} must contain from {} to {max_bytes} bytes",
+            usize::from(!allow_empty)
+        )));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(configuration(format!(
+            "RLM {label} must not contain control characters other than newlines and tabs"
         )));
     }
     Ok(())

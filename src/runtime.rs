@@ -34,7 +34,7 @@ use crate::{
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
 const MAX_PENDING_AGENT_MESSAGES: usize = 20;
-const PROVENANCE_SYSTEM_GUIDANCE: &str = "Evidence rule: when write_file or edit_file content is derived from a source file, you MUST include provenance.required=true and provenance.derivedFrom entries containing the successful read_file toolCallId and exact path. A failed or unavailable read is not evidence. Do not claim copied, preserved, or source-derived content without those references; read the source successfully or explain that the mutation cannot be completed faithfully.";
+const PROVENANCE_SYSTEM_GUIDANCE: &str = "Evidence rule: when write_file or edit_file content is derived from a source file, include provenance.required=true and one provenance.derivedFrom entry per source with its exact workspace-relative path. A successful read_file toolCallId may be included, but it is optional: omit an uncertain id and Mimir will safely bind the path to the latest successful matching read. Never reuse an id from another path or from a failed read. If evidence is unavailable, read the source successfully before retrying; the tool error returns valid evidence ids when available.";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -2524,9 +2524,11 @@ impl AgentRuntime {
                     sink,
                 )
                 .await?;
-                if let Some(check) =
-                    session_integrity::validate_provenance(&self.messages.lock().await, &call)
-                {
+                if let Some(check) = session_integrity::validate_provenance(
+                    &self.messages.lock().await,
+                    &call,
+                    self.tools.workspace_root(),
+                ) {
                     let detail = serde_json::to_string(&serde_json::json!({
                         "type": "provenance_check",
                         "toolCallId": &call.id,

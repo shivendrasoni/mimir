@@ -153,6 +153,12 @@ impl ToolRegistry {
         )
     }
 
+    /// Returns the canonical workspace root used by filesystem tools.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_root.as_ref()
+    }
+
     fn register(&mut self, tool: impl Tool + 'static) {
         let name = tool.definition().name;
         self.tools.insert(name, Arc::new(tool));

@@ -354,7 +354,7 @@ fn workspace_path_schema(paths: &WorkspacePathPolicy) -> Value {
 fn provenance_schema() -> Value {
     json!({
         "type": "object",
-        "description": "For source-derived content, cite successful read_file calls. Set required=true when the mutation must be faithful to those sources; unavailable required evidence pauses the mutation instead of guessing.",
+        "description": "For source-derived content, cite each source path. Set required=true when the mutation must be faithful to those sources. toolCallId is optional: when omitted or unknown, Mimir safely binds the path to the latest successful matching read_file call. An explicitly failed read or a toolCallId/path mismatch is rejected.",
         "additionalProperties": false,
         "properties": {
             "required": {"type": "boolean"},
@@ -364,10 +364,16 @@ fn provenance_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "toolCallId": {"type": "string"},
-                        "path": {"type": "string"}
+                        "toolCallId": {
+                            "type": "string",
+                            "description": "Optional successful read_file call id. Omit it if unavailable; Mimir resolves the exact path from session evidence."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Exact workspace-relative source path passed to read_file."
+                        }
                     },
-                    "required": ["toolCallId", "path"]
+                    "required": ["path"]
                 }
             }
         }

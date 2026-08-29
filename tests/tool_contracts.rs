@@ -172,6 +172,16 @@ fn filesystem_tool_contracts_expose_the_effective_workspace_and_path_rules() {
             .description
             .contains(&canonical.display().to_string())
     );
+
+    let write = tools
+        .definitions()
+        .into_iter()
+        .find(|definition| definition.name == "write_file")
+        .expect("write definition");
+    let evidence_item =
+        &write.parameters["properties"]["provenance"]["properties"]["derivedFrom"]["items"];
+    assert_eq!(evidence_item["required"], json!(["path"]));
+    assert!(evidence_item["properties"]["toolCallId"].is_object());
 }
 
 #[tokio::test]

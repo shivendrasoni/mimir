@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -173,6 +176,7 @@ pub struct ProvenanceCheck {
     pub allowed: bool,
     pub target_path: Option<String>,
     pub evidence: Vec<EvidenceStatus>,
+    pub valid_evidence: Vec<AvailableEvidence>,
     pub warning: Option<String>,
 }
 
@@ -180,9 +184,18 @@ pub struct ProvenanceCheck {
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceStatus {
     pub tool_call_id: String,
+    pub requested_tool_call_id: Option<String>,
     pub path: String,
     pub available: bool,
+    pub recovered_by_path: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableEvidence {
+    pub tool_call_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,15 +210,28 @@ struct ProvenanceClaim {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EvidenceReference {
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    path: String,
+}
+
+#[derive(Debug)]
+struct ReadEvidence {
     tool_call_id: String,
     path: String,
+    canonical_path: Option<PathBuf>,
+    succeeded: bool,
 }
 
 /// Validates an explicit source-derived mutation claim against successful,
 /// persisted `read_file` evidence. Writes without such a claim remain backward
 /// compatible; a required claim fails closed when its source is unavailable.
 #[must_use]
-pub fn validate_provenance(messages: &[Message], call: &ToolCall) -> Option<ProvenanceCheck> {
+pub fn validate_provenance(
+    messages: &[Message],
+    call: &ToolCall,
+    workspace_root: &Path,
+) -> Option<ProvenanceCheck> {
     if !matches!(call.name.as_str(), "write_file" | "edit_file") {
         return None;
     }
@@ -223,64 +249,219 @@ pub fn validate_provenance(messages: &[Message], call: &ToolCall) -> Option<Prov
                 allowed: false,
                 target_path,
                 evidence: Vec::new(),
+                valid_evidence: Vec::new(),
                 warning: Some(format!("invalid provenance claim: {error}")),
             });
         }
     };
 
-    let mut read_calls = BTreeMap::<String, &str>::new();
-    let mut results = BTreeMap::<String, bool>::new();
-    for message in messages {
-        for content in &message.content {
-            match content {
-                Content::ToolCall(read) if read.name == "read_file" => {
-                    if let Some(path) = read.arguments.get("path").and_then(Value::as_str) {
-                        read_calls.insert(read.id.clone(), path);
-                    }
-                }
-                Content::ToolResult(result) => {
-                    results.insert(result.tool_call_id.clone(), !result.is_error);
-                }
-                _ => {}
-            }
-        }
-    }
-
+    let reads = collect_read_evidence(messages, workspace_root);
     let evidence = claim
         .derived_from
         .into_iter()
-        .map(|reference| {
-            let (available, reason) = match read_calls.get(&reference.tool_call_id) {
-                None => (false, "referenced read_file call is unavailable".to_owned()),
-                Some(path) if *path != reference.path => {
-                    (false, "referenced read_file path does not match".to_owned())
-                }
-                Some(_) if results.get(&reference.tool_call_id) == Some(&true) => {
-                    (true, "successful read_file result is available".to_owned())
-                }
-                Some(_) => (false, "referenced read_file did not succeed".to_owned()),
-            };
-            EvidenceStatus {
-                tool_call_id: reference.tool_call_id,
-                path: reference.path,
-                available,
-                reason,
-            }
-        })
+        .map(|reference| resolve_evidence_reference(reference, &reads, workspace_root))
         .collect::<Vec<_>>();
+    let valid_evidence = valid_evidence_for(&evidence, &reads, workspace_root);
     let unavailable = evidence.iter().any(|item| !item.available);
     let empty_required = claim.required && evidence.is_empty();
     let allowed = !claim.required || (!unavailable && !empty_required);
     let warning = (!allowed).then(|| {
-        "required source evidence is unavailable; mutation paused instead of guessing".into()
+        format!(
+            "required source evidence is unavailable; mutation paused instead of guessing; recovery={}",
+            json!({
+                "code": "required_source_evidence_unavailable",
+                "retryable": true,
+                "validEvidence": &valid_evidence,
+                "instruction": "read each missing path, then retry with its path; toolCallId is optional"
+            })
+        )
     });
     Some(ProvenanceCheck {
         required: claim.required,
         allowed,
         target_path,
         evidence,
+        valid_evidence,
         warning,
     })
+}
+
+fn collect_read_evidence(messages: &[Message], workspace_root: &Path) -> Vec<ReadEvidence> {
+    let mut read_calls = Vec::<(&str, &str)>::new();
+    let mut results = BTreeMap::<String, &ToolResult>::new();
+    for message in messages {
+        for content in &message.content {
+            match content {
+                Content::ToolCall(read) if read.name == "read_file" => {
+                    if let Some(path) = read.arguments.get("path").and_then(Value::as_str) {
+                        read_calls.push((&read.id, path));
+                    }
+                }
+                Content::ToolResult(result) => {
+                    results.insert(result.tool_call_id.clone(), result);
+                }
+                _ => {}
+            }
+        }
+    }
+    read_calls
+        .into_iter()
+        .map(|(tool_call_id, path)| {
+            let result = results.get(tool_call_id).copied();
+            let canonical_path = result
+                .filter(|result| !result.is_error)
+                .and_then(|result| result_artifact_path(result, workspace_root))
+                .or_else(|| canonical_workspace_path(workspace_root, path));
+            ReadEvidence {
+                tool_call_id: tool_call_id.to_owned(),
+                path: path.to_owned(),
+                canonical_path,
+                succeeded: result
+                    .is_some_and(|result| !result.is_error && result.tool_name == "read_file"),
+            }
+        })
+        .collect()
+}
+
+fn resolve_evidence_reference(
+    reference: EvidenceReference,
+    reads: &[ReadEvidence],
+    workspace_root: &Path,
+) -> EvidenceStatus {
+    let requested_tool_call_id = reference
+        .tool_call_id
+        .filter(|tool_call_id| !tool_call_id.trim().is_empty());
+    let canonical_reference = canonical_workspace_path(workspace_root, &reference.path);
+    let requested_read = requested_tool_call_id
+        .as_deref()
+        .and_then(|tool_call_id| reads.iter().find(|read| read.tool_call_id == tool_call_id));
+    let (resolved, available, recovered_by_path, reason) = match (
+        requested_tool_call_id.as_deref(),
+        requested_read,
+        canonical_reference.as_ref(),
+    ) {
+        (_, _, None) => (
+            None,
+            false,
+            false,
+            "source path is not a valid workspace-relative path".to_owned(),
+        ),
+        (Some(_), Some(read), Some(canonical))
+            if read.canonical_path.as_ref() != Some(canonical) =>
+        {
+            (
+                Some(read),
+                false,
+                false,
+                "referenced read_file path does not match".to_owned(),
+            )
+        }
+        (Some(_), Some(read), Some(_)) if !read.succeeded => (
+            Some(read),
+            false,
+            false,
+            "referenced read_file did not succeed".to_owned(),
+        ),
+        (Some(_), Some(read), Some(_)) => (
+            Some(read),
+            true,
+            false,
+            "successful referenced read_file result is available".to_owned(),
+        ),
+        (None, _, Some(canonical)) | (Some(_), None, Some(canonical)) => {
+            match reads
+                .iter()
+                .rev()
+                .find(|read| read.succeeded && read.canonical_path.as_ref() == Some(canonical))
+            {
+                Some(read) => (
+                    Some(read),
+                    true,
+                    true,
+                    "bound source path to the latest successful matching read_file result".into(),
+                ),
+                None => (
+                    None,
+                    false,
+                    false,
+                    "no successful read_file result is available for this path".into(),
+                ),
+            }
+        }
+    };
+    EvidenceStatus {
+        tool_call_id: resolved
+            .map(|read| read.tool_call_id.clone())
+            .or_else(|| requested_tool_call_id.clone())
+            .unwrap_or_default(),
+        requested_tool_call_id,
+        path: reference.path,
+        available,
+        recovered_by_path,
+        reason,
+    }
+}
+
+fn valid_evidence_for(
+    evidence: &[EvidenceStatus],
+    reads: &[ReadEvidence],
+    workspace_root: &Path,
+) -> Vec<AvailableEvidence> {
+    let referenced_paths = evidence
+        .iter()
+        .filter_map(|item| canonical_workspace_path(workspace_root, &item.path))
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    reads
+        .iter()
+        .rev()
+        .filter(|read| {
+            read.succeeded
+                && read
+                    .canonical_path
+                    .as_ref()
+                    .is_some_and(|path| referenced_paths.contains(path))
+                && seen.insert(read.tool_call_id.clone())
+        })
+        .take(16)
+        .map(|read| AvailableEvidence {
+            tool_call_id: read.tool_call_id.clone(),
+            path: read.path.clone(),
+        })
+        .collect()
+}
+
+fn canonical_workspace_path(workspace_root: &Path, requested: &str) -> Option<PathBuf> {
+    let requested = Path::new(requested);
+    if requested.as_os_str().is_empty() || requested.is_absolute() {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for component in requested.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => relative.push(component),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let candidate = workspace_root.join(relative);
+    let canonical = candidate.canonicalize().unwrap_or(candidate);
+    canonical.starts_with(workspace_root).then_some(canonical)
+}
+
+fn result_artifact_path(result: &ToolResult, workspace_root: &Path) -> Option<PathBuf> {
+    let value = serde_json::from_str::<Value>(&result.content).ok()?;
+    let artifact = value
+        .get("artifacts")?
+        .as_array()?
+        .iter()
+        .find_map(Value::as_str)?;
+    let artifact = PathBuf::from(artifact);
+    let canonical = artifact.canonicalize().unwrap_or(artifact);
+    canonical.starts_with(workspace_root).then_some(canonical)
 }
 
 #[cfg(test)]
@@ -289,6 +470,13 @@ mod tests {
 
     use super::*;
     use crate::model::{StopReason, ToolCall};
+
+    fn workspace_root() -> PathBuf {
+        std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir")
+    }
 
     #[test]
     fn compaction_split_keeps_tool_exchange_together() {
@@ -331,10 +519,108 @@ mod tests {
                 }
             }),
         };
-        let check = validate_provenance(&messages, &write).expect("claim");
+        let check = validate_provenance(&messages, &write, &workspace_root()).expect("claim");
         assert!(!check.allowed);
         assert_eq!(check.evidence.len(), 1);
         assert!(!check.evidence[0].available);
+        assert!(check.valid_evidence.is_empty());
+    }
+
+    #[test]
+    fn missing_or_unknown_id_binds_to_latest_successful_matching_read() {
+        let messages = vec![
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "read-old".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "source.css"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("read-old", "read_file", "old", false),
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "read-latest".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "./source.css"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("read-latest", "read_file", "latest", false),
+        ];
+
+        for provenance in [
+            json!({"required": true, "derivedFrom": [{"path": "source.css"}]}),
+            json!({
+                "required": true,
+                "derivedFrom": [{"toolCallId": "invented-id", "path": "source.css"}]
+            }),
+        ] {
+            let write = ToolCall {
+                id: "write-1".into(),
+                name: "write_file".into(),
+                arguments: json!({
+                    "path": "copy.css",
+                    "content": "faithful",
+                    "provenance": provenance
+                }),
+            };
+            let check = validate_provenance(&messages, &write, &workspace_root()).expect("claim");
+            assert!(check.allowed);
+            assert_eq!(check.evidence[0].tool_call_id, "read-latest");
+            assert!(check.evidence[0].recovered_by_path);
+        }
+    }
+
+    #[test]
+    fn explicit_tool_id_path_mismatch_is_rejected_without_fallback() {
+        let messages = vec![
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "read-other".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "other.css"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("read-other", "read_file", "ok", false),
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "read-source".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "source.css"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("read-source", "read_file", "ok", false),
+        ];
+        let write = ToolCall {
+            id: "write-1".into(),
+            name: "write_file".into(),
+            arguments: json!({
+                "path": "copy.css",
+                "content": "not authorized by the claimed id",
+                "provenance": {
+                    "required": true,
+                    "derivedFrom": [{"toolCallId": "read-other", "path": "source.css"}]
+                }
+            }),
+        };
+
+        let check = validate_provenance(&messages, &write, &workspace_root()).expect("claim");
+        assert!(!check.allowed);
+        assert!(!check.evidence[0].recovered_by_path);
+        assert_eq!(
+            check.evidence[0].reason,
+            "referenced read_file path does not match"
+        );
+        assert_eq!(check.valid_evidence[0].tool_call_id, "read-source");
+        assert!(
+            check
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("validEvidence"))
+        );
     }
 
     #[test]

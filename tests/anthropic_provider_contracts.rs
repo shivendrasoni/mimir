@@ -285,8 +285,39 @@ async fn anthropic_auth_failures_are_classified_without_echoing_the_key() {
         .await
         .expect_err("auth failure");
     server.await.expect("server");
-    assert_eq!(error, ProviderError::Authentication);
+    assert_eq!(error, ProviderError::AuthenticationRejected);
     assert!(!format!("{provider:?}").contains("secret-never-print"));
+    assert!(!error.to_string().contains("secret-never-print"));
+}
+
+#[tokio::test]
+async fn anthropic_permission_failures_are_not_refreshable_authentication_errors() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let _ = read_http_request(&mut socket).await;
+        let body =
+            r#"{"type":"error","error":{"type":"permission_error","message":"scope denied"}}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+    });
+    let provider = AnthropicProvider::new(Some(&format!("http://{address}")), "secret-never-print")
+        .expect("provider");
+
+    let error = provider
+        .complete(request())
+        .await
+        .expect_err("permission failure");
+
+    server.await.expect("server");
+    assert_eq!(error, ProviderError::Authentication);
     assert!(!error.to_string().contains("secret-never-print"));
 }
 

@@ -36,6 +36,8 @@ pub use vertex::VertexProvider;
 pub enum ProviderError {
     #[error("provider authentication failed")]
     Authentication,
+    #[error("provider rejected the authentication credential")]
+    AuthenticationRejected,
     #[error("provider rate limited the request: {message}")]
     RateLimited { message: String },
     #[error("provider is temporarily unavailable: {message}")]
@@ -97,6 +99,17 @@ pub trait Provider: Send + Sync {
 pub enum ProviderEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    AuthenticationRefresh {
+        provider: String,
+        status: AuthenticationRefreshStatus,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationRefreshStatus {
+    Started,
+    Succeeded,
+    Failed,
 }
 
 #[async_trait]

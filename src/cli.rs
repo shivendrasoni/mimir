@@ -20,7 +20,8 @@ use crate::{
     atomic::canonical_state_root,
     auth::{
         AuthCredential, AuthStore, CredentialType, DeviceAuthorization, OAuthProvider,
-        PendingOAuth, refresh_oauth, resolve_credential_typed,
+        PendingOAuth, RefreshingOAuthProvider, refresh_stored_oauth_if_expired,
+        resolve_credential_typed,
     },
     config::ProviderConfig,
     daemon::{
@@ -6215,21 +6216,18 @@ async fn build_provider_for_runtime(
             environment_name.unwrap_or("the configured credential environment variable")
         )));
     }
+    let mut stored_oauth = None;
     if environment.is_none()
         && definition.is_some()
         && let Some(AuthCredential::OAuth(credential)) = auth.get(&build.provider).await?
     {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            });
-        if credential.is_expired(now)
-            && let Some(oauth_provider) = OAuthProvider::from_id(&build.provider)
-        {
-            let refreshed = refresh_oauth(oauth_provider, &credential).await?;
-            auth.set_oauth(&build.provider, refreshed).await?;
-        }
+        let credential = if let Some(oauth_provider) = OAuthProvider::from_id(&build.provider) {
+            refresh_stored_oauth_if_expired(&auth, &build.provider, oauth_provider, credential)
+                .await?
+        } else {
+            credential
+        };
+        stored_oauth = Some(credential);
     }
     let model_definition = runtime_model_definition(build)?;
     let runtime_support = if let Some(definition) = definition {
@@ -6371,6 +6369,24 @@ async fn build_provider_for_runtime(
             AnthropicCredentialKind::ApiKey
         };
         let empty_headers = BTreeMap::new();
+        if build.provider == "anthropic"
+            && credential_kind == AnthropicCredentialKind::OAuthToken
+            && let Some(oauth) = stored_oauth
+        {
+            return RefreshingOAuthProvider::anthropic(
+                auth,
+                &build.provider,
+                oauth,
+                base_url.into(),
+                model_definition
+                    .headers
+                    .as_ref()
+                    .unwrap_or(&empty_headers)
+                    .clone(),
+            )
+            .map(|provider| Arc::new(provider) as Arc<dyn Provider>)
+            .map_err(|error| MimirError::Provider(error.to_string()));
+        }
         return AnthropicProvider::with_credential_kind_and_headers(
             Some(base_url),
             credential.expose_for_provider(),

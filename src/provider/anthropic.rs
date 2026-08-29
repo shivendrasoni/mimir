@@ -936,7 +936,8 @@ fn classify_stream_error(value: &Value) -> ProviderError {
         .take(300)
         .collect();
     match kind {
-        Some("authentication_error" | "permission_error") => ProviderError::Authentication,
+        Some("authentication_error") => ProviderError::AuthenticationRejected,
+        Some("permission_error") => ProviderError::Authentication,
         Some("rate_limit_error") => ProviderError::RateLimited { message },
         Some("overloaded_error" | "api_error") => ProviderError::Unavailable { message },
         _ => ProviderError::Protocol { message },
@@ -974,7 +975,10 @@ fn classify_status(
     if status.is_success() {
         return Ok(());
     }
-    if matches!(status.as_u16(), 401 | 403) {
+    if status.as_u16() == 401 {
+        return Err(ProviderError::AuthenticationRejected);
+    }
+    if status.as_u16() == 403 {
         return Err(ProviderError::Authentication);
     }
     let message = safe_error_excerpt(body, credential);

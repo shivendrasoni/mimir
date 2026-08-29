@@ -22,7 +22,9 @@ use crate::{
         UiRequest,
     },
     model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel, ToolResult},
-    provider::{Provider, ProviderError, ProviderEvent, ProviderEventSink},
+    provider::{
+        AuthenticationRefreshStatus, Provider, ProviderError, ProviderEvent, ProviderEventSink,
+    },
     runtime_events::{RuntimeEventBus, RuntimeEventEnvelope, RuntimeEventSource},
     session::{SessionPayload, SessionRecord, SessionStore},
     session_integrity,
@@ -244,12 +246,30 @@ impl EventSink for BroadcastingEventSink<'_> {
 #[async_trait]
 impl ProviderEventSink for RuntimeProviderSink<'_> {
     async fn emit(&self, event: ProviderEvent) {
-        self.emitted.store(true, Ordering::Release);
         match event {
             ProviderEvent::TextDelta(text) => {
+                self.emitted.store(true, Ordering::Release);
                 self.sink.emit(RuntimeEvent::TextDelta { text }).await;
             }
-            ProviderEvent::ThinkingDelta(_) => {}
+            ProviderEvent::ThinkingDelta(_) => {
+                self.emitted.store(true, Ordering::Release);
+            }
+            ProviderEvent::AuthenticationRefresh { provider, status } => {
+                let status = match status {
+                    AuthenticationRefreshStatus::Started => "started",
+                    AuthenticationRefreshStatus::Succeeded => "succeeded",
+                    AuthenticationRefreshStatus::Failed => "failed",
+                };
+                self.sink
+                    .emit(RuntimeEvent::SessionEvent {
+                        event: serde_json::json!({
+                            "type": "oauth_refresh",
+                            "provider": provider,
+                            "status": status,
+                        }),
+                    })
+                    .await;
+            }
         }
     }
 }

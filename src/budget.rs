@@ -6,10 +6,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::model::Usage;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     pub max_turns: u32,
     pub max_tool_calls: u32,
+    /// Cumulative fresh-input plus output token ceiling for one run.
     pub max_tokens: u64,
     pub max_elapsed: Duration,
     pub max_context_messages: usize,
@@ -71,11 +74,16 @@ impl fmt::Display for BudgetPause {
         };
         write!(
             formatter,
-            "{exhausted} {} (turns={}, tool_calls={}, tokens={}, elapsed_ms={})",
+            "{exhausted} {} (turns={}, tool_calls={}, budget_tokens={}, input_tokens={}, cached_tokens={}, fresh_input_tokens={}, output_tokens={}, current_context_tokens={}, elapsed_ms={})",
             self.limit,
             self.usage.turns,
             self.usage.tool_calls,
             self.usage.tokens,
+            self.usage.input_tokens,
+            self.usage.cached_tokens,
+            self.usage.fresh_input_tokens,
+            self.usage.output_tokens,
+            self.usage.current_context_tokens,
             self.usage.elapsed_ms
         )
     }
@@ -113,7 +121,19 @@ impl BudgetError {
 pub struct BudgetSnapshot {
     pub turns: u32,
     pub tool_calls: u32,
+    /// Cumulative operational tokens (fresh input plus output).
     pub tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub fresh_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Provider-reported input size for the most recently completed request.
+    #[serde(default)]
+    pub current_context_tokens: u64,
     pub elapsed_ms: u64,
 }
 
@@ -122,6 +142,11 @@ pub struct BudgetUsage {
     turns: u32,
     tool_calls: u32,
     tokens: u64,
+    input_tokens: u64,
+    cached_tokens: u64,
+    fresh_input_tokens: u64,
+    output_tokens: u64,
+    current_context_tokens: u64,
     started_at: Instant,
 }
 
@@ -131,6 +156,11 @@ impl Default for BudgetUsage {
             turns: 0,
             tool_calls: 0,
             tokens: 0,
+            input_tokens: 0,
+            cached_tokens: 0,
+            fresh_input_tokens: 0,
+            output_tokens: 0,
+            current_context_tokens: 0,
             started_at: Instant::now(),
         }
     }
@@ -142,9 +172,15 @@ impl BudgetUsage {
     /// # Errors
     ///
     /// Reserved for usage-accounting failures. Current counters saturate safely.
-    pub fn record_turn(&mut self, tokens: u64) -> Result<(), BudgetError> {
+    pub fn record_turn(&mut self, usage: Usage) -> Result<(), BudgetError> {
         self.turns = self.turns.saturating_add(1);
-        self.tokens = self.tokens.saturating_add(tokens);
+        let fresh_input_tokens = usage.uncached_input_tokens();
+        self.tokens = self.tokens.saturating_add(usage.budget_tokens());
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(usage.cached_tokens);
+        self.fresh_input_tokens = self.fresh_input_tokens.saturating_add(fresh_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.current_context_tokens = usage.input_tokens;
         Ok(())
     }
 
@@ -186,6 +222,11 @@ impl BudgetUsage {
             turns: self.turns,
             tool_calls: self.tool_calls,
             tokens: self.tokens,
+            input_tokens: self.input_tokens,
+            cached_tokens: self.cached_tokens,
+            fresh_input_tokens: self.fresh_input_tokens,
+            output_tokens: self.output_tokens,
+            current_context_tokens: self.current_context_tokens,
             elapsed_ms: duration_millis(self.started_at.elapsed()),
         }
     }

@@ -52,8 +52,20 @@ fn budget_names_the_first_exhausted_limit() {
     };
     let mut usage = BudgetUsage::default();
 
-    usage.record_turn(40).expect("first turn should fit");
-    usage.record_turn(40).expect("second turn should fit");
+    usage
+        .record_turn(Usage {
+            input_tokens: 20,
+            output_tokens: 20,
+            cached_tokens: 0,
+        })
+        .expect("first turn should fit");
+    usage
+        .record_turn(Usage {
+            input_tokens: 20,
+            output_tokens: 20,
+            cached_tokens: 0,
+        })
+        .expect("second turn should fit");
     assert_eq!(usage.check(&budget), Err(BudgetError::Turns { limit: 2 }));
 }
 
@@ -69,6 +81,61 @@ fn normalized_usage_does_not_double_count_cached_input() {
     let separate = Usage::from_separate_cached_input(30_000, 1_000, 90_000);
     assert_eq!(separate, inclusive);
     assert_eq!(separate.total(), 121_000);
+    assert_eq!(separate.uncached_input_tokens(), 30_000);
+    assert_eq!(separate.budget_tokens(), 31_000);
+}
+
+#[test]
+fn cached_context_replay_does_not_exhaust_the_operational_run_budget() {
+    let budget = Budget {
+        max_turns: 64,
+        max_tokens: 1_000_000,
+        ..Budget::default()
+    };
+    let cached_turn = Usage {
+        input_tokens: 140_000,
+        cached_tokens: 133_000,
+        output_tokens: 3_000,
+    };
+    let mut usage = BudgetUsage::default();
+
+    for _ in 0..7 {
+        usage.record_turn(cached_turn).expect("cached turn");
+    }
+
+    let snapshot = usage.snapshot();
+    assert_eq!(snapshot.input_tokens, 980_000);
+    assert_eq!(snapshot.cached_tokens, 931_000);
+    assert_eq!(snapshot.fresh_input_tokens, 49_000);
+    assert_eq!(snapshot.output_tokens, 21_000);
+    assert_eq!(snapshot.tokens, 70_000);
+    assert_eq!(snapshot.current_context_tokens, 140_000);
+    assert_eq!(usage.check(&budget), Ok(()));
+}
+
+#[test]
+fn genuinely_fresh_usage_still_exhausts_the_operational_run_budget() {
+    let budget = Budget {
+        max_turns: 64,
+        max_tokens: 1_000_000,
+        ..Budget::default()
+    };
+    let fresh_turn = Usage {
+        input_tokens: 140_000,
+        cached_tokens: 0,
+        output_tokens: 3_000,
+    };
+    let mut usage = BudgetUsage::default();
+
+    for _ in 0..7 {
+        usage.record_turn(fresh_turn).expect("fresh turn");
+    }
+
+    assert_eq!(usage.snapshot().tokens, 1_001_000);
+    assert_eq!(
+        usage.check(&budget),
+        Err(BudgetError::Tokens { limit: 1_000_000 })
+    );
 }
 
 #[test]

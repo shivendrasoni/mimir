@@ -121,6 +121,7 @@ pub enum RuntimeEvent {
     RunStarted,
     ProviderRequest {
         turn: u32,
+        estimated_context_tokens: u64,
     },
     MessageStarted {
         message: Message,
@@ -2334,7 +2335,13 @@ impl AgentRuntime {
                 sink,
             )
             .await?;
-            sink.emit(RuntimeEvent::ProviderRequest { turn }).await;
+            let estimated_context_tokens =
+                estimate_request_tokens(&request.system_prompt, &request.messages, &request.tools);
+            sink.emit(RuntimeEvent::ProviderRequest {
+                turn,
+                estimated_context_tokens,
+            })
+            .await;
             sink.emit(RuntimeEvent::MessageStarted {
                 message: Message::assistant_pending(),
             })
@@ -2383,7 +2390,7 @@ impl AgentRuntime {
                 ));
             }
             usage
-                .record_turn(response.message.usage.total())
+                .record_turn(response.message.usage)
                 .map_err(|error| MimirError::BudgetPaused(error.pause(usage.snapshot())))?;
             let assistant_message_id = uuid::Uuid::new_v4().to_string();
             self.dispatch_extension_event(

@@ -59,6 +59,7 @@ mimir
 
 # Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
 mimir --max-turns 128
+mimir --max-run-tokens 2000000
 
 # Versioned JSON events
 mimir --output json --print "summarize the project"
@@ -94,6 +95,11 @@ State defaults to `.mimir/` and uses versioned JSON/JSONL formats.
 The per-prompt provider-turn budget defaults to 64 and can be changed with
 `--max-turns` or `MIMIR_MAX_TURNS`. Reaching it is a recoverable budget pause:
 the session stays intact and a new message starts a fresh per-prompt budget.
+The cumulative run-token budget defaults to 1,000,000 fresh-input plus output
+tokens and can be changed with `--max-run-tokens` or
+`MIMIR_MAX_RUN_TOKENS`. Provider-cached input remains visible in diagnostics
+and context measurements, but replaying it does not consume the run budget a
+second time.
 
 ```bash
 mimir doctor
@@ -134,7 +140,8 @@ diagnostics/
 ```
 
 The recorder runs best-effort in a background thread and cannot fail an agent
-run. It records correlation IDs, event types, timing, usage, byte counts,
+run. It records correlation IDs, event types, timing, raw input, cached input,
+fresh input, output, operational-budget usage, peak context, byte counts,
 hashes, status, and error classes. Prompt text, model output, tool arguments,
 tool output, credentials, environment values, and absolute host paths are not
 stored. If a process exits before its terminal write, readers synthesize an

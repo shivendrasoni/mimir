@@ -227,6 +227,14 @@ pub struct Cli {
         help = "Maximum provider turns in one prompt before pausing; send another prompt to continue"
     )]
     max_turns: u32,
+    #[arg(
+        long,
+        env = "MIMIR_MAX_RUN_TOKENS",
+        default_value_t = 1_000_000,
+        value_parser = parse_positive_u64,
+        help = "Maximum fresh-input plus output tokens in one prompt before pausing"
+    )]
+    max_run_tokens: u64,
     #[arg(long = "socket", visible_alias = "daemon-socket", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[arg(long)]
@@ -307,6 +315,7 @@ struct RuntimeBuildConfig {
     verbose: bool,
     provider_timeout_seconds: u64,
     max_turns: u32,
+    max_run_tokens: u64,
     autonomous_limits: Option<AutonomousLimits>,
     fake_responses: Vec<String>,
     fake_delay_ms: u64,
@@ -355,6 +364,7 @@ impl RuntimeBuildConfig {
             verbose: cli.verbose,
             provider_timeout_seconds: cli.provider_timeout_seconds,
             max_turns: cli.max_turns,
+            max_run_tokens: cli.max_run_tokens,
             autonomous_limits: cli_autonomous_limits(cli),
             fake_responses: cli.fake_responses.clone(),
             fake_delay_ms: cli.fake_delay_ms,
@@ -1057,9 +1067,16 @@ impl EventSink for LegacyRpcEventSink {
     async fn emit(&self, event: RuntimeEvent) {
         let values = match event {
             RuntimeEvent::RunStarted => vec![json!({"type": "agent_start"})],
-            RuntimeEvent::ProviderRequest { turn } => {
+            RuntimeEvent::ProviderRequest {
+                turn,
+                estimated_context_tokens,
+            } => {
                 self.partial_text.lock().await.clear();
-                vec![json!({"type": "turn_start", "turn": turn})]
+                vec![json!({
+                    "type": "turn_start",
+                    "turn": turn,
+                    "estimated_context_tokens": estimated_context_tokens
+                })]
             }
             RuntimeEvent::MessageStarted { message } => {
                 vec![json!({"type": "message_start", "message": message})]
@@ -7004,6 +7021,7 @@ async fn build_runtime_for_session(
     config.thinking_level_map = thinking_level_map;
     config.provider_timeout = std::time::Duration::from_secs(build.provider_timeout_seconds);
     config.budget.max_turns = build.max_turns;
+    config.budget.max_tokens = build.max_run_tokens;
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -9532,13 +9550,25 @@ mod tui_model_selection_tests {
     fn normal_turn_budget_is_practical_configurable_and_positive() {
         let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
         assert_eq!(defaults.max_turns, 64);
+        assert_eq!(defaults.max_run_tokens, 1_000_000);
         assert_eq!(RuntimeBuildConfig::from_cli(&defaults).max_turns, 64);
+        assert_eq!(
+            RuntimeBuildConfig::from_cli(&defaults).max_run_tokens,
+            1_000_000
+        );
 
         let overridden =
-            Cli::try_parse_from(["mimir", "--max-turns", "128"]).expect("turn override");
+            Cli::try_parse_from(["mimir", "--max-turns", "128", "--max-run-tokens", "2000000"])
+                .expect("budget override");
         assert_eq!(overridden.max_turns, 128);
+        assert_eq!(overridden.max_run_tokens, 2_000_000);
         assert_eq!(RuntimeBuildConfig::from_cli(&overridden).max_turns, 128);
+        assert_eq!(
+            RuntimeBuildConfig::from_cli(&overridden).max_run_tokens,
+            2_000_000
+        );
         assert!(Cli::try_parse_from(["mimir", "--max-turns", "0"]).is_err());
+        assert!(Cli::try_parse_from(["mimir", "--max-run-tokens", "0"]).is_err());
     }
 
     #[test]
@@ -9554,7 +9584,7 @@ mod tui_model_selection_tests {
         assert!(matches!(error, DaemonError::BudgetPaused(_)));
         assert_eq!(
             error.to_string(),
-            "budget paused: turn budget exhausted at 64 (turns=64, tool_calls=0, tokens=0, elapsed_ms=0)"
+            "budget paused: turn budget exhausted at 64 (turns=64, tool_calls=0, budget_tokens=0, input_tokens=0, cached_tokens=0, fresh_input_tokens=0, output_tokens=0, current_context_tokens=0, elapsed_ms=0)"
         );
         assert!(!error.to_string().contains("protocol"));
     }
@@ -9873,6 +9903,7 @@ mod tui_model_selection_tests {
             verbose: false,
             provider_timeout_seconds: 900,
             max_turns: 64,
+            max_run_tokens: 1_000_000,
             autonomous_limits: None,
             fake_responses: Vec::new(),
             fake_delay_ms: 0,

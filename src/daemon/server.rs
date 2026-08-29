@@ -2704,9 +2704,13 @@ fn public_runtime_event(
     let sequence = envelope.sequence;
     let event = match envelope.event {
         RuntimeEvent::RunStarted => json!({"type": "agent_start"}),
-        RuntimeEvent::ProviderRequest { turn } => json!({
+        RuntimeEvent::ProviderRequest {
+            turn,
+            estimated_context_tokens,
+        } => json!({
             "type": "turn_start",
             "turnIndex": turn,
+            "estimatedContextTokens": estimated_context_tokens,
             "timestamp": now_ms()
         }),
         RuntimeEvent::MessageStarted { message } => {

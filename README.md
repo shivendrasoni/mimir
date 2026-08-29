@@ -57,6 +57,9 @@ OPENAI_API_KEY=... mimir --model gpt-5-mini --print "inspect this repository"
 # Interactive full-screen TUI; /help lists commands and /quit exits
 mimir
 
+# Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
+mimir --max-turns 128
+
 # Versioned JSON events
 mimir --output json --print "summarize the project"
 
@@ -88,6 +91,9 @@ Providers that are discovery-only or unsupported by the selected runtime fail cl
 ## State and management
 
 State defaults to `.mimir/` and uses versioned JSON/JSONL formats.
+The per-prompt provider-turn budget defaults to 64 and can be changed with
+`--max-turns` or `MIMIR_MAX_TURNS`. Reaching it is a recoverable budget pause:
+the session stays intact and a new message starts a fresh per-prompt budget.
 
 ```bash
 mimir doctor

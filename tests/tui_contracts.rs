@@ -1091,6 +1091,17 @@ fn stream_events_accumulate_transcript_and_pending_assistant_text() {
 }
 
 #[test]
+fn budget_pause_is_an_always_visible_recoverable_warning() {
+    let mut app = App::new(AppConfig::default());
+    app.apply_stream_event(StreamEvent::BudgetPaused(
+        "Budget paused. Send another message to continue.".into(),
+    ));
+    assert_eq!(app.transcript().len(), 1);
+    assert!(app.transcript()[0].text.contains("continue"));
+    assert_eq!(app.transcript()[0].role.label(), "warning");
+}
+
+#[test]
 fn retry_lifecycle_uses_transient_activity_instead_of_noisy_transcript_rows() {
     let mut app = App::new(AppConfig::default());
     app.apply_stream_event(StreamEvent::RetryStarted {

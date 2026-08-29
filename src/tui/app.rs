@@ -230,6 +230,7 @@ pub enum StreamEvent {
     },
     Completed(String),
     Failed(String),
+    BudgetPaused(String),
     ExtensionUi {
         extension: String,
         request: crate::extensions::UiRequest,
@@ -1200,6 +1201,14 @@ impl App {
                 self.current_activity = None;
                 self.transcript.push(TranscriptEntry {
                     role: TranscriptRole::Error,
+                    text: message,
+                });
+            }
+            StreamEvent::BudgetPaused(message) => {
+                self.active_assistant = None;
+                self.current_activity = None;
+                self.transcript.push(TranscriptEntry {
+                    role: TranscriptRole::Warning,
                     text: message,
                 });
             }

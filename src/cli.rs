@@ -219,6 +219,14 @@ pub struct Cli {
         help = "Maximum time to wait for one provider request before treating it as unavailable"
     )]
     provider_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "MIMIR_MAX_TURNS",
+        default_value_t = 64,
+        value_parser = parse_positive_u32,
+        help = "Maximum provider turns in one prompt before pausing; send another prompt to continue"
+    )]
+    max_turns: u32,
     #[arg(long = "socket", visible_alias = "daemon-socket", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[arg(long)]
@@ -298,6 +306,7 @@ struct RuntimeBuildConfig {
     offline: bool,
     verbose: bool,
     provider_timeout_seconds: u64,
+    max_turns: u32,
     autonomous_limits: Option<AutonomousLimits>,
     fake_responses: Vec<String>,
     fake_delay_ms: u64,
@@ -348,6 +357,7 @@ impl RuntimeBuildConfig {
             offline: cli.offline,
             verbose: cli.verbose,
             provider_timeout_seconds: cli.provider_timeout_seconds,
+            max_turns: cli.max_turns,
             autonomous_limits: cli_autonomous_limits(cli),
             fake_responses: cli.fake_responses.clone(),
             fake_delay_ms: cli.fake_delay_ms,
@@ -1753,6 +1763,13 @@ fn diagnostic_outcome<T, E: std::fmt::Display>(
                 DiagnosticOutcome::Failed
             }
         }
+    }
+}
+
+fn daemon_runtime_error(error: MimirError) -> DaemonError {
+    match error {
+        MimirError::BudgetPaused(pause) => DaemonError::BudgetPaused(pause.to_string()),
+        other => DaemonError::Protocol(other.to_string()),
     }
 }
 
@@ -3692,7 +3709,7 @@ impl RuntimePromptHandler {
             answer = runtime
                 .run(&continuation, &StdoutEventSink { enabled: false })
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
         }
     }
 
@@ -4057,10 +4074,10 @@ impl RuntimePromptHandler {
         runtime
             .run_pending_steering(&StdoutEventSink { enabled: false })
             .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+            .map_err(daemon_runtime_error)?;
         self.run_pending_follow_ups(session_id, runtime)
             .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+            .map_err(daemon_runtime_error)?;
         self.dispatch_recovered_commands(session_id, runtime, None)
             .await?;
         Ok(Value::Null)
@@ -4715,11 +4732,11 @@ impl PromptHandler for RuntimePromptHandler {
             let mut answer = runtime
                 .run(&request.prompt, &StdoutEventSink { enabled: false })
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
             if let Some(follow_up_answer) = self
                 .run_pending_follow_ups(&request.session_id, runtime.as_ref())
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?
+                .map_err(daemon_runtime_error)?
             {
                 answer = follow_up_answer;
             }
@@ -4761,11 +4778,11 @@ impl PromptHandler for RuntimePromptHandler {
             let mut answer = runtime
                 .run_batch_messages(&[message], &StdoutEventSink { enabled: false })
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
             if let Some(follow_up_answer) = self
                 .run_pending_follow_ups(&request.session_id, runtime.as_ref())
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?
+                .map_err(daemon_runtime_error)?
             {
                 answer = follow_up_answer;
             }
@@ -5019,7 +5036,7 @@ impl PromptHandler for RuntimePromptHandler {
             runtime
                 .run_pending_steering(&StdoutEventSink { enabled: false })
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
             self.dispatch_recovered_commands(
                 session_id,
                 runtime.as_ref(),
@@ -5076,7 +5093,7 @@ impl PromptHandler for RuntimePromptHandler {
             .await?;
             self.run_pending_follow_ups(session_id, runtime.as_ref())
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
             self.dispatch_recovered_commands(
                 session_id,
                 runtime.as_ref(),
@@ -5610,12 +5627,12 @@ impl PromptHandler for RuntimePromptHandler {
                 .run_pending_steering(&StdoutEventSink { enabled: false })
                 .await
                 .map(|answer| answer.unwrap_or_else(|| "heartbeat steered active turn".into()))
-                .map_err(|error| DaemonError::Protocol(error.to_string()));
+                .map_err(daemon_runtime_error);
         }
         runtime
             .run(&request.prompt, &StdoutEventSink { enabled: false })
             .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))
+            .map_err(daemon_runtime_error)
     }
 
     async fn handle_agent_message(
@@ -5653,7 +5670,7 @@ impl PromptHandler for RuntimePromptHandler {
             runtime
                 .run(&request.prompt, &StdoutEventSink { enabled: false })
                 .await
-                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                .map_err(daemon_runtime_error)?;
         }
         Ok(AgentMessageDelivery {
             queued,
@@ -6976,6 +6993,7 @@ async fn build_runtime_for_session(
     config.supported_thinking_levels = supported_thinking_levels;
     config.thinking_level_map = thinking_level_map;
     config.provider_timeout = std::time::Duration::from_secs(build.provider_timeout_seconds);
+    config.budget.max_turns = build.max_turns;
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -9453,8 +9471,10 @@ mod tui_model_selection_tests {
 
     use crate::{
         auth::{AuthStore, OAuthCredential},
-        daemon::{PromptHandler, PublicDaemonCommand},
+        budget::{BudgetKind, BudgetPause, BudgetSnapshot},
+        daemon::{DaemonError, PromptHandler, PublicDaemonCommand},
         diagnostics::{DiagnosticOutcome, diagnostics_root, list_runs, load_bundle},
+        error::MimirError,
         model::{Message, ThinkingLevel},
         runtime::QueueMode,
         session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
@@ -9465,9 +9485,10 @@ mod tui_model_selection_tests {
     use super::{
         Cli, Command, ConfigCommand, OutputMode, PackageCommand, RuntimeBuildConfig,
         RuntimePromptHandler, ScheduleCommand, UpdateAction, activate_single_stored_provider,
-        build_runtime_for_session, parse_recovered_goal_create, parse_recovered_refine_args,
-        resolve_extension_flags, resolve_runtime_thinking_level, resolve_tui_model_selection,
-        run_self_update, runtime_model_definition, send_public_command, tui_model_options,
+        build_runtime_for_session, daemon_runtime_error, parse_recovered_goal_create,
+        parse_recovered_refine_args, resolve_extension_flags, resolve_runtime_thinking_level,
+        resolve_tui_model_selection, run_self_update, runtime_model_definition,
+        send_public_command, tui_model_options,
     };
 
     #[test]
@@ -9495,6 +9516,37 @@ mod tui_model_selection_tests {
         let overridden = Cli::try_parse_from(["mimir", "--provider-timeout-seconds", "1800"])
             .expect("timeout override");
         assert_eq!(overridden.provider_timeout_seconds, 1_800);
+    }
+
+    #[test]
+    fn normal_turn_budget_is_practical_configurable_and_positive() {
+        let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
+        assert_eq!(defaults.max_turns, 64);
+        assert_eq!(RuntimeBuildConfig::from_cli(&defaults).max_turns, 64);
+
+        let overridden =
+            Cli::try_parse_from(["mimir", "--max-turns", "128"]).expect("turn override");
+        assert_eq!(overridden.max_turns, 128);
+        assert_eq!(RuntimeBuildConfig::from_cli(&overridden).max_turns, 128);
+        assert!(Cli::try_parse_from(["mimir", "--max-turns", "0"]).is_err());
+    }
+
+    #[test]
+    fn daemon_preserves_budget_pause_as_a_non_protocol_error() {
+        let error = daemon_runtime_error(MimirError::BudgetPaused(BudgetPause {
+            kind: BudgetKind::Turns,
+            limit: 64,
+            usage: BudgetSnapshot {
+                turns: 64,
+                ..BudgetSnapshot::default()
+            },
+        }));
+        assert!(matches!(error, DaemonError::BudgetPaused(_)));
+        assert_eq!(
+            error.to_string(),
+            "budget paused: turn budget exhausted at 64 (turns=64, tool_calls=0, tokens=0, elapsed_ms=0)"
+        );
+        assert!(!error.to_string().contains("protocol"));
     }
 
     #[test]
@@ -9810,6 +9862,7 @@ mod tui_model_selection_tests {
             offline: false,
             verbose: false,
             provider_timeout_seconds: 900,
+            max_turns: 64,
             autonomous_limits: None,
             fake_responses: Vec::new(),
             fake_delay_ms: 0,

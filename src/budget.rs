@@ -22,7 +22,7 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_turns: 12,
+            max_turns: 64,
             max_tool_calls: 48,
             max_tokens: 1_000_000,
             max_elapsed: Duration::from_secs(30 * 60),

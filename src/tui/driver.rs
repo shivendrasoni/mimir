@@ -404,9 +404,9 @@ impl EventSink for TuiSink {
             }),
             RuntimeEvent::Completed { text } => Some(StreamEvent::Completed(text)),
             RuntimeEvent::Failed { message } => Some(StreamEvent::Failed(message)),
-            RuntimeEvent::BudgetPaused { pause } => {
-                Some(StreamEvent::Failed(format!("Budget paused: {pause}")))
-            }
+            RuntimeEvent::BudgetPaused { pause } => Some(StreamEvent::BudgetPaused(format!(
+                "Budget paused: {pause}. Send another message to continue, or restart with --max-turns <N>."
+            ))),
             RuntimeEvent::ProviderRequest { .. } => Some(StreamEvent::Activity("Thinking…".into())),
             RuntimeEvent::ToolStarted { name, .. } => {
                 Some(StreamEvent::Activity(tool_activity(&name)))

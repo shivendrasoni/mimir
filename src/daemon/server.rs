@@ -74,12 +74,38 @@ pub enum DaemonError {
     Configuration(String),
     #[error("daemon protocol error: {0}")]
     Protocol(String),
+    #[error("budget paused: {0}")]
+    BudgetPaused(String),
     #[error("daemon transport unsupported on this platform: {0}")]
     UnsupportedTransport(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl DaemonError {
+    fn response_code(&self) -> &'static str {
+        match self {
+            Self::BudgetPaused(_) => "budget_paused",
+            Self::Configuration(_)
+            | Self::Protocol(_)
+            | Self::UnsupportedTransport(_)
+            | Self::Io(_)
+            | Self::Json(_) => "request_failed",
+        }
+    }
+
+    fn response_message(&self) -> String {
+        match self {
+            Self::BudgetPaused(message) => message.clone(),
+            Self::Configuration(_)
+            | Self::Protocol(_)
+            | Self::UnsupportedTransport(_)
+            | Self::Io(_)
+            | Self::Json(_) => self.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -323,7 +349,11 @@ impl DaemonClient {
         }
         match envelope.payload {
             ServerResponse::Failure(FailureResponse { code, message }) => {
-                Err(DaemonError::Protocol(format!("{code}: {message}")))
+                if code == "budget_paused" {
+                    Err(DaemonError::BudgetPaused(message))
+                } else {
+                    Err(DaemonError::Protocol(format!("{code}: {message}")))
+                }
             }
             response => Ok(response),
         }
@@ -739,8 +769,10 @@ impl ServerCore {
                 PublicDispatch { frames, shutdown }
             }
             Err(error) => {
-                let message = error.to_string();
-                let code = if message.contains("recognized public daemon command") {
+                let message = error.response_message();
+                let code = if matches!(error, DaemonError::BudgetPaused(_)) {
+                    "budget_paused"
+                } else if message.contains("recognized public daemon command") {
                     "unsupported_command"
                 } else if message.contains("recognized but not supported") {
                     "unsupported_command_feature"
@@ -3792,8 +3824,8 @@ async fn handle_stream(
         match core.process(request.payload).await {
             Ok(response) => response,
             Err(error) => ServerResponse::Failure(FailureResponse {
-                code: "request_failed".into(),
-                message: error.to_string(),
+                code: error.response_code().into(),
+                message: error.response_message(),
             }),
         }
     } else {
@@ -3991,7 +4023,11 @@ async fn request_over_stream(
     }
     match envelope.payload {
         ServerResponse::Failure(FailureResponse { code, message }) => {
-            Err(DaemonError::Protocol(format!("{code}: {message}")))
+            if code == "budget_paused" {
+                Err(DaemonError::BudgetPaused(message))
+            } else {
+                Err(DaemonError::Protocol(format!("{code}: {message}")))
+            }
         }
         response => Ok(response),
     }

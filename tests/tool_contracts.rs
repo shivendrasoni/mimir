@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use mimir::tools::{BashRunner, ObservationStatus, ToolPolicy, ToolRegistry};
 use serde_json::json;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 fn registry(root: &TempDir) -> ToolRegistry {
     ToolRegistry::with_default_tools(
@@ -113,7 +114,7 @@ async fn process_tool_caps_observation_bytes() {
     let tools = ToolRegistry::with_default_tools(
         root.path(),
         ToolPolicy {
-            command_timeout: Duration::from_secs(2),
+            command_timeout: Duration::from_secs(10),
             max_output_bytes: 8,
             max_write_bytes: 1024,
             allow_write: true,
@@ -138,6 +139,230 @@ async fn process_tool_caps_observation_bytes() {
         "unexpected summary: {}; content: {:?}",
         observation.summary,
         observation.content
+    );
+}
+
+fn process_registry(
+    root: &TempDir,
+    timeout: Duration,
+    max_output_bytes: usize,
+    allowed_programs: &[&str],
+) -> ToolRegistry {
+    ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            command_timeout: timeout,
+            max_output_bytes,
+            max_write_bytes: 1024,
+            allow_write: true,
+            allow_process: true,
+            allowed_programs: Some(
+                allowed_programs
+                    .iter()
+                    .map(|program| (*program).to_owned())
+                    .collect(),
+            ),
+            approvals: None,
+        },
+    )
+    .expect("registry should initialize")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_captures_fast_silent_and_search_commands() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(root.path().join("needle.txt"), "fixture").expect("fixture");
+    let tools = process_registry(
+        &root,
+        Duration::from_secs(10),
+        64 * 1024,
+        &["mkdir", "find"],
+    );
+
+    let mkdir = tools
+        .execute(
+            "run_process",
+            json!({"program": "mkdir", "args": ["-p", "nested/path"]}),
+        )
+        .await
+        .expect("mkdir should execute");
+    assert_eq!(mkdir.status, ObservationStatus::Success);
+    assert!(!mkdir.summary.contains("timed out"));
+    assert!(root.path().join("nested/path").is_dir());
+
+    let find = tools
+        .execute(
+            "run_process",
+            json!({"program": "find", "args": [".", "-name", "needle.txt"]}),
+        )
+        .await
+        .expect("find should execute");
+    assert_eq!(find.status, ObservationStatus::Success);
+    assert_eq!(find.content.trim(), "./needle.txt");
+    assert!(!find.summary.contains("timed out"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_preserves_stderr_and_nonzero_exit() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = process_registry(&root, Duration::from_secs(10), 1024, &["sh"]);
+
+    let observation = tools
+        .execute(
+            "run_process",
+            json!({"program": "sh", "args": ["-c", "printf failure >&2; exit 7"]}),
+        )
+        .await
+        .expect("process should execute");
+
+    assert_eq!(observation.status, ObservationStatus::Error);
+    assert_eq!(observation.content, "failure");
+    assert!(observation.summary.contains("exited with 7"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_handles_repeated_fast_processes_without_false_timeouts() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = process_registry(&root, Duration::from_secs(10), 1024, &["printf"]);
+
+    for index in 0..100 {
+        let observation = tools
+            .execute(
+                "run_process",
+                json!({"program": "printf", "args": [index.to_string()]}),
+            )
+            .await
+            .expect("printf should execute");
+        assert_eq!(observation.status, ObservationStatus::Success);
+        assert_eq!(observation.content, index.to_string());
+        assert!(!observation.summary.contains("timed out"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "10,000-process reliability soak; run explicitly before releases"]
+async fn process_tool_fast_process_release_soak() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = process_registry(&root, Duration::from_secs(1), 16, &["printf"]);
+
+    for _ in 0..10_000 {
+        let observation = tools
+            .execute("run_process", json!({"program": "printf", "args": ["ok"]}))
+            .await
+            .expect("printf should execute");
+        assert_eq!(observation.status, ObservationStatus::Success);
+        assert_eq!(observation.content, "ok");
+        assert!(!observation.summary.contains("timed out"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_handles_concurrent_fast_processes() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = Arc::new(process_registry(
+        &root,
+        Duration::from_secs(10),
+        1024,
+        &["printf"],
+    ));
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let tools = Arc::clone(&tools);
+        tasks.push(tokio::spawn(async move {
+            tools
+                .execute(
+                    "run_process",
+                    json!({"program": "printf", "args": [index.to_string()]}),
+                )
+                .await
+                .expect("printf should execute")
+        }));
+    }
+
+    for task in tasks {
+        let observation = task.await.expect("process task");
+        assert_eq!(observation.status, ObservationStatus::Success);
+        assert!(!observation.summary.contains("timed out"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_distinguishes_inherited_pipe_drain_from_execution_timeout() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = process_registry(&root, Duration::from_secs(10), 1024, &["sh"]);
+    let started = std::time::Instant::now();
+
+    let observation = tools
+        .execute(
+            "run_process",
+            json!({
+                "program": "sh",
+                "args": ["-c", "(sleep 1; printf leaked > descendant.txt) & printf ready"]
+            }),
+        )
+        .await
+        .expect("shell should execute");
+
+    assert_eq!(observation.status, ObservationStatus::Warning);
+    assert_eq!(observation.content, "ready");
+    assert!(observation.summary.contains("output pipes remained open"));
+    assert!(!observation.summary.contains("process execution timed out"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert!(
+        !root.path().join("descendant.txt").exists(),
+        "the inherited-descriptor process should have been terminated with its group"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_tool_cancellation_stops_the_process_group() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = Arc::new(process_registry(
+        &root,
+        Duration::from_secs(30),
+        1024,
+        &["sh"],
+    ));
+    let cancellation = CancellationToken::new();
+    let running = {
+        let tools = Arc::clone(&tools);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tools
+                .execute_cancellable(
+                    "run_process",
+                    json!({
+                        "program": "sh",
+                        "args": ["-c", "(sleep 1; printf leaked > cancelled.txt) & wait"]
+                    }),
+                    &cancellation,
+                )
+                .await
+                .expect("cancellation should be an observation")
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    let observation = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("cancelled process should return promptly")
+        .expect("process task");
+
+    assert_eq!(observation.status, ObservationStatus::Error);
+    assert!(observation.summary.contains("cancelled"));
+    assert!(!observation.summary.contains("timed out"));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        !root.path().join("cancelled.txt").exists(),
+        "cancellation should terminate descendants in the process group"
     );
 }
 

@@ -1043,7 +1043,7 @@ async fn dispatch_coordinator_action(
 ) -> Result<Option<String>> {
     match action {
         TuiAction::WorkspacePermission { request, decision } => runtime_factory
-            .record_workspace_permission(request.clone(), decision.clone())
+            .record_workspace_permission(request.clone(), *decision)
             .await
             .map(Some),
         TuiAction::Resume { session } => {

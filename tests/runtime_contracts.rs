@@ -1307,14 +1307,16 @@ async fn budget_pause_persists_synthetic_results_for_every_pending_tool_call() {
     let result_ids = loaded
         .records
         .iter()
-        .filter_map(|record| match &record.payload {
-            SessionPayload::Message(message) => {
-                message.content.iter().find_map(|content| match content {
+        .flat_map(|record| match &record.payload {
+            SessionPayload::Message(message) => message
+                .content
+                .iter()
+                .filter_map(|content| match content {
                     Content::ToolResult(result) => Some(result.tool_call_id.clone()),
                     _ => None,
                 })
-            }
-            _ => None,
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         })
         .collect::<Vec<_>>();
     assert_eq!(result_ids, ["call-one", "call-two"]);

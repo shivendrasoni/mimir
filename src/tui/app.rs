@@ -1365,10 +1365,10 @@ impl App {
 
         match (&self.overlay, &event.code) {
             (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Up) => {
-                self.apply_action(Action::SelectPrev)
+                self.apply_action(Action::SelectPrev);
             }
             (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Down) => {
-                self.apply_action(Action::SelectNext)
+                self.apply_action(Action::SelectNext);
             }
             (
                 Overlay::Selector(_)
@@ -1683,6 +1683,10 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "overlay confirmation keeps each mutually exclusive UI state transition explicit"
+    )]
     fn confirm_overlay(&mut self) {
         if let Overlay::Confirm { action, .. } = &self.overlay {
             self.pending_tui_action = Some((**action).clone());
@@ -1909,7 +1913,7 @@ impl App {
 
     fn move_selection(&mut self, delta: isize) {
         if let Overlay::WorkspacePermission { selected, .. } = &mut self.overlay {
-            *selected = (*selected as isize + delta).rem_euclid(3) as usize;
+            *selected = ((*selected).cast_signed() + delta).rem_euclid(3) as usize;
             return;
         }
         let Overlay::Selector(selector) = &mut self.overlay else {

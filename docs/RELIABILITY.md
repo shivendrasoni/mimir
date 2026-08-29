@@ -19,8 +19,9 @@ Every release must preserve these invariants:
 5. Active context is measured independently from cumulative provider usage.
    Context compaction happens before the projected request exceeds its configured
    threshold.
-6. Tool output placed in model context is bounded. Full retained output is an
-   external artifact referenced by identifier and digest.
+6. Tool output placed in model context is bounded. The unprojected result stays
+   in durable session history while the provider receives a labelled bounded
+   projection.
 7. Workspace file tools accept only non-empty workspace-relative paths without
    parent traversal. Process argument checks are advisory; real process isolation
    requires an operating-system sandbox.
@@ -36,7 +37,7 @@ Every release must preserve these invariants:
 
 | Domain | Stable class | Examples | Retry policy |
 | --- | --- | --- | --- |
-| Provider | `provider_authentication` | expired Claude/OpenAI login | Never automatic |
+| Provider | `provider_authentication` | expired Claude/OpenAI login | One coalesced refresh and request retry for stored OAuth; otherwise stop |
 | Provider | `provider_rate_limited` | HTTP 429 | Bounded backoff |
 | Provider | `provider_unavailable` | timeout, connection reset, 5xx | Bounded backoff |
 | Provider | `provider_protocol` | malformed SSE, incomplete tool JSON | No blind retry; preserve evidence |
@@ -100,7 +101,7 @@ until its control is wired and documented by its implementation.
 | `diagnostics.journal` | Write versioned run bundles and terminal summaries | Disable new writes; retain readable bundles |
 | `process.capture_v2` | Use coordinated child-exit and pipe-drain capture | Restore legacy capture without changing policy |
 | `context.token_compaction` | Compact from projected token pressure | Restore message-count compaction |
-| `context.artifact_offload` | Replace large tool output with bounded references | Keep bounded inline output only |
+| `context.bounded_projection` | Send bounded tool output while retaining full session evidence | Reduce the projection limit; never discard durable evidence |
 | `workspace.path_guidance` | Publish `$WORKSPACE` contract and actionable errors | Restore legacy descriptions, never weaken canonical file checks |
 | `integrity.tool_pairs` | Validate/repair orphan tool calls before provider use | Stop with a classified session error |
 | `integrity.provenance` | Warn or pause on unsupported source-derived claims | Emit warning-only observations |

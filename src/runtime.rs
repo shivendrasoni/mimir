@@ -21,7 +21,7 @@ use crate::{
         LifecycleInterception, LifecycleMutation, LifecycleReplacement, SessionStartReason,
         UiRequest,
     },
-    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel, ToolResult},
+    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel},
     provider::{
         AuthenticationRefreshStatus, Provider, ProviderError, ProviderEvent, ProviderEventSink,
     },
@@ -2840,7 +2840,6 @@ impl AgentRuntime {
         pause: BudgetPause,
         sink: &dyn EventSink,
     ) -> Result<Vec<Message>> {
-        let mut contents = Vec::with_capacity(calls.len());
         for call in calls {
             let observation = ToolObservation {
                 status: ObservationStatus::Error,
@@ -2851,12 +2850,6 @@ impl AgentRuntime {
                 artifacts: Vec::new(),
                 content: String::new(),
             };
-            contents.push(Content::ToolResult(ToolResult {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                content: serde_json::to_string(&observation)?,
-                is_error: true,
-            }));
             sink.emit(RuntimeEvent::ToolFinished {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -2864,7 +2857,8 @@ impl AgentRuntime {
             })
             .await;
         }
-        let result = Message::tool_results(contents);
+        let result =
+            session_integrity::interrupted_tool_results(calls, &format!("budget paused: {pause}"));
         self.persist_message(result.clone()).await?;
         Ok(vec![result])
     }

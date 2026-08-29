@@ -1734,8 +1734,15 @@ async fn dispatch_run_with_diagnostics(
     let result = dispatch_run(cli, runtime, initial_prompt).await;
     let _ = stop_sender.send(());
     let _ = collector.await;
-    let outcome = match &result {
-        Ok(()) => DiagnosticOutcome::Completed,
+    journal.finish(diagnostic_outcome(&result));
+    result
+}
+
+fn diagnostic_outcome<T, E: std::fmt::Display>(
+    result: &std::result::Result<T, E>,
+) -> DiagnosticOutcome {
+    match result {
+        Ok(_) => DiagnosticOutcome::Completed,
         Err(error) => {
             let message = error.to_string().to_ascii_lowercase();
             if message.contains("budget") || message.contains("token budget") {
@@ -1746,9 +1753,7 @@ async fn dispatch_run_with_diagnostics(
                 DiagnosticOutcome::Failed
             }
         }
-    };
-    journal.finish(outcome);
-    result
+    }
 }
 
 async fn dispatch_run(
@@ -3479,6 +3484,20 @@ struct RuntimePromptHandler {
     headless_gates: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+struct ActiveDiagnosticCollector {
+    journal: DiagnosticJournal,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ActiveDiagnosticCollector {
+    async fn finish(self, outcome: DiagnosticOutcome) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+        self.journal.finish(outcome);
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScopedModelSelection {
@@ -3572,6 +3591,67 @@ impl RuntimePromptHandler {
             .entry(session_id.into())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    async fn start_diagnostic_collector(
+        &self,
+        session_id: &str,
+        runtime: &AgentRuntime,
+    ) -> ActiveDiagnosticCollector {
+        let (provider, model, _) = runtime.model_selection().await;
+        let journal = DiagnosticJournal::start(
+            diagnostics_root(&self.state_root),
+            DiagnosticManifest {
+                schema_version: crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
+                run_id: Uuid::new_v4(),
+                session_id: session_id.into(),
+                started_at: chrono::Utc::now(),
+                mimir_version: env!("CARGO_PKG_VERSION").into(),
+                provider,
+                model,
+                workspace: "$WORKSPACE".into(),
+                configuration: DiagnosticConfiguration {
+                    output_mode: "daemon".into(),
+                    offline: self.build.offline,
+                    autonomous: self.build.autonomous_limits.is_some(),
+                },
+                privacy: DiagnosticPrivacy::default(),
+            },
+        );
+        let mut receiver = runtime.subscribe_events();
+        let collector_journal = journal.clone();
+        let (stop, mut stop_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut recorder = RuntimeDiagnosticRecorder::default();
+            loop {
+                tokio::select! {
+                    event_result = receiver.recv() => match event_result {
+                        Ok(envelope) => recorder.record(&collector_journal, &envelope.event),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            collector_journal.note_dropped(skipped);
+                            recorder.record(
+                                &collector_journal,
+                                &RuntimeEvent::SessionEvent {
+                                    event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
+                                },
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = &mut stop_receiver => {
+                        while let Ok(envelope) = receiver.try_recv() {
+                            recorder.record(&collector_journal, &envelope.event);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        ActiveDiagnosticCollector {
+            journal,
+            stop,
+            task,
+        }
     }
 
     async fn run_autonomous_continuations(
@@ -4405,7 +4485,7 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
         let store = WorkspaceApprovalStore::new(&self.build.workspace)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
         store
-            .record(&request, decision.clone())
+            .record(&request, decision)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
         Ok(match decision {
             crate::tools::ApprovalDecision::AllowOnce => {
@@ -4622,31 +4702,39 @@ impl PromptHandler for RuntimePromptHandler {
             .runtime(&request.session_id)
             .await
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        self.dispatch_recovered_commands(
-            &request.session_id,
-            runtime.as_ref(),
-            Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
-        )
-        .await?;
-        let mut answer = runtime
-            .run(&request.prompt, &StdoutEventSink { enabled: false })
-            .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        if let Some(follow_up_answer) = self
-            .run_pending_follow_ups(&request.session_id, runtime.as_ref())
-            .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?
-        {
-            answer = follow_up_answer;
+        let diagnostics = self
+            .start_diagnostic_collector(&request.session_id, runtime.as_ref())
+            .await;
+        let result = async {
+            self.dispatch_recovered_commands(
+                &request.session_id,
+                runtime.as_ref(),
+                Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
+            )
+            .await?;
+            let mut answer = runtime
+                .run(&request.prompt, &StdoutEventSink { enabled: false })
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+            if let Some(follow_up_answer) = self
+                .run_pending_follow_ups(&request.session_id, runtime.as_ref())
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            {
+                answer = follow_up_answer;
+            }
+            self.dispatch_recovered_commands(
+                &request.session_id,
+                runtime.as_ref(),
+                Some(crate::daemon::turn_ops::RecoveredDelivery::WhenIdle),
+            )
+            .await?;
+            self.run_autonomous_continuations(&request.session_id, runtime.as_ref(), answer)
+                .await
         }
-        self.dispatch_recovered_commands(
-            &request.session_id,
-            runtime.as_ref(),
-            Some(crate::daemon::turn_ops::RecoveredDelivery::WhenIdle),
-        )
-        .await?;
-        self.run_autonomous_continuations(&request.session_id, runtime.as_ref(), answer)
-            .await
+        .await;
+        diagnostics.finish(diagnostic_outcome(&result)).await;
+        result
     }
 
     async fn handle_prompt_message(
@@ -4660,31 +4748,39 @@ impl PromptHandler for RuntimePromptHandler {
             .runtime(&request.session_id)
             .await
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        self.dispatch_recovered_commands(
-            &request.session_id,
-            runtime.as_ref(),
-            Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
-        )
-        .await?;
-        let mut answer = runtime
-            .run_batch_messages(&[message], &StdoutEventSink { enabled: false })
-            .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        if let Some(follow_up_answer) = self
-            .run_pending_follow_ups(&request.session_id, runtime.as_ref())
-            .await
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?
-        {
-            answer = follow_up_answer;
+        let diagnostics = self
+            .start_diagnostic_collector(&request.session_id, runtime.as_ref())
+            .await;
+        let result = async {
+            self.dispatch_recovered_commands(
+                &request.session_id,
+                runtime.as_ref(),
+                Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
+            )
+            .await?;
+            let mut answer = runtime
+                .run_batch_messages(&[message], &StdoutEventSink { enabled: false })
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+            if let Some(follow_up_answer) = self
+                .run_pending_follow_ups(&request.session_id, runtime.as_ref())
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            {
+                answer = follow_up_answer;
+            }
+            self.dispatch_recovered_commands(
+                &request.session_id,
+                runtime.as_ref(),
+                Some(crate::daemon::turn_ops::RecoveredDelivery::WhenIdle),
+            )
+            .await?;
+            self.run_autonomous_continuations(&request.session_id, runtime.as_ref(), answer)
+                .await
         }
-        self.dispatch_recovered_commands(
-            &request.session_id,
-            runtime.as_ref(),
-            Some(crate::daemon::turn_ops::RecoveredDelivery::WhenIdle),
-        )
-        .await?;
-        self.run_autonomous_continuations(&request.session_id, runtime.as_ref(), answer)
-            .await
+        .await;
+        diagnostics.finish(diagnostic_outcome(&result)).await;
+        result
     }
 
     async fn session_messages(
@@ -6006,7 +6102,7 @@ fn activate_migrated_preferences(
 
 /// Uses an unambiguous saved login when the caller did not choose a provider.
 ///
-/// The CLI historically defaulted to OpenAI before consulting the auth store,
+/// The CLI historically defaulted to `OpenAI` before consulting the auth store,
 /// which made `mimir login anthropic` insufficient for a bare `mimir` launch.
 /// A command-line provider and migrated preferences retain precedence; this
 /// fallback applies only when one stored credential can run natively.
@@ -6036,14 +6132,14 @@ async fn activate_single_stored_provider(
     };
 
     let mut activated = build.clone();
-    activated.provider = provider.clone();
+    activated.provider.clone_from(provider);
     activated.base_url = None;
     if !activated.model_explicit {
-        activated.model = registry
+        registry
             .get(provider)
             .and_then(|definition| definition.default_model)
             .unwrap_or("gpt-5-mini")
-            .to_owned();
+            .clone_into(&mut activated.model);
     }
     Ok(activated)
 }
@@ -9358,6 +9454,7 @@ mod tui_model_selection_tests {
     use crate::{
         auth::{AuthStore, OAuthCredential},
         daemon::{PromptHandler, PublicDaemonCommand},
+        diagnostics::{DiagnosticOutcome, diagnostics_root, list_runs, load_bundle},
         model::{Message, ThinkingLevel},
         runtime::QueueMode,
         session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
@@ -9954,6 +10051,13 @@ mod tui_model_selection_tests {
             .expect("handled");
         assert_eq!(status["continuationsUsed"], 3);
         assert_eq!(status["turnsUsed"], 4);
+        let runs = list_runs(&diagnostics_root(state.path())).expect("daemon diagnostic runs");
+        assert_eq!(runs.len(), 1);
+        let bundle = load_bundle(&diagnostics_root(state.path()), &runs[0].run_id.to_string())
+            .expect("daemon diagnostic bundle");
+        let summary = bundle.summary.expect("daemon diagnostic summary");
+        assert_eq!(summary.outcome, DiagnosticOutcome::Completed);
+        assert_eq!(summary.provider_requests, 4);
     }
 
     #[test]

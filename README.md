@@ -166,11 +166,10 @@ The TUI `/traces preview` remains available and now links its session metadata
 to matching diagnostic run IDs.
 
 Direct text, JSON, JSON-RPC, ACP, autonomous, REPL, and TUI processes attach the
-diagnostic collector at CLI dispatch. Daemon-managed prompts execute in the
-long-lived daemon process and require the same collector to be attached at the
-daemon prompt lifecycle; until that integration is enabled, their session
-records remain visible through `/traces` but they do not claim a per-prompt
-diagnostic bundle.
+diagnostic collector at CLI dispatch. Each daemon-managed prompt attaches its
+own collector for the complete prompt lifecycle, including queued follow-ups
+and autonomous continuations, so long-lived daemon sessions produce one bounded
+bundle per admitted prompt.
 
 ## RLM and continual harness
 

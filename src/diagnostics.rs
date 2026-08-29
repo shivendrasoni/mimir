@@ -145,6 +145,9 @@ pub enum DiagnosticEventKind {
     Failed {
         error: ErrorMetadata,
     },
+    BudgetPaused {
+        error: ErrorMetadata,
+    },
     ExtensionEvent {
         event: String,
         extension_id: String,
@@ -152,6 +155,10 @@ pub enum DiagnosticEventKind {
     },
     SessionEvent {
         event_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
 }
 
@@ -173,6 +180,7 @@ impl DiagnosticEventKind {
             Self::AutoRetryFinished { .. } => "auto_retry_finished",
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
+            Self::BudgetPaused { .. } => "budget_paused",
             Self::ExtensionEvent { .. } => "extension_event",
             Self::SessionEvent { .. } => "session_event",
         }
@@ -186,7 +194,9 @@ impl DiagnosticEventKind {
             Self::AutoRetryFinished { success: true, .. } | Self::Completed { .. } => {
                 Some("success")
             }
-            Self::AutoRetryFinished { success: false, .. } | Self::Failed { .. } => Some("error"),
+            Self::AutoRetryFinished { success: false, .. }
+            | Self::Failed { .. }
+            | Self::BudgetPaused { .. } => Some("error"),
             _ => None,
         }
     }
@@ -273,8 +283,20 @@ pub enum FailureCode {
     Timeout,
     PermissionDenied,
     ProviderError,
+    ProviderAuthentication,
+    ProviderRateLimited,
+    ProviderUnavailable,
+    ProviderProtocol,
     Cancelled,
     ExtensionError,
+    ProcessSpawnFailed,
+    ProcessExitNonzero,
+    ProcessExecutionTimeout,
+    ProcessPipeDrainTimeout,
+    ProcessOutputLimit,
+    ProcessCancelled,
+    WorkspacePathInvalid,
+    WorkspaceTargetOutside,
     Unknown,
 }
 
@@ -659,6 +681,16 @@ impl RuntimeDiagnosticRecorder {
                 },
                 None,
             ),
+            RuntimeEvent::BudgetPaused { pause } => (
+                DiagnosticEventKind::BudgetPaused {
+                    error: error_metadata(
+                        &pause.to_string(),
+                        FailureComponent::Runtime,
+                        FailureSeverity::Error,
+                    ),
+                },
+                None,
+            ),
             RuntimeEvent::ExtensionUi { extension, .. } => (
                 DiagnosticEventKind::ExtensionEvent {
                     event: "ui".into(),
@@ -697,6 +729,14 @@ impl RuntimeDiagnosticRecorder {
                         .get("type")
                         .and_then(Value::as_str)
                         .map_or_else(|| "unknown".into(), safe_identifier),
+                    status: event
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(safe_identifier),
+                    provider: event
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(safe_identifier),
                 },
                 None,
             ),
@@ -1042,8 +1082,49 @@ fn error_metadata(
     severity: FailureSeverity,
 ) -> ErrorMetadata {
     let lower = message.to_ascii_lowercase();
-    let code = if lower.contains("budget") || lower.contains("token") {
+    let code = if lower.contains("output pipes remained open") || lower.contains("drain deadline") {
+        FailureCode::ProcessPipeDrainTimeout
+    } else if lower.contains("process execution timed out") {
+        FailureCode::ProcessExecutionTimeout
+    } else if lower.contains("process output exceeded") {
+        FailureCode::ProcessOutputLimit
+    } else if lower.contains("process cancelled") {
+        FailureCode::ProcessCancelled
+    } else if lower.contains("process exited with") {
+        FailureCode::ProcessExitNonzero
+    } else if lower.contains("run_process") && lower.contains("spawn") {
+        FailureCode::ProcessSpawnFailed
+    } else if lower.contains("outside $workspace") || lower.contains("outside the workspace") {
+        FailureCode::WorkspaceTargetOutside
+    } else if lower.contains("workspace-relative")
+        || lower.contains("parent traversal")
+        || lower.contains("path must be")
+    {
+        FailureCode::WorkspacePathInvalid
+    } else if lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("oauth")
+        || lower.contains("http 401")
+    {
+        FailureCode::ProviderAuthentication
+    } else if lower.contains("rate limit") || lower.contains("http 429") {
+        FailureCode::ProviderRateLimited
+    } else if lower.contains("provider unavailable")
+        || lower.contains("connection reset")
+        || lower.contains("service unavailable")
+    {
+        FailureCode::ProviderUnavailable
+    } else if lower.contains("malformed")
+        || lower.contains("truncated stream")
+        || lower.contains("incomplete tool")
+    {
+        FailureCode::ProviderProtocol
+    } else if lower.contains("budget") || lower.contains("token") {
         FailureCode::BudgetExhausted
+    } else if component == FailureComponent::Provider
+        && (lower.contains("timed out") || lower.contains("timeout"))
+    {
+        FailureCode::ProviderUnavailable
     } else if lower.contains("timed out") || lower.contains("timeout") {
         FailureCode::Timeout
     } else if lower.contains("permission") || lower.contains("denied") {
@@ -1601,5 +1682,45 @@ mod tests {
         assert_eq!(json["error"]["component"], "tool");
         assert_eq!(json["error"]["severity"], "error");
         assert!(!json.to_string().contains("/Users/example"));
+    }
+
+    #[test]
+    fn reliability_failures_keep_domain_specific_codes() {
+        let cases = [
+            (
+                "process execution timed out after 120000 ms",
+                FailureCode::ProcessExecutionTimeout,
+            ),
+            (
+                "output pipes remained open past the drain deadline",
+                FailureCode::ProcessPipeDrainTimeout,
+            ),
+            (
+                "tool run_process failed: spawn failed: executable missing",
+                FailureCode::ProcessSpawnFailed,
+            ),
+            (
+                "workspace policy denied path ../outside: parent traversal is not allowed",
+                FailureCode::WorkspacePathInvalid,
+            ),
+            (
+                "target is outside $WORKSPACE",
+                FailureCode::WorkspaceTargetOutside,
+            ),
+            (
+                "malformed SSE provider event",
+                FailureCode::ProviderProtocol,
+            ),
+            (
+                "provider authentication rejected after oauth refresh",
+                FailureCode::ProviderAuthentication,
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                error_metadata(message, FailureComponent::Runtime, FailureSeverity::Error).code,
+                expected
+            );
+        }
     }
 }

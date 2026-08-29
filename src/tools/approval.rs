@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -31,7 +32,7 @@ impl DestructiveAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     AllowOnce,
@@ -70,6 +71,10 @@ pub struct WorkspaceApprovalStore {
 
 impl WorkspaceApprovalStore {
     /// Opens the approval ledger for an existing workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace cannot be canonicalized.
     pub fn new(workspace: &Path) -> Result<Self, ToolError> {
         Ok(Self {
             root: Arc::new(workspace.canonicalize()?),
@@ -84,6 +89,10 @@ impl WorkspaceApprovalStore {
     }
 
     /// Returns a request when an operation is not covered by a durable grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval ledger cannot be read or updated.
     pub fn requires_approval(&self, command: &str) -> Result<Option<PermissionRequest>, ToolError> {
         let Some(action) = classify_command(command) else {
             return Ok(None);
@@ -104,6 +113,10 @@ impl WorkspaceApprovalStore {
 
     /// Records the visible user decision. A one-time grant is retained only
     /// until the next matching operation consumes it; an always grant persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval or audit ledger cannot be written.
     pub fn record(
         &self,
         request: &PermissionRequest,
@@ -131,7 +144,6 @@ impl WorkspaceApprovalStore {
         if let Some(parent) = audit_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

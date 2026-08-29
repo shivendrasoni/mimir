@@ -63,10 +63,15 @@ pub struct BudgetPause {
 
 impl fmt::Display for BudgetPause {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exhausted = match self.kind {
+            BudgetKind::Turns => "turn budget exhausted at",
+            BudgetKind::ToolCalls => "tool-call budget exhausted at",
+            BudgetKind::Tokens => "token budget exhausted at",
+            BudgetKind::Elapsed => "elapsed-time budget exhausted after",
+        };
         write!(
             formatter,
-            "{:?} limit {} reached (turns={}, tool_calls={}, tokens={}, elapsed_ms={})",
-            self.kind,
+            "{exhausted} {} (turns={}, tool_calls={}, tokens={}, elapsed_ms={})",
             self.limit,
             self.usage.turns,
             self.usage.tool_calls,

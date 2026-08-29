@@ -30,6 +30,10 @@ fn run_id_from_list(state: &Path) -> String {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end contract verifies one complete diagnostic bundle and its privacy properties"
+)]
 fn a_run_creates_a_queryable_privacy_safe_bundle() {
     let workspace = TempDir::new().expect("workspace");
     let state = workspace.path().join("state");

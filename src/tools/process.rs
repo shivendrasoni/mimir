@@ -90,6 +90,10 @@ impl Tool for ProcessTool {
 }
 
 impl ProcessTool {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "process validation, approval, execution, and typed outcome projection stay together for auditability"
+    )]
     async fn execute_inner(
         &self,
         input: Value,
@@ -143,7 +147,7 @@ impl ProcessTool {
         }
         let child = command.spawn().map_err(|error| ToolError::Execution {
             tool: "run_process".into(),
-            message: error.to_string(),
+            message: format!("spawn failed: {error}"),
         })?;
         let capture = capture_bounded(
             child,
@@ -247,6 +251,10 @@ impl CaptureOutcome {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one coordinator must own child wait, cancellation, output bounds, and pipe-drain deadlines"
+)]
 async fn capture_bounded(
     mut child: Child,
     timeout: Duration,
@@ -371,7 +379,7 @@ async fn capture_bounded(
         content,
         exit_label: status
             .as_ref()
-            .and_then(|value| value.code())
+            .and_then(std::process::ExitStatus::code)
             .map_or_else(|| "signal".into(), |code| code.to_string()),
         exit_code: status.as_ref().and_then(std::process::ExitStatus::code),
         success: status

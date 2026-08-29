@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::model::ToolDefinition;
 
@@ -33,6 +33,30 @@ file_tool!(WriteFileTool);
 file_tool!(EditFileTool);
 file_tool!(ListFilesTool);
 file_tool!(SearchTool);
+
+const DISCOVERY_EXCLUDED_DIRECTORIES: &[&str] = &[
+    ".mimir",
+    ".git",
+    ".hg",
+    ".svn",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+];
+const MAX_LIST_ENTRIES: usize = 500;
+const MAX_SEARCH_FILES: usize = 10_000;
+const MAX_SEARCH_MATCHES: usize = 200;
+const MAX_SEARCH_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_SEARCH_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,7 +235,10 @@ impl Tool for ListFilesTool {
         definition(
             &self.paths,
             "list_files",
-            "List files under a directory",
+            &format!(
+                "List files under a directory. Recursive discovery skips harness state, version-control metadata, dependencies, and generated outputs ({})",
+                DISCOVERY_EXCLUDED_DIRECTORIES.join(", ")
+            ),
             &[],
         )
     }
@@ -219,15 +246,21 @@ impl Tool for ListFilesTool {
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {
         let input: ListInput = parse_input("list_files", input)?;
         let root = self.paths.resolve_existing(&input.path)?;
+        ensure_discovery_root("list_files", self.paths.root(), &root)?;
         let mut entries = Vec::new();
+        let mut bounded = false;
         for entry in WalkDir::new(&root)
             .max_depth(input.max_depth.min(20))
             .into_iter()
+            .filter_entry(include_discovery_entry)
             .filter_map(Result::ok)
-            .take(500)
         {
             if entry.path() == root {
                 continue;
+            }
+            if entries.len() == MAX_LIST_ENTRIES {
+                bounded = true;
+                break;
             }
             if let Ok(relative) = entry.path().strip_prefix(self.paths.root()) {
                 entries.push(relative.display().to_string());
@@ -237,7 +270,7 @@ impl Tool for ListFilesTool {
         let joined = entries.join("\n");
         let (content, truncated) = truncate_utf8(&joined, self.policy.max_output_bytes);
         Ok(ToolObservation::success(
-            if truncated {
+            if bounded || truncated {
                 "files listed; output truncated"
             } else {
                 "files listed"
@@ -261,7 +294,8 @@ impl Tool for SearchTool {
         ToolDefinition {
             name: "search".into(),
             description: format!(
-                "Search UTF-8 files with a regular expression. {}",
+                "Search UTF-8 files with a regular expression. Recursive search skips harness state, version-control metadata, dependencies, and generated outputs ({}). Use read_file only when a specific internal file is deliberately needed. {}",
+                DISCOVERY_EXCLUDED_DIRECTORIES.join(", "),
                 self.paths.path_guidance()
             ),
             parameters: object_schema(
@@ -281,13 +315,22 @@ impl Tool for SearchTool {
             message: error.to_string(),
         })?;
         let root = self.paths.resolve_existing(&input.path)?;
-        let mut matches = Vec::new();
-        for entry in WalkDir::new(root)
+        ensure_discovery_root("search", self.paths.root(), &root)?;
+        let output_limit = self.policy.max_output_bytes.min(MAX_SEARCH_OUTPUT_BYTES);
+        let mut output = String::new();
+        let mut matches = 0_usize;
+        let mut bounded = false;
+        'files: for (files_scanned, entry) in WalkDir::new(root)
             .into_iter()
+            .filter_entry(include_discovery_entry)
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
-            .take(10_000)
+            .enumerate()
         {
+            if files_scanned == MAX_SEARCH_FILES {
+                bounded = true;
+                break;
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
@@ -295,40 +338,84 @@ impl Tool for SearchTool {
                 .policy
                 .max_output_bytes
                 .saturating_mul(16)
-                .max(1024 * 1024);
+                .clamp(1024 * 1024, MAX_SEARCH_FILE_BYTES);
             if metadata.len() > u64::try_from(max_scan_bytes).unwrap_or(u64::MAX) {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            let Ok(file_content) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            for (index, line) in content.lines().enumerate() {
+            for (index, line) in file_content.lines().enumerate() {
                 if regex.is_match(line) {
+                    if matches == MAX_SEARCH_MATCHES {
+                        bounded = true;
+                        break 'files;
+                    }
                     let relative = entry
                         .path()
                         .strip_prefix(self.paths.root())
                         .unwrap_or(entry.path());
-                    matches.push(format!("{}:{}:{line}", relative.display(), index + 1));
-                    if matches.len() == 500 {
-                        break;
+                    let rendered = format!("{}:{}:{line}", relative.display(), index + 1);
+                    let separator_bytes = usize::from(!output.is_empty());
+                    let remaining = output_limit.saturating_sub(output.len());
+                    if separator_bytes + rendered.len() > remaining {
+                        if separator_bytes < remaining && separator_bytes == 1 {
+                            output.push('\n');
+                        }
+                        let remaining = output_limit.saturating_sub(output.len());
+                        let (partial, _) = truncate_utf8(&rendered, remaining);
+                        output.push_str(&partial);
+                        bounded = true;
+                        break 'files;
                     }
+                    if separator_bytes == 1 {
+                        output.push('\n');
+                    }
+                    output.push_str(&rendered);
+                    matches += 1;
                 }
             }
-            if matches.len() == 500 {
-                break;
-            }
         }
-        let joined = matches.join("\n");
-        let (content, truncated) = truncate_utf8(&joined, self.policy.max_output_bytes);
         Ok(ToolObservation::success(
-            if truncated {
+            if bounded {
                 "search complete; output truncated"
             } else {
                 "search complete"
             },
-            content,
+            output,
         ))
     }
+}
+
+fn include_discovery_entry(entry: &DirEntry) -> bool {
+    entry.depth() == 0
+        || !entry.file_type().is_dir()
+        || !DISCOVERY_EXCLUDED_DIRECTORIES
+            .iter()
+            .any(|excluded| entry.file_name().to_str() == Some(excluded))
+}
+
+fn ensure_discovery_root(
+    tool: &str,
+    workspace_root: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), ToolError> {
+    let relative = root.strip_prefix(workspace_root).unwrap_or(root);
+    let excluded = relative.components().find_map(|component| {
+        let component = component.as_os_str().to_str()?;
+        DISCOVERY_EXCLUDED_DIRECTORIES
+            .contains(&component)
+            .then_some(component)
+    });
+    if let Some(excluded) = excluded {
+        return Err(ToolError::Execution {
+            tool: tool.into(),
+            message: format!(
+                "recursive discovery excludes '{excluded}' to prevent harness state, dependencies, or generated output from entering model context; use read_file with a specific file path only when that internal file is deliberately needed"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn definition(

@@ -278,6 +278,103 @@ async fn write_file_creates_missing_nested_workspace_directories() {
 }
 
 #[tokio::test]
+async fn recursive_discovery_excludes_internal_dependency_and_generated_trees() {
+    let root = TempDir::new().expect("tempdir");
+    let excluded = [
+        ".mimir/diagnostics/run/events.jsonl",
+        ".git/logs/HEAD",
+        "node_modules/package/index.js",
+        "target/debug/build.log",
+        "dist/bundle.js",
+        "build/output.txt",
+    ];
+    for path in excluded {
+        let path = root.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+        std::fs::write(path, "self-referential-needle").expect("excluded fixture");
+    }
+    std::fs::create_dir_all(root.path().join("src")).expect("source directory");
+    std::fs::write(
+        root.path().join("src/main.rs"),
+        "// self-referential-needle",
+    )
+    .expect("source fixture");
+    let tools = ToolRegistry::with_default_tools(root.path(), ToolPolicy::default())
+        .expect("registry should initialize");
+
+    let search = tools
+        .execute("search", json!({"pattern": "self-referential-needle"}))
+        .await
+        .expect("workspace search");
+    assert_eq!(search.content, "src/main.rs:1:// self-referential-needle");
+
+    let listed = tools
+        .execute("list_files", json!({"path": ".", "max_depth": 8}))
+        .await
+        .expect("workspace listing");
+    assert!(listed.content.contains("src/main.rs"));
+    for directory in [".mimir", ".git", "node_modules", "target", "dist", "build"] {
+        assert!(
+            !listed.content.contains(directory),
+            "recursive listing leaked excluded directory {directory}: {}",
+            listed.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn recursive_mimir_search_is_rejected_but_targeted_read_remains_available() {
+    let root = TempDir::new().expect("tempdir");
+    let diagnostic = root.path().join(".mimir/diagnostics/run/events.jsonl");
+    std::fs::create_dir_all(diagnostic.parent().expect("diagnostic parent"))
+        .expect("diagnostic directory");
+    std::fs::write(&diagnostic, "private diagnostic marker").expect("diagnostic fixture");
+    let tools = ToolRegistry::with_default_tools(root.path(), ToolPolicy::default())
+        .expect("registry should initialize");
+
+    let error = tools
+        .execute("search", json!({"path": ".mimir", "pattern": "marker"}))
+        .await
+        .expect_err("recursive internal-state search must fail closed");
+    let message = error.to_string();
+    assert!(
+        message.contains("recursive discovery excludes '.mimir'"),
+        "{message}"
+    );
+    assert!(message.contains("read_file"), "{message}");
+
+    let read = tools
+        .execute(
+            "read_file",
+            json!({"path": ".mimir/diagnostics/run/events.jsonl"}),
+        )
+        .await
+        .expect("a deliberately targeted internal read remains possible");
+    assert_eq!(read.content, "private diagnostic marker");
+}
+
+#[tokio::test]
+async fn search_results_are_bounded_below_the_general_tool_output_limit() {
+    let root = TempDir::new().expect("tempdir");
+    let lines = (0..400)
+        .map(|index| format!("bounded-needle-{index:04}-{}", "x".repeat(128)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(root.path().join("many.txt"), lines).expect("search fixture");
+    let tools = ToolRegistry::with_default_tools(root.path(), ToolPolicy::default())
+        .expect("registry should initialize");
+
+    let search = tools
+        .execute("search", json!({"pattern": "bounded-needle"}))
+        .await
+        .expect("bounded search");
+
+    assert!(search.content.len() <= 16 * 1024);
+    assert!(search.summary.contains("truncated"), "{}", search.summary);
+    assert!(search.content.contains("many.txt:1:"));
+}
+
+#[tokio::test]
 async fn process_tool_times_out_and_returns_a_recovery_hint() {
     let root = TempDir::new().expect("tempdir");
     let tools = registry(&root);

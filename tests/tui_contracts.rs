@@ -17,7 +17,7 @@ use mimir::{
     session::{
         FileSessionStore, InMemorySessionStore, SessionPayload, SessionRecord, SessionStore,
     },
-    tools::{ToolPolicy, ToolRegistry},
+    tools::{ApprovalDecision, DestructiveAction, PermissionRequest, ToolPolicy, ToolRegistry},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -1099,6 +1099,38 @@ fn budget_pause_is_an_always_visible_recoverable_warning() {
     assert_eq!(app.transcript().len(), 1);
     assert!(app.transcript()[0].text.contains("continue"));
     assert_eq!(app.transcript()[0].role.label(), "warning");
+}
+
+#[test]
+fn filesystem_write_permission_uses_existing_three_way_tui_decision_flow() {
+    let request = PermissionRequest {
+        action: DestructiveAction::FilesystemWrite,
+        command: "write_file $WORKSPACE/src/main.rs".into(),
+    };
+    let mut app = App::new(AppConfig::default());
+    app.open_workspace_permission(request.clone());
+
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 24,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+    assert!(rendered.contains("Workspace permission required"));
+    assert!(rendered.contains("write or edit files in this workspace"));
+    assert!(rendered.contains("Always allow for this workspace"));
+
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::WorkspacePermission {
+            request,
+            decision: ApprovalDecision::AllowOnce,
+        })
+    );
 }
 
 #[test]

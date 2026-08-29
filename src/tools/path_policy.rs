@@ -147,7 +147,7 @@ impl WorkspacePathPolicy {
             return Err(ToolError::WorkspaceDenied {
                 path: requested.into(),
                 reason: format!(
-                    "'..' parent traversal is not allowed; use a path relative to workspace root '{}'. If the target is outside that root, restart Mimir with a broader --workspace, copy it into the workspace, or use a separately approved external-access mechanism",
+                    "'..' parent traversal is not allowed; use a path relative to workspace root '{}'. If the target is outside that root, restart Mimir with a broader --workspace or copy it into the workspace",
                     self.root.display()
                 ),
             });
@@ -189,7 +189,7 @@ impl WorkspacePathPolicy {
 
     fn outside_workspace_reason(&self, resolved: &Path) -> String {
         format!(
-            "target '{}' is outside workspace root '{}'; restart Mimir with a broader --workspace that contains the target, copy it into the workspace, or use a separately approved external-access mechanism",
+            "target '{}' is outside workspace root '{}'; restart Mimir with a broader --workspace that contains the target or copy it into the workspace",
             resolved.display(),
             self.root.display()
         )

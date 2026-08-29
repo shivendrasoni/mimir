@@ -1327,6 +1327,62 @@ async fn budget_pause_persists_synthetic_results_for_every_pending_tool_call() {
 }
 
 #[tokio::test]
+async fn cached_replay_across_seven_large_tool_turns_does_not_pause_at_one_million_raw_tokens() {
+    let root = TempDir::new().expect("tempdir");
+    let mut responses = (0..7)
+        .map(|index| {
+            let mut response = response(
+                vec![Content::ToolCall(ToolCall {
+                    id: format!("cached-call-{index}"),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "missing.txt"}),
+                })],
+                StopReason::ToolUse,
+                143_000,
+            );
+            response.message.usage = Usage {
+                input_tokens: 140_000,
+                cached_tokens: 133_000,
+                output_tokens: 3_000,
+            };
+            response
+        })
+        .collect::<Vec<_>>();
+    responses.push(response(
+        vec![Content::Text {
+            text: "completed after cached replay".into(),
+        }],
+        StopReason::Stop,
+        1_000,
+    ));
+    let provider = Arc::new(FakeProvider::new(responses));
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig {
+            budget: Budget {
+                max_tokens: 1_000_000,
+                ..Budget::default()
+            },
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+
+    let output = runtime
+        .run("inspect the project", &VecEventSink::default())
+        .await
+        .expect("cached replay must remain below the operational budget");
+
+    assert_eq!(output, "completed after cached replay");
+    assert_eq!(provider.requests().await.len(), 8);
+}
+
+#[tokio::test]
 async fn resume_durably_repairs_trailing_orphaned_tool_calls() {
     let provider = Arc::new(FakeProvider::new(vec![response(
         vec![Content::Text { text: "ok".into() }],

@@ -25,7 +25,7 @@ use crate::{
     auth::{AuthStore, DeviceAuthorization, OAuthProvider, PendingOAuth},
     error::Result,
     mcp::{McpAuthCoordinator, McpOAuthAuthorization, McpOAuthClient, McpOAuthCodeReceiver},
-    model::{Content, Message, Role},
+    model::{Content, Message, Role, Usage},
     orchestration::{
         GoalStatus, GoalStore, HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule,
         ScheduleStore,
@@ -2912,23 +2912,31 @@ async fn render_context_tree(runtime: &AgentRuntime) -> Result<String> {
     let messages = runtime.messages_snapshot().await;
     let children = runtime.context_children(64).await?;
     let (provider, model, _) = runtime.model_selection().await;
-    let (input, output, cached) =
-        messages
-            .iter()
-            .fold((0_u64, 0_u64, 0_u64), |(input, output, cached), message| {
-                (
-                    input.saturating_add(message.usage.input_tokens),
-                    output.saturating_add(message.usage.output_tokens),
-                    cached.saturating_add(message.usage.cached_tokens),
-                )
-            });
-    let total = input.saturating_add(output).saturating_add(cached);
+    let usage = messages
+        .iter()
+        .fold(Usage::default(), |usage, message| Usage {
+            input_tokens: usage
+                .input_tokens
+                .saturating_add(message.usage.input_tokens),
+            output_tokens: usage
+                .output_tokens
+                .saturating_add(message.usage.output_tokens),
+            cached_tokens: usage
+                .cached_tokens
+                .saturating_add(message.usage.cached_tokens),
+        });
+    let input = usage.input_tokens;
+    let output = usage.output_tokens;
+    let cached = usage.cached_tokens;
+    let fresh_input = usage.uncached_input_tokens();
+    let raw_total = usage.total();
+    let operational_total = usage.budget_tokens();
     let child_output = children
         .iter()
         .map(|child| child.output_tokens)
         .fold(0_u64, u64::saturating_add);
     let mut tree = format!(
-        "Context Tree\n└─ main agent [active] {provider}/{model}\n   Messages: {}\n   Own/total usage: input {input}, output {output}, cache read {cached}, total {total}\n   Tree output usage: {}\n   Cost: unavailable (provider pricing is not exposed by the native runtime)",
+        "Context Tree\n└─ main agent [active] {provider}/{model}\n   Messages: {}\n   Own/total usage: input {input}, cache read {cached}, fresh input {fresh_input}, output {output}\n   Raw total: {raw_total}; operational budget: {operational_total}\n   Tree output usage: {}\n   Cost: unavailable (provider pricing is not exposed by the native runtime)",
         messages.len(),
         output.saturating_add(child_output),
     );

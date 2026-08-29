@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    budget::BudgetPause,
     error::{MimirError, Result},
     model::{Content, Message, Role, Usage},
     runtime::RuntimeEvent,
@@ -98,6 +99,8 @@ pub enum DiagnosticEventKind {
     RunStarted,
     ProviderRequest {
         turn: u32,
+        #[serde(default)]
+        estimated_context_tokens: u64,
     },
     MessageStarted {
         metadata: MessageMetadata,
@@ -147,6 +150,8 @@ pub enum DiagnosticEventKind {
     },
     BudgetPaused {
         error: ErrorMetadata,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pause: Option<BudgetPause>,
     },
     ExtensionEvent {
         event: String,
@@ -211,6 +216,12 @@ pub struct MessageMetadata {
     pub tool_call_count: usize,
     pub tool_result_count: usize,
     pub usage: Usage,
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub fresh_input_tokens: u64,
+    #[serde(default)]
+    pub operational_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
 }
@@ -333,6 +344,12 @@ pub struct DiagnosticSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub fresh_input_tokens: u64,
+    #[serde(default)]
+    pub operational_tokens: u64,
+    #[serde(default)]
+    pub peak_context_tokens: u64,
     pub dropped_events: u64,
     /// True when the reader synthesized this summary because the writer never
     /// committed a terminal record (for example after a crash or hard kill).
@@ -555,9 +572,18 @@ impl RuntimeDiagnosticRecorder {
     pub fn record(&mut self, journal: &DiagnosticJournal, event: &RuntimeEvent) {
         let (kind, tool_call_id) = match event {
             RuntimeEvent::RunStarted => (DiagnosticEventKind::RunStarted, None),
-            RuntimeEvent::ProviderRequest { turn } => {
+            RuntimeEvent::ProviderRequest {
+                turn,
+                estimated_context_tokens,
+            } => {
                 self.current_turn = Some(format!("turn-{turn}"));
-                (DiagnosticEventKind::ProviderRequest { turn: *turn }, None)
+                (
+                    DiagnosticEventKind::ProviderRequest {
+                        turn: *turn,
+                        estimated_context_tokens: *estimated_context_tokens,
+                    },
+                    None,
+                )
             }
             RuntimeEvent::MessageStarted { message } => (
                 DiagnosticEventKind::MessageStarted {
@@ -688,6 +714,7 @@ impl RuntimeDiagnosticRecorder {
                         FailureComponent::Runtime,
                         FailureSeverity::Error,
                     ),
+                    pause: Some(*pause),
                 },
                 None,
             ),
@@ -919,6 +946,7 @@ struct SummaryAccumulator {
     tool_calls: u64,
     tool_failures: u64,
     usage: Usage,
+    peak_context_tokens: u64,
     last_elapsed_ms: u64,
     writer_dropped: u64,
 }
@@ -935,6 +963,7 @@ impl SummaryAccumulator {
             tool_calls: 0,
             tool_failures: 0,
             usage: Usage::default(),
+            peak_context_tokens: 0,
             last_elapsed_ms: 0,
             writer_dropped: 0,
         }
@@ -977,6 +1006,8 @@ impl SummaryAccumulator {
                     .usage
                     .cached_tokens
                     .saturating_add(metadata.usage.cached_tokens);
+                self.peak_context_tokens =
+                    self.peak_context_tokens.max(metadata.usage.input_tokens);
             }
             _ => {}
         }
@@ -1004,6 +1035,9 @@ impl SummaryAccumulator {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cached_tokens: self.usage.cached_tokens,
+            fresh_input_tokens: self.usage.uncached_input_tokens(),
+            operational_tokens: self.usage.budget_tokens(),
+            peak_context_tokens: self.peak_context_tokens,
             dropped_events: dropped_events.saturating_add(self.writer_dropped),
             inferred_incomplete: false,
         }
@@ -1039,6 +1073,9 @@ fn message_metadata(message: &Message) -> MessageMetadata {
         tool_call_count,
         tool_result_count,
         usage: message.usage,
+        context_tokens: message.usage.input_tokens,
+        fresh_input_tokens: message.usage.uncached_input_tokens(),
+        operational_tokens: message.usage.budget_tokens(),
         stop_reason: message
             .stop_reason
             .map(|reason| format!("{reason:?}").to_lowercase()),
@@ -1550,6 +1587,49 @@ mod tests {
         assert!(!serialized.contains("private model response"));
         assert!(!serialized.contains("\"secret\""));
         assert!(serialized.contains("read_file"));
+    }
+
+    #[test]
+    fn summary_separates_raw_cached_fresh_and_context_usage() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let run_id = Uuid::new_v4();
+        let journal = DiagnosticJournal::start(temporary.path().into(), manifest(run_id));
+        let mut recorder = RuntimeDiagnosticRecorder::default();
+        recorder.record(
+            &journal,
+            &RuntimeEvent::ProviderRequest {
+                turn: 1,
+                estimated_context_tokens: 139_500,
+            },
+        );
+        let mut message = Message::assistant(
+            vec![Content::Text { text: "ok".into() }],
+            crate::model::StopReason::Stop,
+        );
+        message.usage = Usage {
+            input_tokens: 140_000,
+            cached_tokens: 133_000,
+            output_tokens: 3_000,
+        };
+        recorder.record(&journal, &RuntimeEvent::MessageCompleted { message });
+        recorder.record(&journal, &RuntimeEvent::Completed { text: "ok".into() });
+        journal.finish(DiagnosticOutcome::Completed);
+
+        let bundle = load_bundle(temporary.path(), &run_id.to_string()).expect("bundle");
+        let summary = bundle.summary.expect("summary");
+        assert_eq!(summary.input_tokens, 140_000);
+        assert_eq!(summary.cached_tokens, 133_000);
+        assert_eq!(summary.fresh_input_tokens, 7_000);
+        assert_eq!(summary.output_tokens, 3_000);
+        assert_eq!(summary.operational_tokens, 10_000);
+        assert_eq!(summary.peak_context_tokens, 140_000);
+        assert!(matches!(
+            bundle.events[0].kind,
+            DiagnosticEventKind::ProviderRequest {
+                estimated_context_tokens: 139_500,
+                ..
+            }
+        ));
     }
 
     #[test]

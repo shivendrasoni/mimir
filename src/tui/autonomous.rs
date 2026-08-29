@@ -161,12 +161,7 @@ impl AutonomousState {
             return;
         }
         self.turns_used = self.turns_used.saturating_add(1);
-        // Cached context is excluded because counting it on every continuation
-        // prematurely consumes the budget without representing new model work.
-        self.tokens_used = self
-            .tokens_used
-            .saturating_add(usage.input_tokens)
-            .saturating_add(usage.output_tokens);
+        self.tokens_used = self.tokens_used.saturating_add(usage.budget_tokens());
     }
 
     #[must_use]
@@ -301,7 +296,7 @@ mod tests {
         state.record_turn(
             generation,
             Usage {
-                input_tokens: 10,
+                input_tokens: 50_010,
                 output_tokens: 5,
                 cached_tokens: 50_000,
             },

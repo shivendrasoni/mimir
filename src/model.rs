@@ -106,13 +106,33 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Returns cumulative tokens processed for runtime budgeting.
+    /// Returns the provider's raw total token count for telemetry.
     ///
     /// `cached_tokens` is provider metadata describing a subset of input tokens
     /// after provider adapters normalize usage. Adding it again would double
     /// count OpenAI-compatible cache hits.
     pub fn total(self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Returns input tokens that were not served from the provider cache.
+    ///
+    /// Provider adapters normalize `cached_tokens` as a subset of
+    /// `input_tokens`. Saturating subtraction keeps malformed third-party
+    /// telemetry from underflowing the budget counter.
+    #[must_use]
+    pub fn uncached_input_tokens(self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_tokens)
+    }
+
+    /// Returns the tokens charged to Mimir's cumulative operational budget.
+    ///
+    /// Cached prompt replay remains visible in raw telemetry and current-context
+    /// measurements, but does not consume the same run budget again.
+    #[must_use]
+    pub fn budget_tokens(self) -> u64 {
+        self.uncached_input_tokens()
+            .saturating_add(self.output_tokens)
     }
 
     /// Normalizes providers that report cached input separately from uncached

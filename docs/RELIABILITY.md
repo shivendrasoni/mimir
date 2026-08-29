@@ -18,7 +18,9 @@ Every release must preserve these invariants:
 4. A fast child that exits and closes its pipes is never reported as timed out.
 5. Active context is measured independently from cumulative provider usage.
    Context compaction happens before the projected request exceeds its configured
-   threshold.
+   threshold. Cumulative operational budgeting counts fresh input plus output;
+   provider-cached replay remains raw telemetry and does not consume that budget
+   again.
 6. Tool output placed in model context is bounded. The unprojected result stays
    in durable session history while the provider receives a labelled bounded
    projection.
@@ -41,7 +43,7 @@ Every release must preserve these invariants:
 | Provider | `provider_rate_limited` | HTTP 429 | Bounded backoff |
 | Provider | `provider_unavailable` | timeout, connection reset, 5xx | Bounded backoff |
 | Provider | `provider_protocol` | malformed SSE, incomplete tool JSON | No blind retry; preserve evidence |
-| Budget | `budget_paused` | turn, tool-call, token, or elapsed ceiling reached | Preserve the session; continue with a fresh run or restart with an explicit limit |
+| Budget | `budget_paused` | turn, tool-call, fresh-input-plus-output, or elapsed ceiling reached | Preserve the session; continue with a fresh run or restart with an explicit limit |
 | Context | `context_pressure` | projected request crosses threshold | Compact before provider call |
 | Process | `process_spawn_failed` | executable unavailable | No retry without changed input |
 | Process | `process_exit_nonzero` | command exits with failure | Agent may adjust command |
@@ -132,6 +134,7 @@ A release candidate is blocked unless all applicable gates pass:
   any unrelated baseline exception listed explicitly in the release evidence.
 
 Canaries compare equivalent tasks on completion rate, validation outcome,
-provider attempts, token use, compaction count, tool retries, latency, and failure
+provider attempts, raw/cached/fresh token use, current context, compaction count,
+tool retries, latency, and failure
 classification. Enable one control at a time; do not use a single opaque
 "reliability mode" switch.

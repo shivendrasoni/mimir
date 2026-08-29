@@ -75,6 +75,8 @@ impl Tool for ReadFileTool {
 struct WriteInput {
     path: String,
     content: String,
+    #[serde(default)]
+    provenance: Option<Value>,
 }
 
 #[async_trait]
@@ -89,7 +91,8 @@ impl Tool for WriteFileTool {
             parameters: object_schema(
                 &json!({
                     "path": workspace_path_schema(&self.paths),
-                    "content": {"type": "string"}
+                    "content": {"type": "string"},
+                    "provenance": provenance_schema()
                 }),
                 &["path", "content"],
             ),
@@ -103,6 +106,7 @@ impl Tool for WriteFileTool {
             });
         }
         let input: WriteInput = parse_input("write_file", input)?;
+        let _provenance = input.provenance;
         if input.content.len() > self.policy.max_write_bytes {
             return Err(ToolError::Execution {
                 tool: "write_file".into(),
@@ -131,6 +135,8 @@ struct EditInput {
     path: String,
     old_text: String,
     new_text: String,
+    #[serde(default)]
+    provenance: Option<Value>,
 }
 
 #[async_trait]
@@ -146,7 +152,8 @@ impl Tool for EditFileTool {
                 &json!({
                     "path": workspace_path_schema(&self.paths),
                     "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
+                    "new_text": {"type": "string"},
+                    "provenance": provenance_schema()
                 }),
                 &["path", "old_text", "new_text"],
             ),
@@ -160,6 +167,7 @@ impl Tool for EditFileTool {
             });
         }
         let input: EditInput = parse_input("edit_file", input)?;
+        let _provenance = input.provenance;
         if input.old_text.is_empty() {
             return Err(ToolError::InvalidArguments {
                 tool: "edit_file".into(),
@@ -340,6 +348,29 @@ fn workspace_path_schema(paths: &WorkspacePathPolicy) -> Value {
     json!({
         "type": "string",
         "description": paths.path_guidance()
+    })
+}
+
+fn provenance_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "For source-derived content, cite successful read_file calls. Set required=true when the mutation must be faithful to those sources; unavailable required evidence pauses the mutation instead of guessing.",
+        "additionalProperties": false,
+        "properties": {
+            "required": {"type": "boolean"},
+            "derivedFrom": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "toolCallId": {"type": "string"},
+                        "path": {"type": "string"}
+                    },
+                    "required": ["toolCallId", "path"]
+                }
+            }
+        }
     })
 }
 

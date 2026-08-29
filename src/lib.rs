@@ -25,6 +25,7 @@ pub mod runtime;
 pub mod runtime_events;
 pub mod session;
 pub mod session_compat;
+pub mod session_integrity;
 pub mod session_tree;
 pub mod skills;
 pub mod tools;

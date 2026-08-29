@@ -164,6 +164,16 @@ impl Message {
         )
     }
 
+    /// Creates a tool-role message from one or more validated result blocks.
+    pub fn tool_results(content: Vec<Content>) -> Self {
+        debug_assert!(
+            content
+                .iter()
+                .all(|block| matches!(block, Content::ToolResult(_)))
+        );
+        Self::new(Role::Tool, content)
+    }
+
     pub fn text(&self) -> String {
         self.content
             .iter()

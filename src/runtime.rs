@@ -25,12 +25,14 @@ use crate::{
     provider::{Provider, ProviderError, ProviderEvent, ProviderEventSink},
     runtime_events::{RuntimeEventBus, RuntimeEventEnvelope, RuntimeEventSource},
     session::{SessionPayload, SessionRecord, SessionStore},
+    session_integrity,
     skills::{SkillInvocationError, SkillRuntime},
     tools::{ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry},
 };
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
 const MAX_PENDING_AGENT_MESSAGES: usize = 20;
+const PROVENANCE_SYSTEM_GUIDANCE: &str = "Evidence rule: when write_file or edit_file content is derived from a source file, you MUST include provenance.required=true and provenance.derivedFrom entries containing the successful read_file toolCallId and exact path. A failed or unavailable read is not evidence. Do not claim copied, preserved, or source-derived content without those references; read the source successfully or explain that the mutation cannot be completed faithfully.";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -408,6 +410,12 @@ impl AgentRuntime {
                 SessionPayload::RuntimeEvent { .. } => {}
             }
         }
+        repair_message_integrity(
+            store.as_ref(),
+            &mut messages,
+            "session resumed after an interrupted tool turn",
+        )
+        .await?;
         let supported_thinking_levels =
             normalize_thinking_levels(&config.supported_thinking_levels);
         let thinking_level =
@@ -1215,6 +1223,8 @@ impl AgentRuntime {
         if control_cancellation.is_cancelled() {
             return Err(MimirError::Protocol("Compaction cancelled".into()));
         }
+        self.ensure_session_integrity("manual compaction boundary")
+            .await?;
         let messages = self.messages.lock().await.clone();
         let loaded = self.store.load().await?;
         let newest_compaction = loaded
@@ -1242,25 +1252,14 @@ impl AgentRuntime {
         let split = manual_compaction_split(&messages, 20_000).ok_or_else(|| {
             MimirError::Protocol("Session is too short to compact — try again once it grows".into())
         })?;
-        let retained_message_count = messages.len().saturating_sub(split);
-        let message_record_ids = loaded
-            .records
-            .iter()
-            .filter(|record| matches!(record.payload, SessionPayload::Message(_)))
-            .map(|record| record.record_id.to_string())
-            .collect::<Vec<_>>();
-        let first_kept_entry_id = message_record_ids
-            .get(
-                message_record_ids
-                    .len()
-                    .saturating_sub(retained_message_count),
+        let split = session_integrity::safe_compaction_split(&messages, split);
+        let first_retained = messages.get(split).ok_or_else(|| {
+            MimirError::Protocol(
+                "First kept entry is unavailable — session may need migration".into(),
             )
-            .cloned()
-            .ok_or_else(|| {
-                MimirError::Protocol(
-                    "First kept entry is unavailable — session may need migration".into(),
-                )
-            })?;
+        })?;
+        let (first_kept_entry_id, retained_message_count) =
+            retained_record_span(&loaded.records, first_retained)?;
         let tokens_before = estimate_message_tokens(&messages);
         let prompt = compaction_prompt(&messages[..split], custom_instructions);
         let mut summary = self
@@ -2128,6 +2127,8 @@ impl AgentRuntime {
                 .check(&self.config.budget)
                 .map_err(|error| MimirError::Protocol(error.to_string()))?;
             self.compact_if_needed().await?;
+            self.ensure_session_integrity("provider request boundary")
+                .await?;
             let mut messages = self.messages.lock().await.clone();
             let context_outcomes = self
                 .dispatch_extension_outcomes(
@@ -2156,6 +2157,7 @@ impl AgentRuntime {
                     ),
                 }
             }
+            normalize_request_messages(&mut messages)?;
             let (provider, mut model, mut thinking_level, thinking_level_map) = {
                 let selection = self.selection.read().await;
                 (
@@ -2268,7 +2270,10 @@ impl AgentRuntime {
                 });
             let effective_system_prompt =
                 if let Some(system_prompt) = &extension_system_prompt_override {
-                    system_prompt.clone()
+                    let workspace = self.tools.workspace_context();
+                    format!(
+                        "{system_prompt}\n\n{workspace}\n\n{PROVENANCE_SYSTEM_GUIDANCE}"
+                    )
                 } else {
                     self.combined_system_prompt(active_skill_context.as_deref())
                         .await
@@ -2419,9 +2424,17 @@ impl AgentRuntime {
             }
 
             let mut tool_results = Vec::new();
-            for call in tool_calls {
+            for (call_index, call) in tool_calls.iter().cloned().enumerate() {
                 let mut call = call;
                 let mut blocked_reason = None;
+                if let Err(error) = usage.check(&self.config.budget) {
+                    self.persist_interrupted_tool_calls(
+                        &tool_calls[call_index..],
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(MimirError::Protocol(error.to_string()));
+                }
                 let call_outcomes = self
                     .dispatch_extension_outcomes(
                         LifecycleEvent::ToolCall {
@@ -2452,9 +2465,6 @@ impl AgentRuntime {
                     }
                 }
                 let arguments = call.arguments.clone();
-                usage
-                    .check(&self.config.budget)
-                    .map_err(|error| MimirError::Protocol(error.to_string()))?;
                 usage.record_tool_call();
                 sink.emit(RuntimeEvent::ToolStarted {
                     id: call.id.clone(),
@@ -2471,6 +2481,21 @@ impl AgentRuntime {
                     sink,
                 )
                 .await?;
+                if let Some(check) =
+                    session_integrity::validate_provenance(&self.messages.lock().await, &call)
+                {
+                    let detail = serde_json::to_string(&serde_json::json!({
+                        "type": "provenance_check",
+                        "toolCallId": &call.id,
+                        "toolName": &call.name,
+                        "check": &check
+                    }))?;
+                    self.record_runtime_event_raw("provenance_check", &detail)
+                        .await?;
+                    if !check.allowed {
+                        blocked_reason = check.warning;
+                    }
+                }
                 let execution = if let Some(reason) = blocked_reason {
                     Err(crate::tools::ToolError::Execution {
                         tool: call.name.clone(),
@@ -2600,7 +2625,7 @@ impl AgentRuntime {
     async fn combined_system_prompt(&self, active_skill_context: Option<&str>) -> String {
         let harness = self.harness_context.read().await;
         let workspace = self.tools.workspace_context();
-        let mut parts = Vec::with_capacity(4);
+        let mut parts = Vec::with_capacity(5);
         if !self.config.system_prompt.is_empty() {
             parts.push(self.config.system_prompt.as_str());
         }
@@ -2611,6 +2636,7 @@ impl AgentRuntime {
         if let Some(skill) = active_skill_context {
             parts.push(skill);
         }
+        parts.push(PROVENANCE_SYSTEM_GUIDANCE);
         parts.join("\n\n")
     }
 
@@ -2760,10 +2786,31 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn persist_interrupted_tool_calls(
+        &self,
+        calls: &[crate::model::ToolCall],
+        reason: &str,
+    ) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        self.persist_message(session_integrity::interrupted_tool_results(calls, reason))
+            .await?;
+        self.ensure_session_integrity("tool execution interrupted")
+            .await
+    }
+
+    async fn ensure_session_integrity(&self, reason: &str) -> Result<()> {
+        let mut messages = self.messages.lock().await;
+        repair_message_integrity(self.store.as_ref(), &mut messages, reason).await
+    }
+
     async fn compact_if_needed(&self) -> Result<()> {
         if !self.auto_compaction_enabled() {
             return Ok(());
         }
+        self.ensure_session_integrity("automatic compaction boundary")
+            .await?;
         let limit = self.config.budget.max_context_messages.max(2);
         let messages = self.messages.lock().await;
         if messages.len() <= limit {
@@ -2771,14 +2818,22 @@ impl AgentRuntime {
         }
         let _compacting = RunningFlag::new(&self.compacting);
         let retained_count = limit.saturating_sub(1);
-        let split = messages.len().saturating_sub(retained_count);
+        let split = session_integrity::safe_compaction_split(
+            &messages,
+            messages.len().saturating_sub(retained_count),
+        );
         let summary = summarize(&messages[..split]);
         let retained = messages[split..].to_vec();
         drop(messages);
+        let loaded = self.store.load().await?;
+        let first_retained = retained.first().ok_or_else(|| {
+            MimirError::Protocol("automatic compaction retained an empty suffix".into())
+        })?;
+        let (_, retained_record_count) = retained_record_span(&loaded.records, first_retained)?;
         self.store
             .append(SessionRecord::new(SessionPayload::Compaction {
                 summary: summary.clone(),
-                retained_message_count: retained_count,
+                retained_message_count: retained_record_count,
                 reason: Some("threshold".into()),
                 first_kept_entry_id: None,
                 tokens_before: 0,
@@ -3152,6 +3207,78 @@ fn agent_message_metadata(prompt: &str) -> serde_json::Value {
 
 fn skill_invocation_error(error: &SkillInvocationError) -> MimirError {
     MimirError::Protocol(error.to_string())
+}
+
+async fn repair_message_integrity(
+    store: &dyn SessionStore,
+    messages: &mut Vec<Message>,
+    reason: &str,
+) -> Result<()> {
+    let findings = session_integrity::inspect(messages);
+    if findings.requires_pause() {
+        return Err(MimirError::Protocol(format!(
+            "session integrity check paused: unexpected results: {:?}; duplicate tool ids (calls: {:?}, results: {:?})",
+            findings.unexpected_result_ids,
+            findings.duplicate_call_ids,
+            findings.duplicate_result_ids
+        )));
+    }
+    if !findings.missing_calls.is_empty() {
+        let synthetic =
+            session_integrity::interrupted_tool_results(&findings.missing_calls, reason);
+        store
+            .append(SessionRecord::new(SessionPayload::Message(
+                synthetic.clone(),
+            )))
+            .await?;
+        messages.push(synthetic);
+    }
+    *messages = session_integrity::normalize(messages);
+    Ok(())
+}
+
+fn retained_record_span(
+    records: &[SessionRecord],
+    first_retained: &Message,
+) -> Result<(String, usize)> {
+    let first_index = records
+        .iter()
+        .position(|record| {
+            matches!(&record.payload, SessionPayload::Message(message) if message == first_retained)
+        })
+        .ok_or_else(|| {
+            MimirError::Protocol(
+                "First kept entry is unavailable — session may need migration".into(),
+            )
+        })?;
+    let retained_message_count = records[first_index..]
+        .iter()
+        .filter(|record| matches!(record.payload, SessionPayload::Message(_)))
+        .count();
+    Ok((
+        records[first_index].record_id.to_string(),
+        retained_message_count,
+    ))
+}
+
+fn normalize_request_messages(messages: &mut Vec<Message>) -> Result<()> {
+    let findings = session_integrity::inspect(messages);
+    if findings.requires_pause() {
+        return Err(MimirError::Protocol(format!(
+            "provider request paused by session integrity check: unexpected results: {:?}; duplicate tool ids (calls: {:?}, results: {:?})",
+            findings.unexpected_result_ids,
+            findings.duplicate_call_ids,
+            findings.duplicate_result_ids
+        )));
+    }
+    if !findings.missing_calls.is_empty() {
+        messages.push(session_integrity::interrupted_tool_results(
+            &findings.missing_calls,
+            "context transformation omitted a required tool result",
+        ));
+    }
+    *messages = session_integrity::normalize(messages);
+    Ok(())
 }
 
 fn summarize(messages: &[Message]) -> String {

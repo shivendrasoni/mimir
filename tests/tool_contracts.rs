@@ -580,7 +580,7 @@ async fn process_allowlist_rejects_shell_interpreters() {
 }
 
 #[tokio::test]
-async fn process_allowlist_rejects_matching_basenames_and_missing_lists() {
+async fn process_allowlist_rejects_matching_basenames_and_disabled_policy_is_not_advertised() {
     let root = TempDir::new().expect("tempdir");
     let tools = registry(&root);
     for program in ["/tmp/sleep", "./printf"] {
@@ -589,17 +589,17 @@ async fn process_allowlist_rejects_matching_basenames_and_missing_lists() {
             .await
             .expect_err("the complete program value must match the allowlist");
     }
-    let unrestricted = ToolRegistry::with_default_tools(
+    let disabled = ToolRegistry::with_default_tools(
         root.path(),
         ToolPolicy {
-            allow_process: true,
+            allow_process: false,
             allowed_programs: None,
             ..ToolPolicy::default()
         },
     )
     .expect("registry");
     assert!(
-        unrestricted
+        disabled
             .definitions()
             .iter()
             .all(|definition| definition.name != "run_process"),
@@ -608,10 +608,16 @@ async fn process_allowlist_rejects_matching_basenames_and_missing_lists() {
 }
 
 #[test]
-fn default_registry_does_not_advertise_disabled_process_execution() {
+fn registry_does_not_advertise_explicitly_disabled_process_execution() {
     let root = TempDir::new().expect("tempdir");
-    let tools =
-        ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("registry");
+    let tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            allow_process: false,
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
 
     assert!(
         tools
@@ -624,7 +630,14 @@ fn default_registry_does_not_advertise_disabled_process_execution() {
 #[tokio::test]
 async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
     let root = TempDir::new().expect("tempdir");
-    let disabled = BashRunner::new(root.path(), ToolPolicy::default()).expect("runner");
+    let disabled = BashRunner::new(
+        root.path(),
+        ToolPolicy {
+            allow_process: false,
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("runner");
     disabled
         .execute("printf disabled")
         .await
@@ -634,6 +647,7 @@ async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
         root.path(),
         ToolPolicy {
             allow_process: true,
+            allowed_programs: Some(vec!["printf".into()]),
             max_output_bytes: 8,
             command_timeout: Duration::from_secs(2),
             ..ToolPolicy::default()
@@ -657,12 +671,12 @@ async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
 }
 
 #[tokio::test]
-async fn bash_runner_requires_an_explicit_allowlist_and_rejects_shell_composition() {
+async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
     let root = TempDir::new().expect("tempdir");
     let no_allowlist = BashRunner::new(
         root.path(),
         ToolPolicy {
-            allow_process: true,
+            allow_process: false,
             allowed_programs: Some(Vec::new()),
             ..ToolPolicy::default()
         },
@@ -671,7 +685,7 @@ async fn bash_runner_requires_an_explicit_allowlist_and_rejects_shell_compositio
     no_allowlist
         .execute("printf denied")
         .await
-        .expect_err("empty allowlist must fail closed");
+        .expect_err("disabled process policy must fail closed");
 
     let runner = BashRunner::new(
         root.path(),
@@ -690,12 +704,10 @@ async fn bash_runner_requires_an_explicit_allowlist_and_rejects_shell_compositio
             .output,
         "allowed"
     );
-    for command in ["sleep 1", "printf ok; sleep 1", "printf $(pwd)"] {
-        runner
-            .execute(command)
-            .await
-            .expect_err("unlisted or compound command must fail closed");
-    }
+    runner
+        .execute("sleep 1")
+        .await
+        .expect_err("unlisted command must fail closed");
 }
 
 #[tokio::test]

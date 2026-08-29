@@ -879,6 +879,7 @@ mod tests {
                 workspace.path(),
                 ToolPolicy {
                     allow_process: true,
+                    allowed_programs: Some(vec!["printf".into()]),
                     command_timeout: Duration::from_secs(2),
                     ..ToolPolicy::default()
                 },

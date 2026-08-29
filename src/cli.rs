@@ -10112,12 +10112,14 @@ mod tui_model_selection_tests {
         assert_eq!(status["continuationsUsed"], 3);
         assert_eq!(status["turnsUsed"], 4);
         let runs = list_runs(&diagnostics_root(state.path())).expect("daemon diagnostic runs");
-        assert_eq!(runs.len(), 1);
-        let bundle = load_bundle(&diagnostics_root(state.path()), &runs[0].run_id.to_string())
-            .expect("daemon diagnostic bundle");
-        let summary = bundle.summary.expect("daemon diagnostic summary");
-        assert_eq!(summary.outcome, DiagnosticOutcome::Completed);
-        assert_eq!(summary.provider_requests, 4);
+        assert_eq!(runs.len(), 4);
+        for run in runs {
+            let bundle = load_bundle(&diagnostics_root(state.path()), &run.run_id.to_string())
+                .expect("daemon diagnostic bundle");
+            let summary = bundle.summary.expect("daemon diagnostic summary");
+            assert_eq!(summary.outcome, DiagnosticOutcome::Completed);
+            assert_eq!(summary.provider_requests, 1);
+        }
     }
 
     #[test]

@@ -1,7 +1,17 @@
 use std::{fs, path::Path, process::Command};
 
+use chrono::Utc;
+use mimir::{
+    diagnostics::{
+        DIAGNOSTIC_SCHEMA_VERSION, DiagnosticConfiguration, DiagnosticEventKind,
+        DiagnosticManifest, DiagnosticOutcome, DiagnosticPrivacy, RuntimeDiagnosticRunCollector,
+        list_runs, load_bundle,
+    },
+    runtime::RuntimeEvent,
+};
 use serde_json::Value;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn binary() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("mimir"))
@@ -27,6 +37,85 @@ fn run_id_from_list(state: &Path) -> String {
         .as_str()
         .expect("run id")
         .to_owned()
+}
+
+#[test]
+fn tui_prompt_attempts_create_distinct_terminal_diagnostic_bundles() {
+    let state = TempDir::new().expect("state");
+    let secret_output = "second-prompt-private-output";
+    let mut collector = RuntimeDiagnosticRunCollector::new(
+        state.path().into(),
+        DiagnosticManifest {
+            schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+            run_id: Uuid::nil(),
+            session_id: "default".into(),
+            started_at: Utc::now(),
+            mimir_version: "test".into(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            workspace: "$WORKSPACE".into(),
+            configuration: DiagnosticConfiguration {
+                output_mode: "text".into(),
+                offline: true,
+                autonomous: false,
+            },
+            privacy: DiagnosticPrivacy::default(),
+        },
+    );
+
+    collector.record(&RuntimeEvent::RunStarted);
+    collector.record(&RuntimeEvent::Failed {
+        message: "run cancelled by ctrl-c".into(),
+    });
+    collector.record(&RuntimeEvent::RunStarted);
+    collector.record(&RuntimeEvent::Completed {
+        text: secret_output.into(),
+    });
+    collector.finish_open();
+
+    let runs = list_runs(state.path()).expect("runs");
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0].run_id, runs[1].run_id);
+    let outcomes = runs
+        .iter()
+        .map(|run| run.outcome.expect("outcome"))
+        .collect::<Vec<_>>();
+    assert!(outcomes.contains(&DiagnosticOutcome::Cancelled));
+    assert!(outcomes.contains(&DiagnosticOutcome::Completed));
+    for run in runs {
+        let expected_outcome = run.outcome.expect("outcome");
+        let bundle = load_bundle(state.path(), &run.run_id.to_string()).expect("bundle");
+        assert_eq!(
+            bundle.summary.as_ref().expect("summary").outcome,
+            expected_outcome
+        );
+        assert_eq!(
+            bundle
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, DiagnosticEventKind::RunStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            bundle
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    DiagnosticEventKind::Completed { .. }
+                        | DiagnosticEventKind::Failed { .. }
+                        | DiagnosticEventKind::BudgetPaused { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !serde_json::to_string(&bundle)
+                .expect("serialized bundle")
+                .contains(secret_output)
+        );
+    }
 }
 
 #[test]

@@ -547,6 +547,98 @@ pub struct RuntimeDiagnosticRecorder {
     output_bytes: usize,
 }
 
+struct ActiveRuntimeDiagnosticRun {
+    journal: DiagnosticJournal,
+    recorder: RuntimeDiagnosticRecorder,
+}
+
+/// Splits a long-lived runtime event stream into one immutable diagnostic
+/// bundle per prompt attempt.
+///
+/// Interactive frontends keep one runtime alive across many prompts. Runtime
+/// `RunStarted` and terminal events, rather than frontend shutdown, therefore
+/// define diagnostic run boundaries.
+pub struct RuntimeDiagnosticRunCollector {
+    root: PathBuf,
+    manifest_template: DiagnosticManifest,
+    active: Option<ActiveRuntimeDiagnosticRun>,
+}
+
+impl RuntimeDiagnosticRunCollector {
+    #[must_use]
+    pub fn new(root: PathBuf, manifest_template: DiagnosticManifest) -> Self {
+        Self {
+            root,
+            manifest_template,
+            active: None,
+        }
+    }
+
+    pub fn record(&mut self, event: &RuntimeEvent) {
+        if matches!(event, RuntimeEvent::RunStarted) {
+            self.finish_unterminated();
+            let mut manifest = self.manifest_template.clone();
+            manifest.run_id = Uuid::new_v4();
+            manifest.started_at = Utc::now();
+            self.active = Some(ActiveRuntimeDiagnosticRun {
+                journal: DiagnosticJournal::start(self.root.clone(), manifest),
+                recorder: RuntimeDiagnosticRecorder::default(),
+            });
+        }
+
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.recorder.record(&active.journal, event);
+        let outcome = runtime_terminal_outcome(event);
+        if let Some(outcome) = outcome
+            && let Some(active) = self.active.take()
+        {
+            active.journal.finish(outcome);
+        }
+    }
+
+    pub fn note_dropped(&self, count: u64) {
+        if let Some(active) = &self.active {
+            active.journal.note_dropped(count);
+        }
+    }
+
+    /// Closes an in-flight prompt without allowing frontend shutdown to mark it
+    /// completed. A normally terminated prompt has already been finalized.
+    pub fn finish_open(&mut self) {
+        self.finish_unterminated();
+    }
+
+    fn finish_unterminated(&mut self) {
+        let Some(mut active) = self.active.take() else {
+            return;
+        };
+        active.recorder.record(
+            &active.journal,
+            &RuntimeEvent::Failed {
+                message: "run cancelled before a terminal runtime event was observed".into(),
+            },
+        );
+        active.journal.finish(DiagnosticOutcome::Cancelled);
+    }
+}
+
+fn runtime_terminal_outcome(event: &RuntimeEvent) -> Option<DiagnosticOutcome> {
+    match event {
+        RuntimeEvent::Completed { .. } => Some(DiagnosticOutcome::Completed),
+        RuntimeEvent::BudgetPaused { .. } => Some(DiagnosticOutcome::BudgetPaused),
+        RuntimeEvent::Failed { message }
+            if message.to_ascii_lowercase().contains("cancel")
+                || message.to_ascii_lowercase().contains("abort") =>
+        {
+            Some(DiagnosticOutcome::Cancelled)
+        }
+        RuntimeEvent::Failed { .. } => Some(DiagnosticOutcome::Failed),
+        _ => None,
+    }
+}
+
 impl RuntimeDiagnosticRecorder {
     #[allow(
         clippy::too_many_lines,
@@ -1265,7 +1357,9 @@ pub fn load_bundle(root: &Path, run_id: &str) -> Result<DiagnosticBundle> {
     let has_terminal_event = events.iter().any(|event| {
         matches!(
             event.kind,
-            DiagnosticEventKind::Completed { .. } | DiagnosticEventKind::Failed { .. }
+            DiagnosticEventKind::Completed { .. }
+                | DiagnosticEventKind::Failed { .. }
+                | DiagnosticEventKind::BudgetPaused { .. }
         )
     });
     let summary = persisted_summary
@@ -1417,7 +1511,9 @@ pub fn replay_bundle(root: &Path, run_id: &str) -> Result<DiagnosticReplayReport
         expected = expected.saturating_add(1);
         if matches!(
             event.kind,
-            DiagnosticEventKind::Completed { .. } | DiagnosticEventKind::Failed { .. }
+            DiagnosticEventKind::Completed { .. }
+                | DiagnosticEventKind::Failed { .. }
+                | DiagnosticEventKind::BudgetPaused { .. }
         ) {
             terminal_events += 1;
         }
@@ -1496,6 +1592,7 @@ fn read_json_lines_optional<T: for<'de> Deserialize<'de>>(path: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::{BudgetKind, BudgetPause, BudgetSnapshot};
     use tempfile::TempDir;
 
     fn manifest(run_id: Uuid) -> DiagnosticManifest {
@@ -1550,6 +1647,74 @@ mod tests {
         assert!(!serialized.contains("private model response"));
         assert!(!serialized.contains("\"secret\""));
         assert!(serialized.contains("read_file"));
+    }
+
+    #[test]
+    fn prompt_run_collector_keeps_cancelled_and_budget_paused_outcomes_distinct() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let mut collector =
+            RuntimeDiagnosticRunCollector::new(temporary.path().into(), manifest(Uuid::nil()));
+
+        collector.record(&RuntimeEvent::RunStarted);
+        collector.record(&RuntimeEvent::Failed {
+            message: "run cancelled by user".into(),
+        });
+        collector.record(&RuntimeEvent::RunStarted);
+        collector.record(&RuntimeEvent::BudgetPaused {
+            pause: BudgetPause {
+                kind: BudgetKind::Tokens,
+                limit: 1_000_000,
+                usage: BudgetSnapshot {
+                    turns: 7,
+                    tool_calls: 8,
+                    tokens: 1_006_975,
+                    elapsed_ms: 191_951,
+                },
+            },
+        });
+        collector.finish_open();
+
+        let runs = list_runs(temporary.path()).expect("diagnostic runs");
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].run_id, runs[1].run_id);
+        let outcomes = runs
+            .iter()
+            .map(|run| run.outcome.expect("terminal outcome"))
+            .collect::<Vec<_>>();
+        assert!(outcomes.contains(&DiagnosticOutcome::BudgetPaused));
+        assert!(outcomes.contains(&DiagnosticOutcome::Cancelled));
+        for run in runs {
+            let expected_outcome = run.outcome.expect("terminal outcome");
+            let bundle = load_bundle(temporary.path(), &run.run_id.to_string()).expect("bundle");
+            assert_eq!(
+                bundle.summary.as_ref().expect("summary").outcome,
+                expected_outcome
+            );
+            let replay = replay_bundle(temporary.path(), &run.run_id.to_string()).expect("replay");
+            assert!(replay.valid);
+            assert_eq!(replay.terminal_events, 1);
+            assert_eq!(
+                bundle
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event.kind, DiagnosticEventKind::RunStarted))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                bundle
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        DiagnosticEventKind::Completed { .. }
+                            | DiagnosticEventKind::Failed { .. }
+                            | DiagnosticEventKind::BudgetPaused { .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

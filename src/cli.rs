@@ -30,9 +30,9 @@ use crate::{
         PublicImageContent, ScheduledPromptDelivery, ServerResponse,
     },
     diagnostics::{
-        DiagnosticAnalysisInput, DiagnosticConfiguration, DiagnosticJournal, DiagnosticManifest,
-        DiagnosticOutcome, DiagnosticPrivacy, RuntimeDiagnosticRecorder, append_analysis,
-        diagnostics_root, list_runs, load_bundle, query_events, replay_bundle,
+        DiagnosticAnalysisInput, DiagnosticConfiguration, DiagnosticManifest, DiagnosticPrivacy,
+        RuntimeDiagnosticRunCollector, append_analysis, diagnostics_root, list_runs, load_bundle,
+        query_events, replay_bundle,
     },
     error::{MimirError, Result},
     extensions::{
@@ -1690,12 +1690,11 @@ async fn dispatch_run_with_diagnostics(
 ) -> Result<()> {
     let state = resolve_state_dir(&cli.state_dir)?;
     let (provider, model, _) = runtime.model_selection().await;
-    let run_id = Uuid::new_v4();
-    let journal = DiagnosticJournal::start(
+    let mut recorder = RuntimeDiagnosticRunCollector::new(
         diagnostics_root(&state),
         DiagnosticManifest {
             schema_version: crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
-            run_id,
+            run_id: Uuid::nil(),
             session_id: cli.session.clone(),
             started_at: chrono::Utc::now(),
             mimir_version: env!("CARGO_PKG_VERSION").into(),
@@ -1713,57 +1712,34 @@ async fn dispatch_run_with_diagnostics(
         },
     );
     let mut receiver = runtime.subscribe_events();
-    let collector_journal = journal.clone();
     let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
     let collector = tokio::spawn(async move {
-        let mut recorder = RuntimeDiagnosticRecorder::default();
         loop {
             tokio::select! {
                 event_result = receiver.recv() => match event_result {
-                    Ok(envelope) => recorder.record(&collector_journal, &envelope.event),
+                    Ok(envelope) => recorder.record(&envelope.event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        collector_journal.note_dropped(skipped);
-                        recorder.record(
-                            &collector_journal,
-                            &RuntimeEvent::SessionEvent {
-                                event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
-                            },
-                        );
+                        recorder.note_dropped(skipped);
+                        recorder.record(&RuntimeEvent::SessionEvent {
+                            event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
+                        });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 _ = &mut stop_receiver => {
                     while let Ok(envelope) = receiver.try_recv() {
-                        recorder.record(&collector_journal, &envelope.event);
+                        recorder.record(&envelope.event);
                     }
                     break;
                 }
             }
         }
+        recorder.finish_open();
     });
     let result = dispatch_run(cli, runtime, initial_prompt).await;
     let _ = stop_sender.send(());
     let _ = collector.await;
-    journal.finish(diagnostic_outcome(&result));
     result
-}
-
-fn diagnostic_outcome<T, E: std::fmt::Display>(
-    result: &std::result::Result<T, E>,
-) -> DiagnosticOutcome {
-    match result {
-        Ok(_) => DiagnosticOutcome::Completed,
-        Err(error) => {
-            let message = error.to_string().to_ascii_lowercase();
-            if message.contains("budget") || message.contains("token budget") {
-                DiagnosticOutcome::BudgetPaused
-            } else if message.contains("cancel") || message.contains("abort") {
-                DiagnosticOutcome::Cancelled
-            } else {
-                DiagnosticOutcome::Failed
-            }
-        }
-    }
 }
 
 fn daemon_runtime_error(error: MimirError) -> DaemonError {
@@ -3502,16 +3478,14 @@ struct RuntimePromptHandler {
 }
 
 struct ActiveDiagnosticCollector {
-    journal: DiagnosticJournal,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ActiveDiagnosticCollector {
-    async fn finish(self, outcome: DiagnosticOutcome) {
+    async fn finish(self) {
         let _ = self.stop.send(());
         let _ = self.task.await;
-        self.journal.finish(outcome);
     }
 }
 
@@ -3616,11 +3590,11 @@ impl RuntimePromptHandler {
         runtime: &AgentRuntime,
     ) -> ActiveDiagnosticCollector {
         let (provider, model, _) = runtime.model_selection().await;
-        let journal = DiagnosticJournal::start(
+        let mut recorder = RuntimeDiagnosticRunCollector::new(
             diagnostics_root(&self.state_root),
             DiagnosticManifest {
                 schema_version: crate::diagnostics::DIAGNOSTIC_SCHEMA_VERSION,
-                run_id: Uuid::new_v4(),
+                run_id: Uuid::nil(),
                 session_id: session_id.into(),
                 started_at: chrono::Utc::now(),
                 mimir_version: env!("CARGO_PKG_VERSION").into(),
@@ -3636,39 +3610,31 @@ impl RuntimePromptHandler {
             },
         );
         let mut receiver = runtime.subscribe_events();
-        let collector_journal = journal.clone();
         let (stop, mut stop_receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let mut recorder = RuntimeDiagnosticRecorder::default();
             loop {
                 tokio::select! {
                     event_result = receiver.recv() => match event_result {
-                        Ok(envelope) => recorder.record(&collector_journal, &envelope.event),
+                        Ok(envelope) => recorder.record(&envelope.event),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            collector_journal.note_dropped(skipped);
-                            recorder.record(
-                                &collector_journal,
-                                &RuntimeEvent::SessionEvent {
-                                    event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
-                                },
-                            );
+                            recorder.note_dropped(skipped);
+                            recorder.record(&RuntimeEvent::SessionEvent {
+                                event: json!({"type": "diagnostic_events_lagged", "count": skipped}),
+                            });
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                     _ = &mut stop_receiver => {
                         while let Ok(envelope) = receiver.try_recv() {
-                            recorder.record(&collector_journal, &envelope.event);
+                            recorder.record(&envelope.event);
                         }
                         break;
                     }
                 }
             }
+            recorder.finish_open();
         });
-        ActiveDiagnosticCollector {
-            journal,
-            stop,
-            task,
-        }
+        ActiveDiagnosticCollector { stop, task }
     }
 
     async fn run_autonomous_continuations(
@@ -4750,7 +4716,7 @@ impl PromptHandler for RuntimePromptHandler {
                 .await
         }
         .await;
-        diagnostics.finish(diagnostic_outcome(&result)).await;
+        diagnostics.finish().await;
         result
     }
 
@@ -4796,7 +4762,7 @@ impl PromptHandler for RuntimePromptHandler {
                 .await
         }
         .await;
-        diagnostics.finish(diagnostic_outcome(&result)).await;
+        diagnostics.finish().await;
         result
     }
 

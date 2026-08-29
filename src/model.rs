@@ -106,10 +106,28 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Returns cumulative tokens processed for runtime budgeting.
+    ///
+    /// `cached_tokens` is provider metadata describing a subset of input tokens
+    /// after provider adapters normalize usage. Adding it again would double
+    /// count OpenAI-compatible cache hits.
     pub fn total(self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cached_tokens)
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Normalizes providers that report cached input separately from uncached
+    /// input (for example Anthropic) into the shared inclusive-input contract.
+    #[must_use]
+    pub fn from_separate_cached_input(
+        uncached_input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> Self {
+        Self {
+            input_tokens: uncached_input_tokens.saturating_add(cached_tokens),
+            output_tokens,
+            cached_tokens,
+        }
     }
 }
 

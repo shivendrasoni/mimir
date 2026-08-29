@@ -185,7 +185,7 @@ async fn api_key_mode_uses_express_resource_and_preserves_typed_parts() {
 
     assert_eq!(response.response_id.as_deref(), Some("vertex-response-1"));
     assert_eq!(response.message.stop_reason, Some(StopReason::ToolUse));
-    assert_eq!(response.message.usage.input_tokens, 11);
+    assert_eq!(response.message.usage.input_tokens, 14);
     assert_eq!(response.message.usage.output_tokens, 10);
     assert_eq!(response.message.usage.cached_tokens, 3);
     assert!(matches!(
@@ -260,7 +260,7 @@ async fn bearer_mode_uses_project_location_resource_and_sse_streaming() {
             ProviderEvent::TextDelta("ne".into())
         ]
     );
-    assert_eq!(response.message.usage.input_tokens, 10);
+    assert_eq!(response.message.usage.input_tokens, 12);
     assert_eq!(response.message.usage.output_tokens, 8);
     assert_eq!(response.message.usage.cached_tokens, 2);
     assert_eq!(response.message.stop_reason, Some(StopReason::ToolUse));

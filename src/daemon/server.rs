@@ -2801,6 +2801,12 @@ fn public_runtime_event(
         RuntimeEvent::Failed { message } => {
             json!({"type": "agent_end", "messages": [], "errorMessage": message})
         }
+        RuntimeEvent::BudgetPaused { pause } => json!({
+            "type": "agent_end",
+            "messages": [],
+            "outcome": "budget_paused",
+            "budget": pause
+        }),
         RuntimeEvent::ExtensionUi { extension, request } => json!({
             "type": "extension_ui_request",
             "extension": extension,

@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use mimir::{
-    budget::Budget,
+    budget::{Budget, BudgetKind},
     error::MimirError,
     model::{Content, Message, ModelResponse, StopReason, ThinkingLevel, ToolCall, Usage},
     provider::{FakeProvider, Provider, ProviderError, ProviderEvent, ProviderEventSink},
@@ -1110,6 +1110,331 @@ async fn runtime_compacts_context_before_provider_request() {
             .text()
             .contains("Compacted conversation")
     );
+}
+
+#[tokio::test]
+async fn runtime_compacts_a_large_context_by_tokens_before_the_message_limit() {
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::Text { text: "ok".into() }],
+        StopReason::Stop,
+        2,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    for index in 0..8 {
+        store
+            .append(SessionRecord::new(SessionPayload::Message(Message::user(
+                format!("message-{index} {}", "x".repeat(60_000)),
+            ))))
+            .await
+            .expect("seed large session");
+    }
+    let root = TempDir::new().expect("tempdir");
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig {
+            budget: Budget {
+                max_context_messages: 200,
+                max_context_tokens: 128_000,
+                auto_compaction_threshold_percent: 80,
+                ..Budget::default()
+            },
+            provider_timeout: Duration::from_secs(1),
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+
+    runtime
+        .run("new message", &VecEventSink::default())
+        .await
+        .expect("run");
+
+    let request = provider.requests().await.pop().expect("request");
+    assert!(request.messages.len() < 9);
+    assert!(
+        request.messages[0]
+            .text()
+            .contains("Compacted conversation")
+    );
+    let loaded = store.load().await.expect("session");
+    assert!(loaded.records.iter().any(|record| matches!(
+        &record.payload,
+        SessionPayload::Compaction {
+            reason: Some(reason),
+            tokens_before,
+            ..
+        } if reason == "token_threshold" && *tokens_before > 100_000
+    )));
+}
+
+#[tokio::test]
+async fn token_compaction_never_retains_a_tool_result_without_its_call() {
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::Text { text: "ok".into() }],
+        StopReason::Stop,
+        2,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    for index in 0..4 {
+        store
+            .append(SessionRecord::new(SessionPayload::Message(Message::user(
+                format!("round {index} {}", "x".repeat(48_000)),
+            ))))
+            .await
+            .expect("user");
+        store
+            .append(SessionRecord::new(SessionPayload::Message(
+                Message::assistant(
+                    vec![Content::ToolCall(ToolCall {
+                        id: format!("call-{index}"),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "README.md"}),
+                    })],
+                    StopReason::ToolUse,
+                ),
+            )))
+            .await
+            .expect("assistant");
+        store
+            .append(SessionRecord::new(SessionPayload::Message(
+                Message::tool_result(
+                    format!("call-{index}"),
+                    "read_file",
+                    "y".repeat(48_000),
+                    false,
+                ),
+            )))
+            .await
+            .expect("tool result");
+    }
+    let root = TempDir::new().expect("tempdir");
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store,
+        RuntimeConfig {
+            budget: Budget {
+                max_context_messages: 200,
+                max_context_tokens: 64_000,
+                auto_compaction_threshold_percent: 80,
+                ..Budget::default()
+            },
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+
+    runtime
+        .run("continue", &VecEventSink::default())
+        .await
+        .expect("run");
+    let request = provider.requests().await.pop().expect("request");
+    let mut seen_calls = std::collections::BTreeSet::new();
+    for message in request.messages {
+        for content in message.content {
+            match content {
+                Content::ToolCall(call) => {
+                    seen_calls.insert(call.id);
+                }
+                Content::ToolResult(result) => assert!(
+                    seen_calls.contains(&result.tool_call_id),
+                    "retained tool result {} has no retained call",
+                    result.tool_call_id
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn budget_pause_persists_synthetic_results_for_every_pending_tool_call() {
+    let root = TempDir::new().expect("tempdir");
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![
+            Content::ToolCall(ToolCall {
+                id: "call-one".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "one.txt", "content": "one"}),
+            }),
+            Content::ToolCall(ToolCall {
+                id: "call-two".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "two.txt", "content": "two"}),
+            }),
+        ],
+        StopReason::ToolUse,
+        120_000,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = AgentRuntime::resume(
+        provider,
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig {
+            budget: Budget {
+                max_turns: 1,
+                ..Budget::default()
+            },
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+    let events = VecEventSink::default();
+
+    let error = runtime
+        .run("write both files", &events)
+        .await
+        .expect_err("budget must pause before tool execution");
+    assert!(matches!(
+        error,
+        MimirError::BudgetPaused(pause) if pause.kind == BudgetKind::Turns
+    ));
+    assert!(!root.path().join("one.txt").exists());
+    assert!(!root.path().join("two.txt").exists());
+    let loaded = store.load().await.expect("session");
+    let result_ids = loaded
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            SessionPayload::Message(message) => {
+                message.content.iter().find_map(|content| match content {
+                    Content::ToolResult(result) => Some(result.tool_call_id.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result_ids, ["call-one", "call-two"]);
+    assert!(events.events().await.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::BudgetPaused { pause } if pause.kind == BudgetKind::Turns
+    )));
+}
+
+#[tokio::test]
+async fn resume_durably_repairs_trailing_orphaned_tool_calls() {
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::Text { text: "ok".into() }],
+        StopReason::Stop,
+        2,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    store
+        .append(SessionRecord::new(SessionPayload::Message(
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "interrupted-call".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "README.md"}),
+                })],
+                StopReason::ToolUse,
+            ),
+        )))
+        .await
+        .expect("assistant");
+    let root = TempDir::new().expect("tempdir");
+    let runtime = AgentRuntime::resume(
+        provider,
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("resume");
+
+    let messages = runtime.messages_snapshot().await;
+    assert!(matches!(
+        messages.last().and_then(|message| message.content.first()),
+        Some(Content::ToolResult(result))
+            if result.tool_call_id == "interrupted-call" && result.is_error
+    ));
+    let loaded = store.load().await.expect("session");
+    assert!(matches!(
+        loaded.records.last().map(|record| &record.payload),
+        Some(SessionPayload::Message(message))
+            if matches!(message.content.first(), Some(Content::ToolResult(result)) if result.tool_call_id == "interrupted-call")
+    ));
+}
+
+#[tokio::test]
+async fn provider_context_bounds_large_tool_results_without_mutating_history() {
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::Text { text: "ok".into() }],
+        StopReason::Stop,
+        2,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    store
+        .append(SessionRecord::new(SessionPayload::Message(
+            Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "large-call".into(),
+                    name: "run_process".into(),
+                    arguments: json!({"program": "printf"}),
+                })],
+                StopReason::ToolUse,
+            ),
+        )))
+        .await
+        .expect("assistant");
+    let large_result = "z".repeat(60 * 1024);
+    store
+        .append(SessionRecord::new(SessionPayload::Message(
+            Message::tool_result("large-call", "run_process", large_result.clone(), false),
+        )))
+        .await
+        .expect("tool result");
+    let root = TempDir::new().expect("tempdir");
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+
+    runtime
+        .run("continue", &VecEventSink::default())
+        .await
+        .expect("run");
+    let request = provider.requests().await.pop().expect("request");
+    let projected = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult(result) => Some(result.content.as_str()),
+            _ => None,
+        })
+        .expect("projected tool result");
+    assert!(projected.len() < large_result.len());
+    assert!(projected.contains("full result remains in session history"));
+    let persisted = store.load().await.expect("session");
+    assert!(persisted.records.iter().any(|record| matches!(
+        &record.payload,
+        SessionPayload::Message(message) if message.content.iter().any(|content| matches!(
+            content,
+            Content::ToolResult(result) if result.content == large_result
+        ))
+    )));
 }
 
 #[tokio::test]

@@ -1091,6 +1091,12 @@ impl EventSink for LegacyRpcEventSink {
                 "type": "message_update",
                 "assistantMessageEvent": {"type": "error", "reason": "error", "message": message}
             })],
+            RuntimeEvent::BudgetPaused { pause } => vec![json!({
+                "type": "budget_paused",
+                "reason": pause.kind,
+                "limit": pause.limit,
+                "usage": pause.usage
+            })],
             RuntimeEvent::ExtensionUi { extension, request } => vec![json!({
                 "type": "extension_ui_request",
                 "extension": extension,
@@ -6474,6 +6480,7 @@ async fn build_runtime_for_session(
         thinking_level_map,
         supports_priority_tier,
         model_max_output_tokens,
+        model_context_window_tokens,
     ) = if extension_provider_selected {
         if build.base_url.is_some() {
             return Err(MimirError::Configuration(format!(
@@ -6484,7 +6491,7 @@ async fn build_runtime_for_session(
         let (provider, supported) = extension_manager
             .activate_provider(&build.provider, &build.model)
             .await?;
-        (provider, supported, None, false, 16_384)
+        (provider, supported, None, false, 16_384, 128_000)
     } else {
         let model_definition = runtime_model_definition(build)?;
         let supports_priority_tier = matches!(
@@ -6498,6 +6505,7 @@ async fn build_runtime_for_session(
             model_definition.thinking_level_map,
             supports_priority_tier,
             model_definition.max_tokens,
+            model_definition.context_window,
         )
     };
     let thinking_level = resolve_runtime_thinking_level(
@@ -6646,6 +6654,7 @@ async fn build_runtime_for_session(
     config.supported_thinking_levels = supported_thinking_levels;
     config.thinking_level_map = thinking_level_map;
     config.provider_timeout = std::time::Duration::from_secs(build.provider_timeout_seconds);
+    config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
         .system_prompt
@@ -8975,7 +8984,7 @@ async fn legacy_session_stats(context: &RpcSessionContext) -> Result<Value> {
         "toolCalls": tool_calls,
         "toolResults": tool_results,
         "totalMessages": messages.len(),
-        "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": 0, "total": input.saturating_add(output).saturating_add(cache_read)},
+        "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": 0, "total": input.saturating_add(output)},
         "cost": 0.0
     }))
 }

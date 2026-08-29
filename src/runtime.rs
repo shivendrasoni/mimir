@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    budget::{Budget, BudgetUsage},
+    budget::{Budget, BudgetPause, BudgetUsage},
     error::{MimirError, Result},
     extensions::{
         ExtensionCommandInfo, ExtensionContextUsage, ExtensionFlagValue, ExtensionHostAction,
@@ -21,7 +21,7 @@ use crate::{
         LifecycleInterception, LifecycleMutation, LifecycleReplacement, SessionStartReason,
         UiRequest,
     },
-    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel},
+    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel, ToolResult},
     provider::{Provider, ProviderError, ProviderEvent, ProviderEventSink},
     runtime_events::{RuntimeEventBus, RuntimeEventEnvelope, RuntimeEventSource},
     session::{SessionPayload, SessionRecord, SessionStore},
@@ -169,6 +169,9 @@ pub enum RuntimeEvent {
     Failed {
         message: String,
     },
+    BudgetPaused {
+        pause: BudgetPause,
+    },
     ExtensionUi {
         extension: String,
         request: UiRequest,
@@ -205,6 +208,7 @@ impl RuntimeEvent {
             Self::AutoRetryFinished { .. } => "auto_retry_finished",
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
+            Self::BudgetPaused { .. } => "budget_paused",
             Self::ExtensionUi { .. } => "extension_ui",
             Self::ExtensionRendered { .. } => "extension_rendered",
             Self::ExtensionError { .. } => "extension_error",
@@ -1966,10 +1970,15 @@ impl AgentRuntime {
                         sink,
                     )
                     .await;
-                sink.emit(RuntimeEvent::Failed {
-                    message: error_message,
-                })
-                .await;
+                if let MimirError::BudgetPaused(pause) = &error {
+                    sink.emit(RuntimeEvent::BudgetPaused { pause: *pause })
+                        .await;
+                } else {
+                    sink.emit(RuntimeEvent::Failed {
+                        message: error_message,
+                    })
+                    .await;
+                }
                 Err(error)
             }
         }
@@ -2123,12 +2132,23 @@ impl AgentRuntime {
         let mut usage = BudgetUsage::default();
 
         loop {
-            usage
-                .check(&self.config.budget)
-                .map_err(|error| MimirError::Protocol(error.to_string()))?;
-            self.compact_if_needed().await?;
+            if let Err(error) = usage.check(&self.config.budget) {
+                return Err(MimirError::BudgetPaused(error.pause(usage.snapshot())));
+            }
             self.ensure_session_integrity("provider request boundary")
                 .await?;
+            let preflight_system_prompt = extension_system_prompt_override.clone().unwrap_or(
+                self.combined_system_prompt(active_skill_context.as_deref())
+                    .await,
+            );
+            let preflight_tools = self.active_tool_definitions().await;
+            let max_output_tokens = self.max_output_tokens.load(Ordering::Acquire);
+            self.compact_if_needed(
+                &preflight_system_prompt,
+                &preflight_tools,
+                max_output_tokens,
+            )
+            .await?;
             let mut messages = self.messages.lock().await.clone();
             let context_outcomes = self
                 .dispatch_extension_outcomes(
@@ -2271,9 +2291,7 @@ impl AgentRuntime {
             let effective_system_prompt =
                 if let Some(system_prompt) = &extension_system_prompt_override {
                     let workspace = self.tools.workspace_context();
-                    format!(
-                        "{system_prompt}\n\n{workspace}\n\n{PROVENANCE_SYSTEM_GUIDANCE}"
-                    )
+                    format!("{system_prompt}\n\n{workspace}\n\n{PROVENANCE_SYSTEM_GUIDANCE}")
                 } else {
                     self.combined_system_prompt(active_skill_context.as_deref())
                         .await
@@ -2283,9 +2301,9 @@ impl AgentRuntime {
                 thinking_level,
                 thinking_effort,
                 system_prompt: effective_system_prompt,
-                messages,
+                messages: prepare_context_messages(&messages),
                 tools: self.active_tool_definitions().await,
-                max_output_tokens: self.max_output_tokens.load(Ordering::Acquire),
+                max_output_tokens,
             };
             let turn = usage.snapshot().turns.saturating_add(1);
             self.dispatch_extension_event(
@@ -2346,7 +2364,7 @@ impl AgentRuntime {
             }
             usage
                 .record_turn(response.message.usage.total())
-                .map_err(|error| MimirError::Protocol(error.to_string()))?;
+                .map_err(|error| MimirError::BudgetPaused(error.pause(usage.snapshot())))?;
             let assistant_message_id = uuid::Uuid::new_v4().to_string();
             self.dispatch_extension_event(
                 LifecycleEvent::MessageStart {
@@ -2425,16 +2443,21 @@ impl AgentRuntime {
 
             let mut tool_results = Vec::new();
             for (call_index, call) in tool_calls.iter().cloned().enumerate() {
+                if let Err(error) = usage.check(&self.config.budget) {
+                    let pause = error.pause(usage.snapshot());
+                    let blocked = self
+                        .persist_budget_blocked_tool_results(&tool_calls[call_index..], pause, sink)
+                        .await?;
+                    tool_results.extend(blocked);
+                    sink.emit(RuntimeEvent::TurnCompleted {
+                        message: assistant_message,
+                        tool_results,
+                    })
+                    .await;
+                    return Err(MimirError::BudgetPaused(pause));
+                }
                 let mut call = call;
                 let mut blocked_reason = None;
-                if let Err(error) = usage.check(&self.config.budget) {
-                    self.persist_interrupted_tool_calls(
-                        &tool_calls[call_index..],
-                        &error.to_string(),
-                    )
-                    .await?;
-                    return Err(MimirError::Protocol(error.to_string()));
-                }
                 let call_outcomes = self
                     .dispatch_extension_outcomes(
                         LifecycleEvent::ToolCall {
@@ -2786,42 +2809,95 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn persist_interrupted_tool_calls(
-        &self,
-        calls: &[crate::model::ToolCall],
-        reason: &str,
-    ) -> Result<()> {
-        if calls.is_empty() {
-            return Ok(());
-        }
-        self.persist_message(session_integrity::interrupted_tool_results(calls, reason))
-            .await?;
-        self.ensure_session_integrity("tool execution interrupted")
-            .await
-    }
-
     async fn ensure_session_integrity(&self, reason: &str) -> Result<()> {
         let mut messages = self.messages.lock().await;
         repair_message_integrity(self.store.as_ref(), &mut messages, reason).await
     }
 
-    async fn compact_if_needed(&self) -> Result<()> {
+    async fn persist_budget_blocked_tool_results(
+        &self,
+        calls: &[crate::model::ToolCall],
+        pause: BudgetPause,
+        sink: &dyn EventSink,
+    ) -> Result<Vec<Message>> {
+        let mut contents = Vec::with_capacity(calls.len());
+        for call in calls {
+            let observation = ToolObservation {
+                status: ObservationStatus::Error,
+                summary: format!("tool not executed: budget paused ({pause})"),
+                next_actions: vec![
+                    "Resume with a larger budget or start a new run after reducing context".into(),
+                ],
+                artifacts: Vec::new(),
+                content: String::new(),
+            };
+            contents.push(Content::ToolResult(ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: serde_json::to_string(&observation)?,
+                is_error: true,
+            }));
+            sink.emit(RuntimeEvent::ToolFinished {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                observation,
+            })
+            .await;
+        }
+        let result = Message::tool_results(contents);
+        self.persist_message(result.clone()).await?;
+        Ok(vec![result])
+    }
+
+    async fn compact_if_needed(
+        &self,
+        system_prompt: &str,
+        tools: &[crate::model::ToolDefinition],
+        max_output_tokens: u32,
+    ) -> Result<()> {
         if !self.auto_compaction_enabled() {
             return Ok(());
         }
         self.ensure_session_integrity("automatic compaction boundary")
             .await?;
-        let limit = self.config.budget.max_context_messages.max(2);
+        let message_limit = self.config.budget.max_context_messages.max(2);
+        let context_window = self.config.budget.max_context_tokens.max(1);
+        let threshold_percent = u64::from(
+            self.config
+                .budget
+                .auto_compaction_threshold_percent
+                .clamp(1, 100),
+        );
+        let token_threshold = context_window
+            .saturating_mul(threshold_percent)
+            .checked_div(100)
+            .unwrap_or(context_window)
+            .max(1);
         let messages = self.messages.lock().await;
-        if messages.len() <= limit {
+        let tokens_before = estimate_request_tokens(system_prompt, &messages, tools);
+        let projected_tokens = tokens_before.saturating_add(u64::from(max_output_tokens));
+        let message_threshold_reached = messages.len() > message_limit;
+        let token_threshold_reached = projected_tokens >= token_threshold;
+        if !message_threshold_reached && !token_threshold_reached {
             return Ok(());
         }
         let _compacting = RunningFlag::new(&self.compacting);
-        let retained_count = limit.saturating_sub(1);
-        let split = session_integrity::safe_compaction_split(
+        let base_tokens = estimate_request_tokens(system_prompt, &[], tools)
+            .saturating_add(u64::from(max_output_tokens));
+        let retained_token_target = token_threshold
+            .saturating_sub(base_tokens)
+            .saturating_mul(3)
+            .checked_div(4)
+            .unwrap_or(0);
+        let split = auto_compaction_split(
             &messages,
-            messages.len().saturating_sub(retained_count),
+            message_limit.saturating_sub(1),
+            retained_token_target,
         );
+        let Some(split) = split else {
+            return Ok(());
+        };
+        let split = session_integrity::safe_compaction_split(&messages, split);
         let summary = summarize(&messages[..split]);
         let retained = messages[split..].to_vec();
         drop(messages);
@@ -2834,9 +2910,13 @@ impl AgentRuntime {
             .append(SessionRecord::new(SessionPayload::Compaction {
                 summary: summary.clone(),
                 retained_message_count: retained_record_count,
-                reason: Some("threshold".into()),
+                reason: Some(if token_threshold_reached {
+                    "token_threshold".into()
+                } else {
+                    "message_threshold".into()
+                }),
                 first_kept_entry_id: None,
-                tokens_before: 0,
+                tokens_before,
                 custom_instructions: None,
                 details: None,
             }))
@@ -2848,7 +2928,7 @@ impl AgentRuntime {
         self.publish_session_event(serde_json::json!({
             "type": "compaction_end",
             "result": {
-                "tokensBefore": 0,
+                "tokensBefore": tokens_before,
                 "summary": "automatic context compaction"
             }
         }))?;
@@ -3290,12 +3370,35 @@ fn summarize(messages: &[Message]) -> String {
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         };
-        let text: String = message.text().chars().take(240).collect();
+        let text: String = message_summary_text(message).chars().take(240).collect();
         if !text.is_empty() {
             lines.push(format!("- {role}: {text}"));
         }
     }
     lines.join("\n")
+}
+
+fn message_summary_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .map(|content| match content {
+            Content::Text { text } | Content::Thinking { text, .. } => text.clone(),
+            Content::Image { mime_type, .. } => format!("[{mime_type} image]"),
+            Content::ToolCall(call) => format!("tool call {} {}", call.name, call.arguments),
+            Content::ToolResult(result) => {
+                if let Ok(observation) = serde_json::from_str::<ToolObservation>(&result.content) {
+                    format!(
+                        "tool result {}: {}\n{}",
+                        result.tool_name, observation.summary, observation.content
+                    )
+                } else {
+                    format!("tool result {}: {}", result.tool_name, result.content)
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn estimate_message_tokens(messages: &[Message]) -> u64 {
@@ -3318,11 +3421,141 @@ fn estimate_message_tokens(messages: &[Message]) -> u64 {
     })
 }
 
+fn estimate_request_tokens(
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[crate::model::ToolDefinition],
+) -> u64 {
+    const REQUEST_FRAMING_TOKENS: u64 = 256;
+    const TOOL_FRAMING_TOKENS: u64 = 16;
+    let system_tokens =
+        u64::try_from(system_prompt.chars().count().div_ceil(4)).unwrap_or(u64::MAX);
+    let tool_tokens = tools.iter().fold(0_u64, |total, tool| {
+        let characters = tool
+            .name
+            .chars()
+            .count()
+            .saturating_add(tool.description.chars().count())
+            .saturating_add(tool.parameters.to_string().chars().count());
+        total.saturating_add(
+            u64::try_from(characters.div_ceil(4))
+                .unwrap_or(u64::MAX)
+                .saturating_add(TOOL_FRAMING_TOKENS),
+        )
+    });
+    REQUEST_FRAMING_TOKENS
+        .saturating_add(system_tokens)
+        .saturating_add(tool_tokens)
+        .saturating_add(estimate_message_tokens(messages))
+}
+
+fn auto_compaction_split(
+    messages: &[Message],
+    retained_message_target: usize,
+    retained_token_target: u64,
+) -> Option<usize> {
+    if messages.len() < 2 {
+        return None;
+    }
+    let count_split = messages
+        .len()
+        .saturating_sub(retained_message_target.max(1));
+    let mut retained_tokens = 0_u64;
+    let mut token_split = 0;
+    for index in (0..messages.len()).rev() {
+        retained_tokens =
+            retained_tokens.saturating_add(estimate_message_tokens(&messages[index..=index]));
+        if retained_tokens > retained_token_target {
+            token_split = index.saturating_add(1);
+            break;
+        }
+    }
+    let desired = count_split.max(token_split).clamp(1, messages.len() - 1);
+    (desired..messages.len())
+        .find(|split| safe_compaction_split(messages, *split))
+        .or_else(|| {
+            (1..desired)
+                .rev()
+                .find(|split| safe_compaction_split(messages, *split))
+        })
+}
+
+fn safe_compaction_split(messages: &[Message], split: usize) -> bool {
+    if split == 0 || split >= messages.len() || messages[split].role == Role::Tool {
+        return false;
+    }
+    let calls_before = messages[..split]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::ToolCall(call) => Some(call.id.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    !messages[split..]
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|content| {
+            matches!(content, Content::ToolResult(result) if calls_before.contains(result.tool_call_id.as_str()))
+        })
+}
+
+fn prepare_context_messages(messages: &[Message]) -> Vec<Message> {
+    bound_tool_results_for_context(session_integrity::normalize(messages))
+}
+
+fn bound_tool_results_for_context(mut messages: Vec<Message>) -> Vec<Message> {
+    const MAX_TOOL_RESULT_CONTEXT_BYTES: usize = 48 * 1024;
+    const TRUNCATION_NOTE: &str =
+        "\n[tool result truncated for active context; full result remains in session history]";
+    for message in &mut messages {
+        for content in &mut message.content {
+            let Content::ToolResult(result) = content else {
+                continue;
+            };
+            if result.content.len() <= MAX_TOOL_RESULT_CONTEXT_BYTES {
+                continue;
+            }
+            if let Ok(mut observation) = serde_json::from_str::<ToolObservation>(&result.content) {
+                truncate_string_bytes(
+                    &mut observation.content,
+                    MAX_TOOL_RESULT_CONTEXT_BYTES.saturating_sub(TRUNCATION_NOTE.len()),
+                );
+                observation.content.push_str(TRUNCATION_NOTE);
+                observation.next_actions.push(
+                    "Use an artifact path or a narrower follow-up read for omitted output".into(),
+                );
+                if let Ok(encoded) = serde_json::to_string(&observation) {
+                    result.content = encoded;
+                    continue;
+                }
+            }
+            truncate_string_bytes(
+                &mut result.content,
+                MAX_TOOL_RESULT_CONTEXT_BYTES.saturating_sub(TRUNCATION_NOTE.len()),
+            );
+            result.content.push_str(TRUNCATION_NOTE);
+        }
+    }
+    messages
+}
+
+fn truncate_string_bytes(value: &mut String, limit: usize) {
+    if value.len() <= limit {
+        return;
+    }
+    let mut end = limit.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
 fn manual_compaction_split(messages: &[Message], keep_recent_tokens: u64) -> Option<usize> {
     let valid_cut_points = messages
         .iter()
         .enumerate()
-        .filter(|(_, message)| message.role != Role::Tool)
+        .filter(|(index, _)| safe_compaction_split(messages, *index))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if valid_cut_points.is_empty() {

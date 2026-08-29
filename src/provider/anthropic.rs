@@ -672,20 +672,25 @@ fn parse_stop_reason(reason: &str) -> StopReason {
 
 fn parse_usage(value: Option<&Value>) -> Usage {
     let value = value.unwrap_or(&Value::Null);
-    Usage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cached_tokens: value
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    }
+    let uncached_input_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = value
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            value
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    Usage::from_separate_cached_input(uncached_input_tokens, output_tokens, cached_tokens)
 }
 
 #[derive(Default)]

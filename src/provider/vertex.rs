@@ -887,7 +887,7 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     Usage {
-        input_tokens: prompt.saturating_sub(cached),
+        input_tokens: prompt,
         output_tokens: candidates.saturating_add(thoughts),
         cached_tokens: cached,
     }

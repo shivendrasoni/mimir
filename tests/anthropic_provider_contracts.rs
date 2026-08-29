@@ -144,7 +144,7 @@ async fn native_messages_transport_uses_anthropic_headers_and_typed_blocks() {
                 {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "README.md"}}
             ],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3}
+            "usage": {"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}
         })
         .to_string();
         let response = format!(
@@ -164,9 +164,9 @@ async fn native_messages_transport_uses_anthropic_headers_and_typed_blocks() {
 
     assert_eq!(response.response_id.as_deref(), Some("msg-1"));
     assert_eq!(response.message.stop_reason, Some(StopReason::ToolUse));
-    assert_eq!(response.message.usage.input_tokens, 11);
+    assert_eq!(response.message.usage.input_tokens, 16);
     assert_eq!(response.message.usage.output_tokens, 7);
-    assert_eq!(response.message.usage.cached_tokens, 3);
+    assert_eq!(response.message.usage.cached_tokens, 5);
     assert!(matches!(
         &response.message.content[0],
         Content::Thinking { text, signature, .. } if text == "considering" && signature.as_deref() == Some("sig")

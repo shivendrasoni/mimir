@@ -265,6 +265,8 @@ impl RlmChildExecutor for AgentRuntimeChildExecutor {
             max_tokens: request.max_output_tokens,
             max_elapsed: self.policy.max_elapsed,
             max_context_messages: self.policy.max_context_messages,
+            max_context_tokens: u64::from(model.context_window),
+            auto_compaction_threshold_percent: 80,
         };
         let system_prompt = child_system_prompt(&self.policy.system_prompt, &request);
         let runtime = Arc::new(

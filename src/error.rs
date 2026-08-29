@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::budget::BudgetPause;
+
 #[derive(Debug, Error)]
 pub enum MimirError {
     #[error("configuration error: {0}")]
@@ -14,6 +16,8 @@ pub enum MimirError {
     Session { path: PathBuf, message: String },
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("budget paused: {0}")]
+    BudgetPaused(BudgetPause),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

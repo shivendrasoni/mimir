@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,6 +13,10 @@ pub struct Budget {
     pub max_tokens: u64,
     pub max_elapsed: Duration,
     pub max_context_messages: usize,
+    /// Provider context-window ceiling used by automatic compaction.
+    pub max_context_tokens: u64,
+    /// Percentage of the context window at which compaction starts.
+    pub auto_compaction_threshold_percent: u8,
 }
 
 impl Default for Budget {
@@ -20,6 +27,8 @@ impl Default for Budget {
             max_tokens: 1_000_000,
             max_elapsed: Duration::from_secs(30 * 60),
             max_context_messages: 200,
+            max_context_tokens: 128_000,
+            auto_compaction_threshold_percent: 80,
         }
     }
 }
@@ -34,6 +43,65 @@ pub enum BudgetError {
     Tokens { limit: u64 },
     #[error("elapsed-time budget exhausted after {limit_ms} ms")]
     Elapsed { limit_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetKind {
+    Turns,
+    ToolCalls,
+    Tokens,
+    Elapsed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetPause {
+    pub kind: BudgetKind,
+    pub limit: u64,
+    pub usage: BudgetSnapshot,
+}
+
+impl fmt::Display for BudgetPause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:?} limit {} reached (turns={}, tool_calls={}, tokens={}, elapsed_ms={})",
+            self.kind,
+            self.limit,
+            self.usage.turns,
+            self.usage.tool_calls,
+            self.usage.tokens,
+            self.usage.elapsed_ms
+        )
+    }
+}
+
+impl BudgetError {
+    #[must_use]
+    pub fn pause(&self, usage: BudgetSnapshot) -> BudgetPause {
+        match *self {
+            Self::Turns { limit } => BudgetPause {
+                kind: BudgetKind::Turns,
+                limit: u64::from(limit),
+                usage,
+            },
+            Self::ToolCalls { limit } => BudgetPause {
+                kind: BudgetKind::ToolCalls,
+                limit: u64::from(limit),
+                usage,
+            },
+            Self::Tokens { limit } => BudgetPause {
+                kind: BudgetKind::Tokens,
+                limit,
+                usage,
+            },
+            Self::Elapsed { limit_ms } => BudgetPause {
+                kind: BudgetKind::Elapsed,
+                limit: limit_ms,
+                usage,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use mimir::budget::{Budget, BudgetError, BudgetUsage};
 use mimir::config::{Config, ProviderConfig};
-use mimir::model::{Content, Message, Role, StopReason, ToolCall};
+use mimir::model::{Content, Message, Role, StopReason, ToolCall, Usage};
 use serde_json::json;
 
 #[test]
@@ -47,12 +47,28 @@ fn budget_names_the_first_exhausted_limit() {
         max_tokens: 100,
         max_elapsed: Duration::from_secs(10),
         max_context_messages: 20,
+        max_context_tokens: 128_000,
+        auto_compaction_threshold_percent: 80,
     };
     let mut usage = BudgetUsage::default();
 
     usage.record_turn(40).expect("first turn should fit");
     usage.record_turn(40).expect("second turn should fit");
     assert_eq!(usage.check(&budget), Err(BudgetError::Turns { limit: 2 }));
+}
+
+#[test]
+fn normalized_usage_does_not_double_count_cached_input() {
+    let inclusive = Usage {
+        input_tokens: 120_000,
+        output_tokens: 1_000,
+        cached_tokens: 90_000,
+    };
+    assert_eq!(inclusive.total(), 121_000);
+
+    let separate = Usage::from_separate_cached_input(30_000, 1_000, 90_000);
+    assert_eq!(separate, inclusive);
+    assert_eq!(separate.total(), 121_000);
 }
 
 #[test]

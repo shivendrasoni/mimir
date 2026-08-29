@@ -379,7 +379,9 @@ fn safe_error(error: &MimirError) -> String {
         MimirError::Protocol(_) => "MCP protocol or transport operation failed",
         MimirError::Io(_) => "MCP transport is unavailable",
         MimirError::Json(_) => "MCP server returned invalid JSON",
-        MimirError::Provider(_) | MimirError::Session { .. } => "MCP operation failed",
+        MimirError::Provider(_) | MimirError::Session { .. } | MimirError::BudgetPaused(_) => {
+            "MCP operation failed"
+        }
     };
     bounded_public_text(message)
 }

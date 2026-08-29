@@ -1118,6 +1118,81 @@ async fn required_provenance_blocks_a_fabricated_copy_after_a_failed_read() {
 }
 
 #[tokio::test]
+async fn required_provenance_recovers_unknown_id_from_successful_matching_read() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        response(
+            vec![Content::ToolCall(ToolCall {
+                id: "actual-read-id".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "source.css"}),
+            })],
+            StopReason::ToolUse,
+            2,
+        ),
+        response(
+            vec![Content::ToolCall(ToolCall {
+                id: "write-copy".into(),
+                name: "write_file".into(),
+                arguments: json!({
+                    "path": "copy.css",
+                    "content": "faithful replacement",
+                    "provenance": {
+                        "required": true,
+                        "derivedFrom": [{
+                            "toolCallId": "model-invented-id",
+                            "path": "source.css"
+                        }]
+                    }
+                }),
+            })],
+            StopReason::ToolUse,
+            2,
+        ),
+        response(
+            vec![Content::Text {
+                text: "copied safely".into(),
+            }],
+            StopReason::Stop,
+            2,
+        ),
+    ]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(root.path().join("source.css"), "source").expect("seed source");
+    let runtime = AgentRuntime::resume(
+        provider,
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+
+    assert_eq!(
+        runtime
+            .run("copy the source", &VecEventSink::default())
+            .await
+            .expect("agent completes"),
+        "copied safely"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("copy.css")).expect("copy exists"),
+        "faithful replacement"
+    );
+    let loaded = store.load().await.expect("session");
+    assert!(loaded.records.iter().any(|record| matches!(
+        &record.payload,
+        SessionPayload::RuntimeEvent { name, detail }
+            if name == "provenance_check"
+                && detail.contains("\"allowed\":true")
+                && detail.contains("\"recoveredByPath\":true")
+                && detail.contains("actual-read-id")
+    )));
+}
+
+#[tokio::test]
 async fn runtime_compacts_context_before_provider_request() {
     let provider = Arc::new(FakeProvider::new(vec![response(
         vec![Content::Text { text: "ok".into() }],

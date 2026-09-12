@@ -1019,6 +1019,10 @@ fn secure_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "callers share the fallible Unix permission contract"
+)]
 fn secure_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -1031,6 +1035,10 @@ fn secure_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "callers share the fallible Unix permission contract"
+)]
 fn secure_file(_path: &Path) -> Result<()> {
     Ok(())
 }

@@ -1,9 +1,12 @@
+#[cfg(unix)]
 mod journal;
 mod protocol;
 mod public;
+#[cfg(unix)]
 mod replay;
 pub(crate) mod runtime_ops;
 mod server;
+#[cfg(unix)]
 pub(crate) mod session_ops;
 mod state;
 pub(crate) mod turn_ops;

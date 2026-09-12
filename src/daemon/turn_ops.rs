@@ -1,12 +1,18 @@
 //! Bounded prompt-admission and turn-recovery primitives for the public daemon.
 
+use std::collections::HashSet;
+#[cfg(unix)]
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex as StdMutex, Weak},
 };
 
-use serde_json::{Map, Value, json};
+#[cfg(unix)]
+use serde_json::json;
+use serde_json::{Map, Value};
+#[cfg(unix)]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{Content, Message};
@@ -19,8 +25,10 @@ const MAX_RECOVERY_TEXT_CHARS: usize = 262_144;
 const MAX_RECOVERY_ID_CHARS: usize = 256;
 const MAX_CUSTOM_TYPE_CHARS: usize = 128;
 
+#[cfg(unix)]
 type AdmissionKey = (String, String);
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionStatus {
     Waiting,
@@ -28,6 +36,7 @@ enum AdmissionStatus {
     Cancelled,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct AdmissionEntry {
     status: AdmissionStatus,
@@ -102,6 +111,7 @@ pub(crate) enum TurnRecovery {
     ResumeQueue,
 }
 
+#[cfg(unix)]
 /// Per-daemon prompt admission gates and recovery validation.
 #[derive(Debug, Default)]
 pub(crate) struct TurnOps {
@@ -109,6 +119,7 @@ pub(crate) struct TurnOps {
     admissions: Arc<StdMutex<HashMap<AdmissionKey, AdmissionEntry>>>,
 }
 
+#[cfg(unix)]
 impl TurnOps {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -220,6 +231,7 @@ impl TurnOps {
     }
 }
 
+#[cfg(unix)]
 /// Holds one session's prompt gate until the provider run has completed.
 pub(crate) struct PromptAdmissionGuard {
     key: Option<AdmissionKey>,
@@ -227,6 +239,7 @@ pub(crate) struct PromptAdmissionGuard {
     _permit: OwnedSemaphorePermit,
 }
 
+#[cfg(unix)]
 impl PromptAdmissionGuard {
     /// Commits ownership after the dispatcher has resolved the target runtime.
     pub(crate) fn mark_owned(&mut self) -> Result<(), DaemonError> {
@@ -245,6 +258,7 @@ impl PromptAdmissionGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PromptAdmissionGuard {
     fn drop(&mut self) {
         if let Some(key) = &self.key {
@@ -588,6 +602,7 @@ fn object_string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a 
         .ok_or_else(|| protocol(format!("{field} must be a string")))
 }
 
+#[cfg(unix)]
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()

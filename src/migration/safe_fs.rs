@@ -289,8 +289,8 @@ async fn set_private_if_sensitive(path: &Path, _relative: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn set_private_if_sensitive(_path: &Path, _relative: &str) -> Result<()> {
-    Ok(())
+fn set_private_if_sensitive(_path: &Path, _relative: &str) -> std::future::Ready<Result<()>> {
+    std::future::ready(Ok(()))
 }
 
 pub(crate) async fn write_json_atomic<T: Serialize>(
@@ -418,8 +418,8 @@ async fn set_private_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn set_private_directory(_path: &Path) -> Result<()> {
-    Ok(())
+fn set_private_directory(_path: &Path) -> std::future::Ready<Result<()>> {
+    std::future::ready(Ok(()))
 }
 
 fn enforce_size_limit(path: &Path, actual: u64, limit: u64) -> Result<()> {

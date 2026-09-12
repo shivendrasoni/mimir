@@ -442,6 +442,6 @@ async fn set_private_permissions(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn set_private_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+fn set_private_permissions(_path: &std::path::Path) -> std::future::Ready<Result<()>> {
+    std::future::ready(Ok(()))
 }

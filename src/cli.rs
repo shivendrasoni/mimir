@@ -2615,12 +2615,17 @@ async fn public_daemon_request(cli: &Cli, state: &Path, command: Value) -> Resul
 }
 
 #[cfg(not(unix))]
-async fn public_daemon_request(_cli: &Cli, _state: &Path, _command: Value) -> Result<Value> {
-    Err(MimirError::Configuration(
+fn public_daemon_request(
+    _cli: &Cli,
+    _state: &Path,
+    _command: Value,
+) -> std::future::Ready<Result<Value>> {
+    std::future::ready(Err(MimirError::Configuration(
         "public daemon commands require Unix-domain sockets".into(),
-    ))
+    )))
 }
 
+#[cfg(unix)]
 async fn read_public_json_line<R>(
     reader: &mut tokio::io::BufReader<R>,
     limit: usize,

@@ -9,13 +9,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
 use async_trait::async_trait;
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use serde::Deserialize;
+use serde::Serialize;
+#[cfg(unix)]
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -26,12 +30,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[cfg(unix)]
 use crate::model::ToolDefinition;
 
+#[cfg(unix)]
 use super::{
-    DestructiveAction, ObservationStatus, Tool, ToolError, ToolObservation, ToolPolicy,
-    WorkspacePathPolicy, object_schema, parse_input,
+    DestructiveAction, ObservationStatus, Tool, ToolObservation, object_schema, parse_input,
 };
+use super::{ToolError, ToolPolicy, WorkspacePathPolicy};
 
 const MAX_FULL_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -57,17 +63,20 @@ pub struct BashRunner {
     running: AtomicBool,
 }
 
+#[cfg(unix)]
 pub(super) struct BashTool {
     runner: BashRunner,
     policy: ToolPolicy,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BashInput {
     command: String,
 }
 
+#[cfg(unix)]
 impl BashTool {
     pub fn new(workspace: &Path, policy: ToolPolicy) -> Result<Self, ToolError> {
         let mut runner_policy = policy.clone();
@@ -145,6 +154,7 @@ impl BashTool {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
@@ -167,6 +177,7 @@ impl Tool for BashTool {
         self.execute_inner(input, None).await
     }
 
+    #[cfg(unix)]
     async fn execute_cancellable(
         &self,
         input: Value,

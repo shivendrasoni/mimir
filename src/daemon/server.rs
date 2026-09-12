@@ -2,6 +2,11 @@
     clippy::missing_errors_doc,
     reason = "daemon errors are exhaustively represented by DaemonError"
 )]
+#![cfg_attr(
+    not(unix),
+    allow(dead_code),
+    reason = "the public daemon API fails closed on platforms without Unix-domain sockets"
+)]
 
 use std::{
     collections::BTreeSet,
@@ -331,10 +336,10 @@ impl DaemonClient {
     }
 
     #[cfg(not(unix))]
-    pub async fn connect(_socket_path: &Path) -> Result<Self, DaemonError> {
-        Err(DaemonError::UnsupportedTransport(
+    pub fn connect(_socket_path: &Path) -> std::future::Ready<Result<Self, DaemonError>> {
+        std::future::ready(Err(DaemonError::UnsupportedTransport(
             "Unix sockets are required".into(),
-        ))
+        )))
     }
 
     #[cfg(unix)]
@@ -376,13 +381,13 @@ impl DaemonClient {
     }
 
     #[cfg(not(unix))]
-    pub async fn request(
+    pub fn request(
         &mut self,
         _payload: ClientRequest,
-    ) -> Result<ServerResponse, DaemonError> {
-        Err(DaemonError::UnsupportedTransport(
+    ) -> std::future::Ready<Result<ServerResponse, DaemonError>> {
+        std::future::ready(Err(DaemonError::UnsupportedTransport(
             "Unix sockets are required".into(),
-        ))
+        )))
     }
 }
 
@@ -3740,13 +3745,13 @@ impl DaemonServer {
 
 #[cfg(not(unix))]
 impl DaemonServer {
-    pub async fn spawn(
+    pub fn spawn(
         _config: DaemonConfig,
         _handler: Arc<dyn PromptHandler>,
-    ) -> Result<DaemonHandle, DaemonError> {
-        Err(DaemonError::UnsupportedTransport(
+    ) -> std::future::Ready<Result<DaemonHandle, DaemonError>> {
+        std::future::ready(Err(DaemonError::UnsupportedTransport(
             "Unix sockets are required".into(),
-        ))
+        )))
     }
 
     pub fn spawn_blocking_for_test(

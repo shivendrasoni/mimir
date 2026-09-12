@@ -188,6 +188,7 @@ impl DaemonStateStore {
     }
 }
 
+#[cfg(unix)]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

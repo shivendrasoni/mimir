@@ -326,6 +326,7 @@ pub struct AgentMessageRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(unix)]
 pub(crate) struct RequestEnvelope {
     pub schema_version: u16,
     pub request_id: Uuid,
@@ -333,12 +334,14 @@ pub(crate) struct RequestEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(unix)]
 pub(crate) struct ResponseEnvelope {
     pub schema_version: u16,
     pub request_id: Uuid,
     pub payload: ServerResponse,
 }
 
+#[cfg(unix)]
 pub(crate) fn negotiate_capabilities(
     server: &BTreeSet<String>,
     requested: &[String],
@@ -353,6 +356,7 @@ pub(crate) fn negotiate_capabilities(
     negotiated
 }
 
+#[cfg(unix)]
 pub(crate) fn schema_mismatch_error(version: u16) -> FailureResponse {
     FailureResponse {
         code: "schema_mismatch".into(),

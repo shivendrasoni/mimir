@@ -96,4 +96,10 @@ fn platform_failures_are_isolated_and_successful_artifacts_publish_independently
         !release.contains("actions/download-artifact"),
         "platform releases must not depend on a combined artifact-publishing job"
     );
+    assert!(
+        release.contains("Update package and lockfile version")
+            && release.contains("Cargo.lock mimir package version was not found")
+            && release.contains("cargo metadata --locked --no-deps"),
+        "release preparation must synchronize and validate Cargo.toml and Cargo.lock"
+    );
 }

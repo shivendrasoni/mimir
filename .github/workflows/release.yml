@@ -78,14 +78,16 @@ jobs:
           echo "version=$release_version" >> "$GITHUB_OUTPUT"
           echo "tag=v$release_version" >> "$GITHUB_OUTPUT"
           echo "Preparing v$release_version"
-      - name: Update package version
+      - name: Update package and lockfile version
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
 
+          release_version = os.environ["RELEASE_VERSION"]
           path = Path("Cargo.toml")
           lines = path.read_text().splitlines(keepends=True)
           in_package = False
@@ -99,15 +101,27 @@ jobs:
                   break
               if in_package and stripped.startswith("version = "):
                   newline = "\n" if line.endswith("\n") else ""
-                  lines[index] = f'version = "{os.environ["RELEASE_VERSION"]}"{newline}'
+                  lines[index] = f'version = "{release_version}"{newline}'
                   updated = True
                   break
           if not updated:
               raise SystemExit("Cargo.toml package version was not found")
           path.write_text("".join(lines))
+
+          lock_path = Path("Cargo.lock")
+          lock_text = lock_path.read_text()
+          lock_text, replacements = re.subn(
+              r'(?m)(^name = "mimir"\nversion = ")[^"]+("$)',
+              rf'\g<1>{release_version}\g<2>',
+              lock_text,
+              count=1,
+          )
+          if replacements != 1:
+              raise SystemExit("Cargo.lock mimir package version was not found")
+          lock_path.write_text(lock_text)
           PY
-      - name: Update lockfile version
-        run: cargo metadata --no-deps --format-version 1 >/dev/null
+      - name: Validate synchronized lockfile
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
       - name: Create tagged release commit
         id: commit
         env:

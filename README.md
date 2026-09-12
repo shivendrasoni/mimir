@@ -211,6 +211,13 @@ Use `/rlm-max-depth` in the TUI to inspect or set the recursion limit for a sess
 
 This is harness refinement, not model-weight training: Mimir proposes and validates small durable operating-context changes, then records the before/after state needed to inspect or reverse them.
 
+## Agent harness benchmarks
+
+- [Mimir vs Claude Code — 6 tasks, 3 repeats](benchmarks/2026-09-12-mimir-vs-claude-code.pdf)
+- [Mimir vs Codex — matched GPT-5.6 Terra model, 6 tasks, 3 repeats](benchmarks/2026-09-12-mimir-vs-codex.pdf)
+
+Each report records the run identifiers, benchmark commit, harness and model versions, outcome scores, timing, token usage, scope violations, and adapter failures used for the comparison.
+
 ## Quality gates
 
 ```bash

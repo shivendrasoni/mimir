@@ -5,7 +5,10 @@ use mimir::{
     model::{
         Content, Message, ModelRequest, Role, StopReason, ThinkingLevel, ToolCall, ToolDefinition,
     },
-    provider::{AnthropicProvider, Provider, ProviderError, ProviderEvent, ProviderEventSink},
+    provider::{
+        AnthropicCredentialKind, AnthropicProvider, Provider, ProviderError, ProviderEvent,
+        ProviderEventSink,
+    },
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -332,6 +335,29 @@ fn anthropic_preview_omits_internal_tool_role_and_normalizes_ids() {
             .messages
             .iter()
             .any(|message| message.role == Role::Tool)
+    );
+}
+
+#[test]
+fn anthropic_oauth_keeps_identity_separate_from_agent_system_prompt() {
+    let provider = AnthropicProvider::with_credential_kind(
+        None,
+        "test-oauth-token",
+        AnthropicCredentialKind::OAuthToken,
+    )
+    .expect("provider");
+
+    let preview = provider.request_preview(&request());
+
+    assert_eq!(
+        preview["system"],
+        json!([
+            {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            },
+            {"type": "text", "text": "Be precise"}
+        ])
     );
 }
 

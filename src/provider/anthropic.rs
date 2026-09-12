@@ -322,7 +322,16 @@ fn build_request_body(request: &ModelRequest, credential_kind: AnthropicCredenti
         "messages": messages
     });
     if !system.is_empty() {
-        body["system"] = json!(system.join("\n\n"));
+        body["system"] = if credential_kind == AnthropicCredentialKind::OAuthToken {
+            Value::Array(
+                system
+                    .into_iter()
+                    .map(|text| json!({"type": "text", "text": text}))
+                    .collect(),
+            )
+        } else {
+            json!(system.join("\n\n"))
+        };
     }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);

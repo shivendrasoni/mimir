@@ -422,8 +422,14 @@ async fn anthropic_oauth_token_uses_bearer_identity_and_never_api_key_auth() {
     let body = request.split("\r\n\r\n").nth(1).expect("request body");
     let value: serde_json::Value = serde_json::from_str(body).expect("JSON request");
     assert_eq!(
-        value["system"].as_str().expect("system").lines().next(),
-        Some("You are Claude Code, Anthropic's official CLI for Claude.")
+        value["system"],
+        json!([
+            {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            },
+            {"type": "text", "text": "Be concise"}
+        ])
     );
     let debug = format!("{provider:?}");
     assert!(!debug.contains(token));

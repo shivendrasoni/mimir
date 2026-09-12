@@ -2,7 +2,7 @@ use crate::{
     model::ThinkingLevel,
     orchestration::HeartbeatManagementAction,
     runtime::QueueMode,
-    tools::{ApprovalDecision, PermissionRequest},
+    tools::{AgentMode, ApprovalDecision, PermissionRequest},
 };
 use uuid::Uuid;
 
@@ -11,6 +11,7 @@ use super::commands::McpCommand;
 /// Typed, side-effect-free requests emitted by TUI slash commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
+    SetAgentMode(AgentMode),
     WorkspacePermission {
         request: PermissionRequest,
         decision: ApprovalDecision,

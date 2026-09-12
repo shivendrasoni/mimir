@@ -127,10 +127,14 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     }
     composer.push(rule);
     composer.push(format!(
-        "{} · {} · /help  ·  ctrl+v attach image  ·  ctrl+c interrupt",
+        "{} · {} · mode:{} · /help  ·  ctrl+v attach image  ·  ctrl+c cancel · twice exit",
         app.selected_model().unwrap_or("model unset"),
-        app.selected_effort().as_str()
+        app.selected_effort().as_str(),
+        app.agent_mode().as_str()
     ));
+    if let Some(hint) = app.command_parameter_hint() {
+        composer.push(format!("↳ {hint}"));
+    }
     composer.push(format!(
         "{}❯ {}",
         " ".repeat(usize::from(app.editor_padding_x())),
@@ -294,7 +298,8 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
             lines.push(String::new());
             lines.push("Help".into());
             lines.push(
-                "/login /logout /model /effort /session /sessions /resume /new /clear /name".into(),
+                "/login /logout /model /mode /effort /session /sessions /resume /new /clear /name"
+                    .into(),
             );
             lines.push("/tree /fork /clone".into());
             lines.push("/compact /refine /goal /autonomous /heartbeat /heartbeats".into());
@@ -310,7 +315,8 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
             lines.push("Enter submit/confirm · Esc close overlay or quit".into());
             lines.push("Up/Down history or selector · Left/Right move cursor".into());
             lines.push(
-                "Backspace/Delete edit · Ctrl+V attach image · Ctrl+C cancel · Ctrl+D quit".into(),
+                "Backspace/Delete edit · Ctrl+V attach image · Ctrl+C cancel · twice exit · Ctrl+D quit"
+                    .into(),
             );
         }
         Overlay::Confirm { title, message, .. } => {

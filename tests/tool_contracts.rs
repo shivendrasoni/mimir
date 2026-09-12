@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use mimir::tools::{
-    ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus, ToolError, ToolPolicy,
-    ToolRegistry, WorkspaceApprovalStore,
+    AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus, ToolError,
+    ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -17,6 +17,9 @@ fn registry(root: &TempDir) -> ToolRegistry {
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: true,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["sleep".into(), "printf".into()]),
             approvals: None,
         },
@@ -34,6 +37,9 @@ fn approval_registry(root: &TempDir) -> (ToolRegistry, Arc<WorkspaceApprovalStor
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: false,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: None,
             approvals: Some(Arc::clone(&approvals)),
         },
@@ -95,6 +101,9 @@ async fn mockup_workspace_explains_how_to_access_a_sibling_vv_file() {
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: true,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["find".into()]),
             approvals: None,
         },
@@ -216,6 +225,9 @@ async fn process_path_screening_preserves_normal_flags_and_urls() {
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: true,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["printf".into()]),
             approvals: None,
         },
@@ -574,6 +586,9 @@ async fn process_tool_caps_observation_bytes() {
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: true,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["printf".into()]),
             approvals: None,
         },
@@ -611,6 +626,9 @@ fn process_registry(
             max_write_bytes: 1024,
             allow_write: true,
             allow_process: true,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Some(
                 allowed_programs
                     .iter()
@@ -1020,6 +1038,62 @@ async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
         .execute("sleep 1")
         .await
         .expect_err("unlisted command must fail closed");
+}
+
+#[tokio::test]
+async fn model_bash_requires_approval_in_default_mode_and_runs_in_auto_mode() {
+    let root = TempDir::new().expect("tempdir");
+    let approvals = Arc::new(WorkspaceApprovalStore::new(root.path()).expect("approvals"));
+    let default_tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            allow_shell: true,
+            approvals: Some(Arc::clone(&approvals)),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("default tools");
+    assert!(
+        default_tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.name == "bash")
+    );
+
+    let error = default_tools
+        .execute("bash", json!({"command": "printf default"}))
+        .await
+        .expect_err("default mode must request approval");
+    let ToolError::ApprovalRequired { request } = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(request.action, DestructiveAction::ProcessExecution);
+    approvals
+        .record(&request, ApprovalDecision::AllowOnce)
+        .expect("approval");
+    let approved = default_tools
+        .execute("bash", json!({"command": "printf default"}))
+        .await
+        .expect("approved bash");
+    assert_eq!(approved.status, ObservationStatus::Success);
+    assert_eq!(approved.content, "default");
+
+    let auto_tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            allow_shell: true,
+            agent_mode: AgentMode::Auto,
+            approvals: Some(approvals),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("auto tools");
+    let automatic = auto_tools
+        .execute("bash", json!({"command": "printf automatic | tr a-z A-Z"}))
+        .await
+        .expect("automatic bash");
+    assert_eq!(automatic.status, ObservationStatus::Success);
+    assert_eq!(automatic.content, "AUTOMATIC");
 }
 
 #[tokio::test]

@@ -17,10 +17,27 @@ use mimir::{
     session::{
         FileSessionStore, InMemorySessionStore, SessionPayload, SessionRecord, SessionStore,
     },
-    tools::{ApprovalDecision, DestructiveAction, PermissionRequest, ToolPolicy, ToolRegistry},
+    tools::{
+        AgentMode, ApprovalDecision, DestructiveAction, PermissionRequest, ToolPolicy, ToolRegistry,
+    },
 };
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[test]
+fn fresh_tui_shows_a_cursor_and_supports_editing_in_the_middle() {
+    let mut app = App::new(AppConfig::default());
+
+    assert!(
+        app.show_hardware_cursor(),
+        "the prompt cursor should be visible without changing settings"
+    );
+
+    app.set_prompt("helo");
+    app.apply_key(KeyEvent::plain(KeyCode::Left));
+    app.apply_key(KeyEvent::plain(KeyCode::Char('l')));
+    assert_eq!(app.prompt(), "hello");
+}
 
 #[test]
 fn parses_supported_slash_commands_and_arguments() {
@@ -38,6 +55,20 @@ fn parses_supported_slash_commands_and_arguments() {
             model: Some("gpt-5-mini".into()),
         })
     );
+    assert_eq!(
+        parse_slash_command("/mode"),
+        Some(SlashCommand::Mode { mode: None })
+    );
+    assert_eq!(
+        parse_slash_command("/mode auto"),
+        Some(SlashCommand::Mode {
+            mode: Some(AgentMode::Auto),
+        })
+    );
+    assert!(matches!(
+        parse_slash_command("/mode unsafe"),
+        Some(SlashCommand::Invalid { .. })
+    ));
     assert_eq!(
         parse_slash_command("/session"),
         Some(SlashCommand::Session { session: None })
@@ -305,6 +336,26 @@ fn scoped_models_are_interactive_and_drive_ctrl_p_cycling() {
 }
 
 #[test]
+fn mode_command_switches_between_confirmed_and_automatic_execution() {
+    let mut app = App::new(AppConfig::default());
+    assert_eq!(app.agent_mode(), AgentMode::Default);
+
+    submit_command(&mut app, "/mode auto");
+    assert_eq!(app.agent_mode(), AgentMode::Auto);
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::SetAgentMode(AgentMode::Auto))
+    );
+
+    submit_command(&mut app, "/mode default");
+    assert_eq!(app.agent_mode(), AgentMode::Default);
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::SetAgentMode(AgentMode::Default))
+    );
+}
+
+#[test]
 fn settings_overlay_is_an_interactive_runtime_selector() {
     let mut app = App::new(AppConfig::default());
     app.set_models(vec!["openai/gpt-5".into()]);
@@ -436,7 +487,7 @@ fn extended_reference_commands_emit_actions_and_render_hotkeys() {
     );
     assert!(rendered.contains("Keyboard shortcuts"));
     assert!(rendered.contains("Ctrl+V attach image"));
-    assert!(rendered.contains("Ctrl+C cancel"));
+    assert!(rendered.contains("Ctrl+C cancel · twice exit"));
     assert!(rendered.contains("Ctrl+D quit"));
 }
 
@@ -1046,6 +1097,63 @@ fn display_preferences_drive_autocomplete_followups_images_progress_and_layout()
         },
     );
     assert!(rendered.contains("   ❯ /"));
+}
+
+#[test]
+fn slash_command_parameter_hints_are_muted_and_do_not_edit_the_prompt() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("/new");
+    let size = TerminalSize {
+        width: 100,
+        height: 12,
+    };
+
+    let plain = app.render(
+        size,
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+    assert!(plain.contains("↳ /new [--name <name>] [-- <prompt>]"));
+    assert_eq!(app.prompt(), "/new");
+
+    let ansi = app.render(
+        size,
+        RenderOptions {
+            capabilities: TerminalCapabilities::rich_ansi(),
+        },
+    );
+    assert!(ansi.contains("\u{1b}[38;2;148;163;184m↳ /new [--name <name>] [-- <prompt>]\u{1b}[0m"));
+}
+
+#[test]
+fn prompt_template_argument_hints_appear_while_using_the_command() {
+    let root = TempDir::new().expect("resources");
+    let mut app = App::new(AppConfig::default());
+    app.set_resource_snapshot(mimir::tui::TuiResourceSnapshot {
+        prompt_templates: vec![PromptTemplate {
+            name: "audit".into(),
+            description: "Audit a target".into(),
+            argument_hint: Some("<target>".into()),
+            content: "Audit $1 carefully".into(),
+            path: root.path().join("audit.md"),
+        }],
+        ..mimir::tui::TuiResourceSnapshot::default()
+    });
+    app.set_prompt("/audit");
+
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 12,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+
+    assert!(rendered.contains("↳ /audit <target>"));
+    assert_eq!(app.prompt(), "/audit");
 }
 
 #[test]

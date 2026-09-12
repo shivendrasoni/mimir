@@ -9,13 +9,13 @@ use crate::{
     orchestration::HeartbeatManagementAction,
     resources::{CustomTheme, PromptTemplate, Skill, expand_prompt_template},
     runtime::QueueMode,
-    tools::{ApprovalDecision, PermissionRequest},
+    tools::{AgentMode, ApprovalDecision, PermissionRequest},
 };
 use uuid::Uuid;
 
 use super::{
     Action, InputBinding, KeyCode, KeyEvent, RenderOptions, SlashCommand, TerminalSize, TuiAction,
-    parse_slash_command, render::render,
+    commands::builtin_command_usage, parse_slash_command, render::render,
 };
 
 static EMPTY_MODELS: LazyLock<BTreeSet<String>> = LazyLock::new(BTreeSet::new);
@@ -44,6 +44,7 @@ const BUILTIN_COMPLETIONS: &[&str] = &[
     "/logs",
     "/mcp",
     "/model",
+    "/mode",
     "/name",
     "/new",
     "/quit",
@@ -329,6 +330,7 @@ pub struct TuiResourceSnapshot {
     reason = "independent TUI display toggles mirror persisted operator settings"
 )]
 pub struct AppPreferenceState {
+    pub agent_mode: AgentMode,
     pub fast_mode: bool,
     pub fullscreen: bool,
     pub auto_compaction: bool,
@@ -351,6 +353,7 @@ pub struct AppPreferenceState {
 impl Default for AppPreferenceState {
     fn default() -> Self {
         Self {
+            agent_mode: AgentMode::Default,
             fast_mode: false,
             fullscreen: true,
             auto_compaction: true,
@@ -364,7 +367,7 @@ impl Default for AppPreferenceState {
             follow_up_mode: QueueMode::OneAtATime,
             autocomplete_max_visible: 8,
             tree_filter_mode: TreeFilterMode::Default,
-            show_hardware_cursor: false,
+            show_hardware_cursor: true,
             editor_padding_x: 0,
             show_terminal_progress: true,
             show_warnings: true,
@@ -644,6 +647,26 @@ impl App {
         self.current_activity.as_deref()
     }
 
+    pub(crate) fn command_parameter_hint(&self) -> Option<String> {
+        let command = self.prompt.trim_start().strip_prefix('/')?;
+        let command_end = command.find(char::is_whitespace).unwrap_or(command.len());
+        let name = &command[..command_end];
+        if name.is_empty() {
+            return None;
+        }
+        if let Some(usage) = builtin_command_usage(name) {
+            return Some(usage.into());
+        }
+        self.resource_snapshot
+            .prompt_templates
+            .iter()
+            .find(|template| template.name.eq_ignore_ascii_case(name))
+            .and_then(|template| template.argument_hint.as_deref())
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(|hint| format!("/{name} {hint}"))
+    }
+
     #[must_use]
     pub const fn run_active(&self) -> bool {
         self.run_active
@@ -685,6 +708,15 @@ impl App {
     #[must_use]
     pub const fn fast_mode(&self) -> bool {
         self.preferences.fast_mode
+    }
+
+    #[must_use]
+    pub const fn agent_mode(&self) -> AgentMode {
+        self.preferences.agent_mode
+    }
+
+    pub fn set_agent_mode(&mut self, mode: AgentMode) {
+        self.preferences.agent_mode = mode;
     }
 
     pub fn set_fast_mode(&mut self, enabled: bool) {
@@ -1518,6 +1550,17 @@ impl App {
                     self.select_or_filter_model(&model);
                 } else {
                     self.open_overlay(OverlayKind::ModelSelector);
+                }
+            }
+            SlashCommand::Mode { mode } => {
+                if let Some(mode) = mode {
+                    self.preferences.agent_mode = mode;
+                    self.pending_tui_action = Some(TuiAction::SetAgentMode(mode));
+                } else {
+                    self.push_system_message(format!(
+                        "Mode: {}. Default asks before model-issued shell commands; auto runs shell commands and workspace edits immediately.",
+                        self.preferences.agent_mode.as_str()
+                    ));
                 }
             }
             SlashCommand::Session { .. } => {

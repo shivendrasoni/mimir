@@ -482,7 +482,8 @@ fn require_write_approval(
     tool: &str,
     requested_path: &str,
 ) -> Result<(), ToolError> {
-    if let Some(approvals) = &policy.approvals
+    if !policy.agent_mode.automatically_approves()
+        && let Some(approvals) = &policy.approvals
         && let Some(request) = approvals.requires_action_approval(
             DestructiveAction::FilesystemWrite,
             &format!("{tool} $WORKSPACE/{requested_path}"),

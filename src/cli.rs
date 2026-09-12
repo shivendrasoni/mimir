@@ -78,11 +78,12 @@ use crate::{
     },
     skills::SkillRuntime,
     tools::{
-        BashResult, BashRunner, ObservationStatus, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
+        AgentMode, BashResult, BashRunner, ObservationStatus, ToolPolicy, ToolRegistry,
+        WorkspaceApprovalStore,
     },
     tui::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
-        load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
+        load_tui_agent_mode, load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
     },
 };
 
@@ -118,6 +119,30 @@ enum ThinkingArg {
     Max,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentModeArg {
+    Default,
+    Auto,
+}
+
+impl From<AgentModeArg> for AgentMode {
+    fn from(value: AgentModeArg) -> Self {
+        match value {
+            AgentModeArg::Default => Self::Default,
+            AgentModeArg::Auto => Self::Auto,
+        }
+    }
+}
+
+impl From<AgentMode> for AgentModeArg {
+    fn from(value: AgentMode) -> Self {
+        match value {
+            AgentMode::Default => Self::Default,
+            AgentMode::Auto => Self::Auto,
+        }
+    }
+}
+
 impl From<ThinkingArg> for ThinkingLevel {
     fn from(value: ThinkingArg) -> Self {
         match value {
@@ -130,6 +155,14 @@ impl From<ThinkingArg> for ThinkingLevel {
             ThinkingArg::Max => Self::Max,
         }
     }
+}
+
+fn default_state_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map_or_else(|| PathBuf::from(".mimir"), |home| home.join(".mimir"))
 }
 
 #[derive(Debug, Parser)]
@@ -147,7 +180,7 @@ pub struct Cli {
     base_url: Option<String>,
     #[arg(long = "workspace", visible_alias = "cwd", default_value = ".")]
     workspace: PathBuf,
-    #[arg(long, default_value = ".mimir")]
+    #[arg(long, env = "MIMIR_STATE_DIR", default_value_os_t = default_state_dir())]
     state_dir: PathBuf,
     #[arg(long, default_value = "default")]
     session: String,
@@ -165,6 +198,12 @@ pub struct Cli {
     output: OutputMode,
     #[arg(long)]
     allow_process: bool,
+    #[arg(
+        long = "agent-mode",
+        value_enum,
+        help = "Command permission mode: default asks before shell commands; auto runs them immediately"
+    )]
+    agent_mode: Option<AgentModeArg>,
     #[arg(long, value_delimiter = ',')]
     allowed_programs: Vec<String>,
     #[arg(long, value_delimiter = ',', conflicts_with = "no_tools")]
@@ -294,6 +333,7 @@ struct RuntimeBuildConfig {
     session_dir: Option<PathBuf>,
     no_session: bool,
     allow_process: bool,
+    agent_mode: AgentMode,
     allowed_programs: Vec<String>,
     tool_allowlist: Option<BTreeSet<String>>,
     no_builtin_tools: bool,
@@ -337,6 +377,7 @@ impl RuntimeBuildConfig {
             session_dir: cli.session_dir.clone(),
             no_session: cli.no_session,
             allow_process: cli.allow_process,
+            agent_mode: cli.agent_mode.map(Into::into).unwrap_or_default(),
             allowed_programs: cli.allowed_programs.clone(),
             tool_allowlist: if cli.no_tools {
                 Some(BTreeSet::new())
@@ -469,7 +510,7 @@ fn cli_autonomous_limits(cli: &Cli) -> Option<AutonomousLimits> {
 }
 
 fn resolved_cli_provider(cli: &Cli) -> String {
-    cli.provider.clone().unwrap_or_else(|| "openai".into())
+    cli.provider.clone().unwrap_or_else(|| "anthropic".into())
 }
 
 fn resolved_cli_model(cli: &Cli, provider: &str) -> String {
@@ -503,6 +544,7 @@ enum Command {
     Doctor,
     /// Store an API key or start a supported OAuth login flow.
     Login {
+        #[arg(default_value = "anthropic")]
         provider: String,
         #[arg(long, hide_env_values = true, conflicts_with = "api_key_stdin")]
         api_key: Option<String>,
@@ -1708,6 +1750,16 @@ pub async fn entrypoint() -> Result<()> {
         return run_socket_prompt(&cli, prompt).await;
     }
     prepare_run_session(&mut cli).await?;
+    if cli.agent_mode.is_none()
+        && cli.output == OutputMode::Text
+        && initial_prompt.is_none()
+        && !cli.no_tui
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let state = resolve_state_dir(&cli.state_dir)?;
+        cli.agent_mode = Some(load_tui_agent_mode(&state).await?.into());
+    }
     let runtime = build_runtime(&cli).await?;
     dispatch_run_with_diagnostics(&cli, runtime, initial_prompt.as_deref()).await
 }
@@ -1863,7 +1915,8 @@ async fn dispatch_run(
                 Arc::new(CliTuiRuntimeFactory {
                     build: tui_build.clone(),
                     explicit_base_url: cli.base_url.clone(),
-                    bash_runner: tui_bash_runner,
+                    bash_runner: std::sync::RwLock::new(tui_bash_runner),
+                    agent_mode: std::sync::RwLock::new(tui_build.agent_mode),
                 }),
                 models,
                 sessions,
@@ -4420,13 +4473,15 @@ fn parse_recovered_goal_create(
 struct CliTuiRuntimeFactory {
     build: RuntimeBuildConfig,
     explicit_base_url: Option<String>,
-    bash_runner: Arc<BashRunner>,
+    bash_runner: std::sync::RwLock<Arc<BashRunner>>,
+    agent_mode: std::sync::RwLock<AgentMode>,
 }
 
 #[async_trait]
 impl TuiRuntimeFactory for CliTuiRuntimeFactory {
     async fn build(&self, model: &str, session: &str) -> Result<Arc<AgentRuntime>> {
         let mut build = self.build.clone();
+        build.agent_mode = self.agent_mode();
         let (provider, model) = resolve_tui_model_selection(model, &build.provider)?;
         build.provider = provider.clone();
         build.model = model;
@@ -4453,6 +4508,28 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
         Ok(runtime)
     }
 
+    fn agent_mode(&self) -> AgentMode {
+        *self
+            .agent_mode
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_agent_mode(&self, mode: AgentMode) -> Result<()> {
+        let mut build = self.build.clone();
+        build.agent_mode = mode;
+        let bash_runner = build_bash_runner(&build)?;
+        *self
+            .bash_runner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bash_runner;
+        *self
+            .agent_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+        Ok(())
+    }
+
     async fn execute_user_bash(
         &self,
         runtime: &AgentRuntime,
@@ -4474,8 +4551,12 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
                 "extension user_bash cwd overrides are unavailable in the bounded runner".into(),
             ));
         }
-        let result = self
+        let bash_runner = self
             .bash_runner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let result = bash_runner
             .execute(&command)
             .await
             .map_err(|error| MimirError::Tool(error.to_string()))?;
@@ -4486,7 +4567,10 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
     }
 
     fn abort_user_bash(&self) {
-        self.bash_runner.abort();
+        self.bash_runner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort();
     }
 
     async fn record_workspace_permission(
@@ -6650,7 +6734,9 @@ fn build_bash_runner(build: &RuntimeBuildConfig) -> Result<Arc<BashRunner>> {
         MimirError::Configuration(format!("workspace is inaccessible: {error}"))
     })?;
     let policy = ToolPolicy {
-        allow_process: build.allow_process,
+        allow_process: build.allow_process || build.agent_mode == AgentMode::Auto,
+        allow_any_program: build.agent_mode == AgentMode::Auto,
+        agent_mode: build.agent_mode,
         allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
             WorkspaceApprovalStore::new(&workspace)
@@ -6851,6 +6937,8 @@ async fn build_runtime_for_session(
     let process_tools_authorized = build.allow_process;
     let policy = ToolPolicy {
         allow_process: build.allow_process,
+        allow_shell: true,
+        agent_mode: build.agent_mode,
         allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
             WorkspaceApprovalStore::new(&workspace)
@@ -9472,6 +9560,7 @@ mod tui_model_selection_tests {
         model::{Message, ThinkingLevel},
         runtime::QueueMode,
         session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
+        tools::AgentMode,
     };
     use clap::Parser;
     use serde_json::json;
@@ -9510,6 +9599,49 @@ mod tui_model_selection_tests {
         let overridden = Cli::try_parse_from(["mimir", "--provider-timeout-seconds", "1800"])
             .expect("timeout override");
         assert_eq!(overridden.provider_timeout_seconds, 1_800);
+    }
+
+    #[test]
+    fn bare_cli_defaults_to_global_anthropic_sonnet() {
+        let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
+        let expected_state = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .map_or_else(|| PathBuf::from(".mimir"), |home| home.join(".mimir"));
+        assert_eq!(defaults.state_dir, expected_state);
+
+        let build = RuntimeBuildConfig::from_cli(&defaults);
+        assert_eq!(build.provider, "anthropic");
+        assert_eq!(build.model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn bare_login_targets_anthropic() {
+        let cli = Cli::try_parse_from(["mimir", "login"]).expect("default login");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Login { ref provider, .. }) if provider == "anthropic"
+        ));
+    }
+
+    #[test]
+    fn agent_modes_parse_without_reusing_the_output_mode_flag() {
+        let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
+        assert_eq!(
+            RuntimeBuildConfig::from_cli(&defaults).agent_mode,
+            AgentMode::Default
+        );
+
+        let auto = Cli::try_parse_from(["mimir", "--agent-mode", "auto"]).expect("auto agent mode");
+        assert_eq!(
+            RuntimeBuildConfig::from_cli(&auto).agent_mode,
+            AgentMode::Auto
+        );
+
+        let output = Cli::try_parse_from(["mimir", "--mode", "json"])
+            .expect("output mode compatibility alias");
+        assert_eq!(output.output, OutputMode::Json);
     }
 
     #[test]
@@ -9777,7 +9909,7 @@ mod tui_model_selection_tests {
             .expect("implicit provider");
 
         assert_eq!(selected.provider, "anthropic");
-        assert_eq!(selected.model, "claude-sonnet-4-6");
+        assert_eq!(selected.model, "claude-sonnet-5");
     }
 
     #[test]
@@ -9848,6 +9980,7 @@ mod tui_model_selection_tests {
             session_dir: None,
             no_session: false,
             allow_process: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: Vec::new(),
             tool_allowlist: None,
             no_builtin_tools: false,

@@ -34,7 +34,8 @@
 - The crate forbids unsafe Rust.
 - Provider configuration cannot be constructed with blank URL, model, or key; debug output redacts the key.
 - Tools are registered explicitly. File operations cannot escape the canonical workspace.
-- Process execution fails closed, requires explicit authority plus an exact non-empty allowlist, rejects compound shell syntax, clears the environment, and uses process groups, timeouts, and bounded output.
+- Model-issued Bash commands require confirmation in default mode and run immediately only after selecting auto mode. The shell is rooted at the workspace, clears inherited environment values except `PATH`, and uses process groups, timeouts, cancellation, and bounded output; it is not an OS sandbox.
+- The narrower `run_process` tool remains opt-in, requires an exact non-empty program allowlist, and rejects compound shell syntax.
 - Internal state rejects symlinked path components and shares path-scoped mutation locks across store instances.
 - Auth and imported credential files are owner-readable only on Unix.
 - Daemon metadata persists timestamps and lease state but not raw prompt text.

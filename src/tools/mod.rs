@@ -31,12 +31,19 @@ pub use mcp::{McpRegistrationReport, McpUnavailableServer};
 pub use path_policy::WorkspacePathPolicy;
 
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent tool capabilities and shell policy remain explicit for auditability"
+)]
 pub struct ToolPolicy {
     pub command_timeout: Duration,
     pub max_output_bytes: usize,
     pub max_write_bytes: usize,
     pub allow_write: bool,
     pub allow_process: bool,
+    pub allow_shell: bool,
+    pub allow_any_program: bool,
+    pub agent_mode: AgentMode,
     pub allowed_programs: Option<Vec<String>>,
     pub approvals: Option<Arc<WorkspaceApprovalStore>>,
 }
@@ -49,9 +56,44 @@ impl Default for ToolPolicy {
             max_write_bytes: 2 * 1024 * 1024,
             allow_write: true,
             allow_process: false,
+            allow_shell: false,
+            allow_any_program: false,
+            agent_mode: AgentMode::Default,
             allowed_programs: None,
             approvals: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    #[default]
+    Default,
+    Auto,
+}
+
+impl AgentMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Auto => "auto",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn automatically_approves(self) -> bool {
+        matches!(self, Self::Auto)
     }
 }
 
@@ -118,6 +160,7 @@ pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     rlm_runtime: Option<Arc<crate::extensions::RlmRuntime>>,
     workspace_root: Arc<PathBuf>,
+    agent_mode: AgentMode,
 }
 
 impl ToolRegistry {
@@ -132,12 +175,16 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             rlm_runtime: None,
             workspace_root: Arc::new(paths.root().to_owned()),
+            agent_mode: policy.agent_mode,
         };
         registry.register(file::ReadFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::WriteFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
         registry.register(file::SearchTool::new(paths.clone(), policy.clone()));
+        if policy.allow_shell {
+            registry.register(bash::BashTool::new(paths.root(), policy.clone())?);
+        }
         if policy.allow_process
             && policy
                 .allowed_programs
@@ -152,9 +199,17 @@ impl ToolRegistry {
     /// Returns a single system-prompt section describing the effective workspace contract.
     #[must_use]
     pub fn workspace_context(&self) -> String {
+        let permission_guidance = match self.agent_mode {
+            AgentMode::Default => {
+                "Workspace writes and model-issued Bash commands require explicit approval."
+            }
+            AgentMode::Auto => {
+                "Auto mode is active: workspace writes and model-issued Bash commands run without approval prompts."
+            }
+        };
         format!(
-            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. Writes inside the workspace require explicit approval. Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. run_process argument screening is advisory and is not an OS sandbox.",
-            self.workspace_root.display()
+            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. {permission_guidance} Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. Bash and run_process execution are not an OS sandbox.",
+            self.workspace_root.display(),
         )
     }
 
@@ -270,6 +325,7 @@ impl ToolRegistry {
                 .collect(),
             rlm_runtime: None,
             workspace_root: Arc::clone(&self.workspace_root),
+            agent_mode: self.agent_mode,
         }
     }
 

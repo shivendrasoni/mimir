@@ -378,7 +378,7 @@ static BUILTINS: &[ProviderDefinition] = &[
         &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         API_PKCE,
         Some("https://api.anthropic.com"),
-        Some("claude-sonnet-4-6"),
+        Some("claude-sonnet-5"),
         AnthropicMessages
     ),
     provider!(

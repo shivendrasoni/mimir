@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -8,11 +9,13 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -22,7 +25,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{ToolError, ToolPolicy, WorkspacePathPolicy};
+use crate::model::ToolDefinition;
+
+use super::{
+    DestructiveAction, ObservationStatus, Tool, ToolError, ToolObservation, ToolPolicy,
+    WorkspacePathPolicy, object_schema, parse_input,
+};
 
 const MAX_FULL_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -48,6 +56,125 @@ pub struct BashRunner {
     running: AtomicBool,
 }
 
+pub(super) struct BashTool {
+    runner: BashRunner,
+    policy: ToolPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashInput {
+    command: String,
+}
+
+impl BashTool {
+    pub fn new(workspace: &Path, policy: ToolPolicy) -> Result<Self, ToolError> {
+        let mut runner_policy = policy.clone();
+        runner_policy.allow_process = true;
+        runner_policy.allow_any_program = true;
+        runner_policy.approvals = None;
+        Ok(Self {
+            runner: BashRunner::new(workspace, runner_policy)?,
+            policy,
+        })
+    }
+
+    async fn execute_inner(
+        &self,
+        input: Value,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolObservation, ToolError> {
+        let input: BashInput = parse_input("bash", input)?;
+        let command = input.command.trim();
+        if command.is_empty() {
+            return Err(ToolError::InvalidArguments {
+                tool: "bash".into(),
+                message: "command must not be blank".into(),
+            });
+        }
+        if !self.policy.agent_mode.automatically_approves()
+            && let Some(approvals) = &self.policy.approvals
+            && let Some(request) =
+                approvals.requires_action_approval(DestructiveAction::ProcessExecution, command)?
+        {
+            return Err(ToolError::ApprovalRequired { request });
+        }
+        let result = if let Some(cancellation) = cancellation {
+            self.runner
+                .execute_cancellable(command, cancellation)
+                .await?
+        } else {
+            self.runner.execute(command).await?
+        };
+        let (status, summary) = if result.cancelled {
+            (ObservationStatus::Error, "bash command cancelled".into())
+        } else if result.timed_out {
+            (
+                ObservationStatus::Error,
+                format!(
+                    "bash command timed out after {} ms",
+                    self.policy.command_timeout.as_millis()
+                ),
+            )
+        } else if result.exit_code == Some(0) {
+            (ObservationStatus::Success, "bash command completed".into())
+        } else {
+            (
+                ObservationStatus::Error,
+                result.exit_code.map_or_else(
+                    || "bash ended without an exit code".into(),
+                    |code| format!("bash exited with code {code}"),
+                ),
+            )
+        };
+        Ok(ToolObservation {
+            status,
+            summary,
+            next_actions: if result.timed_out {
+                vec![
+                    "For a long-running server, start it in the background and redirect stdout and stderr to a workspace log file"
+                        .into(),
+                ]
+            } else {
+                Vec::new()
+            },
+            artifacts: result.full_output_path.into_iter().collect(),
+            content: result.output,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "bash".into(),
+            description: "Run a Bash command in $WORKSPACE. Supports pipes, redirects, command chaining, environment assignments, and background jobs. For a long-running server, background it and redirect stdout and stderr to a workspace log file. Default mode asks for approval before each command; auto mode runs commands immediately. Shell execution is not an OS sandbox.".into(),
+            parameters: object_schema(
+                &json!({
+                    "command": {
+                        "type": "string",
+                        "description": "The Bash command to run in $WORKSPACE"
+                    }
+                }),
+                &["command"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {
+        self.execute_inner(input, None).await
+    }
+
+    async fn execute_cancellable(
+        &self,
+        input: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolObservation, ToolError> {
+        self.execute_inner(input, Some(cancellation)).await
+    }
+}
+
 impl BashRunner {
     /// Creates a shell runner rooted at the canonical workspace.
     ///
@@ -70,7 +197,15 @@ impl BashRunner {
     ///
     /// Returns a disabled, validation, spawn, or I/O error.
     pub async fn execute(&self, command: &str) -> Result<BashResult, ToolError> {
-        self.execute_inner(command, None).await
+        self.execute_inner(command, None, None).await
+    }
+
+    async fn execute_cancellable(
+        &self,
+        command: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<BashResult, ToolError> {
+        self.execute_inner(command, None, Some(cancellation)).await
     }
 
     /// Executes one bounded shell command while forwarding sanitized output
@@ -85,13 +220,14 @@ impl BashRunner {
         command: &str,
         output: mpsc::Sender<String>,
     ) -> Result<BashResult, ToolError> {
-        self.execute_inner(command, Some(output)).await
+        self.execute_inner(command, Some(output), None).await
     }
 
     async fn execute_inner(
         &self,
         command: &str,
         output: Option<mpsc::Sender<String>>,
+        external_cancellation: Option<&CancellationToken>,
     ) -> Result<BashResult, ToolError> {
         if !self.policy.allow_process {
             return Err(ToolError::Disabled {
@@ -105,14 +241,27 @@ impl BashRunner {
                 message: "command must not be blank".into(),
             });
         }
-        validate_allowlisted_command(command, self.policy.allowed_programs.as_deref())?;
-        if let Some(approvals) = &self.policy.approvals
+        validate_allowlisted_command(
+            command,
+            self.policy.allowed_programs.as_deref(),
+            self.policy.allow_any_program,
+        )?;
+        if !self.policy.agent_mode.automatically_approves()
+            && let Some(approvals) = &self.policy.approvals
             && let Some(request) = approvals.requires_approval(command)?
         {
             return Err(ToolError::ApprovalRequired { request });
         }
         let _guard = self.run_lock.lock().await;
         let cancellation = CancellationToken::new();
+        let cancellation_forwarder = external_cancellation.map(|external| {
+            let external = external.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                external.cancelled().await;
+                cancellation.cancel();
+            })
+        });
         *self
             .cancellation
             .lock()
@@ -130,6 +279,9 @@ impl BashRunner {
             output.as_ref(),
         )
         .await;
+        if let Some(forwarder) = cancellation_forwarder {
+            forwarder.abort();
+        }
         self.running.store(false, Ordering::Release);
         *self
             .cancellation
@@ -156,6 +308,7 @@ impl BashRunner {
 fn validate_allowlisted_command(
     command: &str,
     allowed_programs: Option<&[String]>,
+    allow_any_program: bool,
 ) -> Result<(), ToolError> {
     if command.len() > MAX_COMMAND_BYTES {
         return Err(ToolError::InvalidArguments {
@@ -163,12 +316,6 @@ fn validate_allowlisted_command(
             message: format!("command exceeds the {MAX_COMMAND_BYTES}-byte limit"),
         });
     }
-    let allowed_programs = allowed_programs
-        .filter(|programs| !programs.is_empty())
-        .ok_or_else(|| ToolError::Disabled {
-            tool: "bash: no programs were explicitly allowlisted".into(),
-        })?;
-
     if command
         .chars()
         .any(|character| character.is_control() && character != '\t' && character != '\n')
@@ -185,6 +332,14 @@ fn validate_allowlisted_command(
             message: "command must start with a program".into(),
         });
     }
+    if allow_any_program {
+        return Ok(());
+    }
+    let allowed_programs = allowed_programs
+        .filter(|programs| !programs.is_empty())
+        .ok_or_else(|| ToolError::Disabled {
+            tool: "bash: no programs were explicitly allowlisted".into(),
+        })?;
     if !allowed_programs
         .iter()
         .any(|candidate| candidate == program)
@@ -197,12 +352,12 @@ fn validate_allowlisted_command(
 }
 
 fn spawn_shell(command: &str, workspace: &Path) -> Result<Child, ToolError> {
-    let mut process = Command::new("/bin/sh");
+    let mut process = Command::new("/bin/bash");
     process
         .args(["-c", command])
         .current_dir(workspace)
         .env_clear()
-        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", shell_path())
         .env("LANG", "C.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -216,6 +371,12 @@ fn spawn_shell(command: &str, workspace: &Path) -> Result<Child, ToolError> {
         tool: "bash".into(),
         message: error.to_string(),
     })
+}
+
+fn shell_path() -> OsString {
+    std::env::var_os("PATH")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| OsString::from("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"))
 }
 
 async fn capture_shell(

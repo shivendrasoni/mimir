@@ -16,7 +16,7 @@ It does not require Node.js. Python 3 is optional and is started only when the e
 ## Build
 
 ```bash
-rustup toolchain install stable --profile minimal --component rustfmt,clippy
+rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
 cargo build --release
 ```
 
@@ -24,7 +24,7 @@ The binary is `target/release/mimir`.
 
 ## Releases and installation
 
-Pushing a version tag such as `v0.1.0` starts the release workflow. It verifies the tag against the version in `Cargo.toml`, builds native binaries for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64, and publishes archives with SHA-256 checksums on the GitHub Releases page.
+Every push to `main` starts the release workflow. It creates a tagged release commit with the next minor version in `Cargo.toml` and `Cargo.lock`, builds native binaries for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64, and publishes archives with SHA-256 checksums on the GitHub Releases page. The generated version commit is kept on the release tag instead of being pushed back to `main`.
 
 Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
 
@@ -38,11 +38,11 @@ install -m 755 /tmp/mimir "$HOME/.local/bin/mimir"
 
 On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. On Windows, download the `x86_64-pc-windows-msvc.zip` archive, extract `mimir.exe`, and add its directory to `PATH`.
 
-To publish a release, update the package version, commit it, and push the matching tag:
+Minor releases are automatic. To start a new major release line, set the package version to the next `<major>.0.0` and push that commit to `main`; the workflow preserves the manual major version instead of incrementing it:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+cargo metadata --no-deps --format-version 1
+git push origin main
 ```
 
 ## Quick start
@@ -57,6 +57,9 @@ OPENAI_API_KEY=... mimir --model gpt-5-mini --print "inspect this repository"
 # Interactive full-screen TUI; /help lists commands and /quit exits
 mimir
 
+# Auto mode lets the agent run Bash commands and workspace edits without prompts
+mimir --agent-mode auto
+
 # Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
 mimir --max-turns 128
 mimir --max-run-tokens 2000000
@@ -68,7 +71,14 @@ mimir --output json --print "summarize the project"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"health"}' | mimir --provider fake --fake-response ok --output rpc
 ```
 
-Process execution is off by default. Enabling it still requires an exact program allowlist:
+The model has a workspace-rooted `bash` tool. In `default` mode every model-issued shell command
+requires confirmation, while `/mode auto` runs shell commands and workspace edits immediately.
+Use `/mode default` to return to confirmation. Long-running servers should be backgrounded with
+stdout and stderr redirected to a workspace log. Direct TUI commands use `!command` (or
+`!!command` to exclude the result from model context); auto mode runs those without an allowlist.
+
+The narrower argument-vector `run_process` tool remains opt-in and requires an exact program
+allowlist:
 
 ```bash
 mimir --allow-process --allowed-programs cargo,rg --print "run the tests"
@@ -78,6 +88,8 @@ mimir --allow-process --allowed-programs cargo,rg --print "run the tests"
 
 ```bash
 mimir providers
+# Anthropic OAuth is the default login and Claude Sonnet 5 is the default model
+mimir login
 printf '%s\n' "$OPENAI_API_KEY" | mimir login openai --api-key-stdin
 mimir auth status
 mimir logout openai
@@ -91,7 +103,8 @@ Providers that are discovery-only or unsupported by the selected runtime fail cl
 
 ## State and management
 
-State defaults to `.mimir/` and uses versioned JSON/JSONL formats.
+State defaults to the global `$HOME/.mimir/` directory and uses versioned JSON/JSONL formats.
+Set `MIMIR_STATE_DIR` or pass `--state-dir` to use an isolated state directory.
 The per-prompt provider-turn budget defaults to 64 and can be changed with
 `--max-turns` or `MIMIR_MAX_TURNS`. Reaching it is a recoverable budget pause:
 the session stays intact and a new message starts a fresh per-prompt budget.

@@ -2,46 +2,132 @@ name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
-  verify:
-    name: Verify release
+  prepare:
+    name: Version and verify release
     runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.commit.outputs.release_sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check tag matches package version
-        env:
-          TAG_NAME: ${{ github.ref_name }}
+      - name: Calculate next release version
+        id: version
+        shell: bash
         run: |
-          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mimir") | .version')"
-          tag_version="${TAG_NAME#v}"
-          test "$tag_version" = "$package_version" || {
-            echo "Tag $TAG_NAME does not match Cargo.toml version $package_version"
+          set -euo pipefail
+          manifest_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mimir") | .version')"
+          if [[ ! "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Cargo.toml version must use major.minor.patch: $manifest_version"
             exit 1
-          }
+          fi
+          manifest_major="${BASH_REMATCH[1]}"
+          manifest_minor="${BASH_REMATCH[2]}"
+          manifest_patch="${BASH_REMATCH[3]}"
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+          if [[ -z "$latest_tag" ]]; then
+            release_version="$manifest_version"
+          else
+            tag_version="${latest_tag#v}"
+            if [[ ! "$tag_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Latest release tag is not semantic: $latest_tag"
+              exit 1
+            fi
+            tag_major="${BASH_REMATCH[1]}"
+            tag_minor="${BASH_REMATCH[2]}"
+            if (( manifest_major < tag_major )); then
+              echo "Cargo.toml major version $manifest_major is behind $latest_tag"
+              exit 1
+            fi
+            if (( manifest_major > tag_major )); then
+              if (( manifest_minor != 0 || manifest_patch != 0 )); then
+                echo "Manual major releases must be declared as <major>.0.0"
+                exit 1
+              fi
+              release_version="$manifest_version"
+            else
+              next_minor=$((tag_minor + 1))
+              if (( manifest_minor > next_minor )); then
+                next_minor="$manifest_minor"
+              fi
+              release_version="${manifest_major}.${next_minor}.0"
+            fi
+          fi
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$release_version" >> "$GITHUB_OUTPUT"
+          echo "Preparing v$release_version"
+      - name: Update package version
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          lines = path.read_text().splitlines(keepends=True)
+          in_package = False
+          updated = False
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped == "[package]":
+                  in_package = True
+                  continue
+              if in_package and stripped.startswith("["):
+                  break
+              if in_package and stripped.startswith("version = "):
+                  newline = "\n" if line.endswith("\n") else ""
+                  lines[index] = f'version = "{os.environ["RELEASE_VERSION"]}"{newline}'
+                  updated = True
+                  break
+          if not updated:
+              raise SystemExit("Cargo.toml package version was not found")
+          path.write_text("".join(lines))
+          PY
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --workspace --all-features
+      - name: Create tagged release commit
+        id: commit
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          TAG_NAME: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore(release): v${RELEASE_VERSION} [skip ci]"
+          fi
+          git tag -a "$TAG_NAME" -m "Mimir $TAG_NAME"
+          git push origin "refs/tags/$TAG_NAME"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +148,11 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -71,9 +160,9 @@ jobs:
       - name: Package
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ github.ref_name }}
           ARCHIVE_TYPE: ${{ matrix.archive }}
+          TARGET: ${{ matrix.target }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -82,7 +171,7 @@ jobs:
             suffix=".exe"
           fi
           binary="target/$TARGET/release/mimir$suffix"
-          archive_name="mimir-${VERSION}-${TARGET}"
+          archive_name="mimir-${TAG_NAME}-${TARGET}"
           if [[ "$ARCHIVE_TYPE" == "zip" ]]; then
             cp "$binary" "dist/mimir$suffix"
             (cd dist && 7z a -tzip "${archive_name}.zip" "mimir$suffix")
@@ -103,8 +192,8 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [verify, build]
-    if: ${{ always() && needs.verify.result == 'success' }}
+    needs: [prepare, build]
+    if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Require at least one successful build
@@ -128,9 +217,15 @@ jobs:
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release create "$TAG_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Mimir $TAG_NAME" \
-            --generate-notes
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_SHA" \
+              --title "Mimir $TAG_NAME" \
+              --generate-notes
+          fi

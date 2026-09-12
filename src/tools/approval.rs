@@ -18,6 +18,7 @@ const AUDIT_FILE: &str = ".mimir/workspace-permissions.audit.jsonl";
 #[serde(rename_all = "snake_case")]
 pub enum DestructiveAction {
     FilesystemWrite,
+    ProcessExecution,
     Delete,
     GitDestructive,
     ForcePush,
@@ -27,6 +28,7 @@ impl DestructiveAction {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::FilesystemWrite => "write or edit files in this workspace",
+            Self::ProcessExecution => "run this shell command",
             Self::Delete => "delete files or directories",
             Self::GitDestructive => "perform a destructive Git operation",
             Self::ForcePush => "force-push Git history",

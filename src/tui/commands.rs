@@ -1,4 +1,4 @@
-use crate::model::ThinkingLevel;
+use crate::{model::ThinkingLevel, tools::AgentMode};
 
 use super::app::ThemeName;
 
@@ -19,6 +19,9 @@ pub enum SlashCommand {
     },
     Model {
         model: Option<String>,
+    },
+    Mode {
+        mode: Option<AgentMode>,
     },
     Session {
         session: Option<String>,
@@ -113,6 +116,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "login" => Some(SlashCommand::Login { provider: argument }),
         "logout" => Some(SlashCommand::Logout { provider: argument }),
         "model" => Some(SlashCommand::Model { model: argument }),
+        "mode" => Some(parse_agent_mode(arguments)),
         "session" => Some(if arguments.is_empty() {
             SlashCommand::Session { session: None }
         } else {
@@ -184,6 +188,48 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "quit" => Some(no_argument(command, arguments, SlashCommand::Quit)),
         _ => None,
     }
+}
+
+#[must_use]
+pub(super) fn builtin_command_usage(command: &str) -> Option<&'static str> {
+    match command.to_ascii_lowercase().as_str() {
+        "autonomous" => Some("/autonomous [on|off|status|cancel]"),
+        "btw" | "side" => Some("/btw <question>"),
+        "clear" | "new" => Some("/new [--name <name>] [-- <prompt>]"),
+        "compact" => Some("/compact [instructions]"),
+        "effort" | "thinking" => Some("/effort [off|minimal|low|medium|high|xhigh|max]"),
+        "export" => Some("/export [path]"),
+        "fullscreen" => Some("/fullscreen [on|off]"),
+        "goal" => Some("/goal [--budget <tokens>] <objective>"),
+        "heartbeat" => Some("/heartbeat [--every <interval>] [--steer|--follow-up] <instruction>"),
+        "import" => Some("/import <path.jsonl>"),
+        "login" => Some("/login [provider]"),
+        "logout" => Some("/logout [provider]"),
+        "mcp" => Some("/mcp [list|login <name>|logout <name>]"),
+        "model" => Some("/model [provider/model]"),
+        "mode" => Some("/mode [default|auto]"),
+        "name" | "rename" => Some("/name [name]"),
+        "refine" => Some("/refine [instructions|rollback <refinement-id>]"),
+        "resume" => Some("/resume [session]"),
+        "rlm-max-depth" => Some("/rlm-max-depth [<non-negative integer> [--global]]"),
+        "sessions" => Some("/sessions [id]"),
+        "theme" => Some("/theme [system|dark|light|name]"),
+        "trace" | "traces" => Some("/traces [preview|status|upload]"),
+        "update" => Some("/update [status|check]"),
+        _ => None,
+    }
+}
+
+fn parse_agent_mode(arguments: &str) -> SlashCommand {
+    if arguments.is_empty() {
+        return SlashCommand::Mode { mode: None };
+    }
+    AgentMode::parse(arguments).map_or_else(
+        || SlashCommand::Invalid {
+            message: "Usage: /mode [default|auto]".into(),
+        },
+        |mode| SlashCommand::Mode { mode: Some(mode) },
+    )
 }
 
 fn parse_import(value: &str) -> SlashCommand {

@@ -36,7 +36,7 @@ use crate::{
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     session_compat::{ReferenceSessionMetadata, export_jsonl, import_jsonl},
     session_tree::{SessionBranchCatalog, SessionNodeKind},
-    tools::{ApprovalDecision, BashResult, ObservationStatus, PermissionRequest},
+    tools::{AgentMode, ApprovalDecision, BashResult, ObservationStatus, PermissionRequest},
 };
 use uuid::Uuid;
 
@@ -60,6 +60,27 @@ struct TerminalFrameCache {
     body: String,
     cursor: Option<(u16, u16)>,
     initialized: bool,
+}
+
+const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCAction {
+    Cancel,
+    Exit,
+}
+
+fn ctrl_c_action(last_press: &mut Option<Instant>, now: Instant) -> CtrlCAction {
+    if last_press.is_some_and(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|elapsed| elapsed <= DOUBLE_CTRL_C_WINDOW)
+    }) {
+        *last_press = None;
+        CtrlCAction::Exit
+    } else {
+        *last_press = Some(now);
+        CtrlCAction::Cancel
+    }
 }
 
 impl TerminalFrameCache {
@@ -99,6 +120,7 @@ struct TuiPreferences {
     scoped_models: Vec<String>,
     scoped_models_configured: bool,
     theme: String,
+    agent_mode: String,
     rlm_max_depth: u32,
     rlm_session_depths: BTreeMap<String, u32>,
     steering_mode: String,
@@ -139,6 +161,7 @@ impl Default for TuiPreferences {
             scoped_models: Vec::new(),
             scoped_models_configured: false,
             theme: "dark".into(),
+            agent_mode: AgentMode::Default.as_str().into(),
             rlm_max_depth: 3,
             rlm_session_depths: BTreeMap::new(),
             steering_mode: QueueMode::OneAtATime.as_str().into(),
@@ -148,7 +171,7 @@ impl Default for TuiPreferences {
             block_images: false,
             autocomplete_max_visible: 8,
             tree_filter_mode: TreeFilterMode::Default.as_str().into(),
-            show_hardware_cursor: false,
+            show_hardware_cursor: true,
             editor_padding_x: 0,
             show_terminal_progress: true,
             show_warnings: true,
@@ -265,6 +288,22 @@ struct TuiSink {
 pub trait TuiRuntimeFactory: Send + Sync {
     async fn build(&self, model: &str, session: &str) -> Result<Arc<AgentRuntime>>;
 
+    /// Returns the command permission mode used when building runtimes.
+    fn agent_mode(&self) -> AgentMode {
+        AgentMode::Default
+    }
+
+    /// Changes the command permission mode for subsequently built runtimes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the active coordinator cannot rebuild its tool policy.
+    fn set_agent_mode(&self, _mode: AgentMode) -> Result<()> {
+        Err(crate::error::MimirError::Configuration(
+            "agent mode changes are unavailable in this TUI runtime".into(),
+        ))
+    }
+
     /// Executes one user-owned shell command through the configured bounded runner.
     ///
     /// Implementations must fail closed when process execution or the explicit
@@ -338,6 +377,7 @@ pub trait TuiRuntimeFactory: Send + Sync {
             TuiAction::ConfigureScopedModels => {
                 "scoped model preferences require an active TUI coordinator"
             }
+            TuiAction::SetAgentMode(_) => "agent mode changes require an active TUI coordinator",
             TuiAction::ImportSession { .. }
             | TuiAction::ShowSystemPrompt
             | TuiAction::ShowLogs
@@ -516,7 +556,7 @@ fn bounded_session_event_string(value: Option<&serde_json::Value>) -> Option<Str
         .filter(|value| !value.is_empty())
 }
 
-/// Runs the full-screen terminal client until `/quit`, Ctrl-D, or the terminal closes.
+/// Runs the full-screen terminal client until `/quit`, Ctrl-D, a double Ctrl-C, or closure.
 ///
 /// # Errors
 ///
@@ -568,7 +608,8 @@ pub async fn run_tui_with_autonomous(
     autonomous_limits: Option<AutonomousLimits>,
 ) -> Result<()> {
     let mut terminal_guard = TerminalGuard::enter()?;
-    let preferences = load_tui_preferences(&state_root).await?;
+    let mut preferences = load_tui_preferences(&state_root).await?;
+    preferences.agent_mode = runtime_factory.agent_mode().as_str().into();
     let resource_snapshot = runtime_factory.resource_snapshot().await?;
     apply_runtime_preferences(&runtime, &preferences).await;
     terminal_guard.set_fullscreen(preferences.toggles.fullscreen)?;
@@ -581,6 +622,7 @@ pub async fn run_tui_with_autonomous(
         state.set_sessions(sessions);
         state.set_resource_snapshot(resource_snapshot);
         state.set_preferences(AppPreferenceState {
+            agent_mode: AgentMode::parse(&preferences.agent_mode).unwrap_or_default(),
             fast_mode: preferences.toggles.fast_mode,
             fullscreen: preferences.toggles.fullscreen,
             auto_compaction: preferences.toggles.auto_compaction,
@@ -618,6 +660,7 @@ pub async fn run_tui_with_autonomous(
     let autonomous = Arc::new(Mutex::new(autonomous_state));
     let mut side_questions = SideQuestionSession::default();
     let mut frame_cache = TerminalFrameCache::default();
+    let mut last_ctrl_c_press = None;
 
     loop {
         render_frame(&app, &mut frame_cache)?;
@@ -669,22 +712,30 @@ pub async fn run_tui_with_autonomous(
                 continue;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, CrosstermKeyCode::Char('c'))
+                && matches!(key.code, CrosstermKeyCode::Char('c' | 'C'))
             {
-                let bash_active = app
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .bash_active();
-                if bash_active {
-                    runtime_factory.abort_user_bash();
-                } else {
-                    runtime.cancel();
-                    autonomous
+                if key.kind == KeyEventKind::Press {
+                    if ctrl_c_action(&mut last_ctrl_c_press, Instant::now()) == CtrlCAction::Exit {
+                        return Ok(());
+                    }
+                    let bash_active = app
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .cancel_current();
+                        .bash_active();
+                    if bash_active {
+                        runtime_factory.abort_user_bash();
+                    } else {
+                        runtime.cancel();
+                        autonomous
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .cancel_current();
+                    }
                 }
                 continue;
+            }
+            if key.kind == KeyEventKind::Press {
+                last_ctrl_c_press = None;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, CrosstermKeyCode::Char('d'))
@@ -1042,6 +1093,50 @@ async fn dispatch_coordinator_action(
     terminal_guard: &mut TerminalGuard,
 ) -> Result<Option<String>> {
     match action {
+        TuiAction::SetAgentMode(mode) => {
+            let previous = runtime_factory.agent_mode();
+            let bash_active = app
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bash_active();
+            if runtime.is_running() || bash_active {
+                app.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_agent_mode(previous);
+                return Err(crate::error::MimirError::Configuration(
+                    "wait for the active agent or Bash command before changing modes".into(),
+                ));
+            }
+            runtime_factory.set_agent_mode(*mode)?;
+            let session = active_session(runtime_key.as_ref())?.to_owned();
+            let model = current_model(runtime, runtime_key.as_ref()).await;
+            match build_runtime_with_preferences(runtime_factory, &model, &session, state_root)
+                .await
+            {
+                Ok(updated) => {
+                    *runtime = updated;
+                    *runtime_key = Some((model, session));
+                    refresh_extension_commands(runtime, app).await;
+                    persist_app_preferences(state_root, app).await?;
+                    Ok(Some(format!(
+                        "Mode set to {}. {}",
+                        mode.as_str(),
+                        if *mode == AgentMode::Auto {
+                            "Shell commands and workspace edits will run without confirmation."
+                        } else {
+                            "Model-issued shell commands and workspace edits require confirmation."
+                        }
+                    )))
+                }
+                Err(error) => {
+                    let _ = runtime_factory.set_agent_mode(previous);
+                    app.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_agent_mode(previous);
+                    Err(error)
+                }
+            }
+        }
         TuiAction::WorkspacePermission { request, decision } => runtime_factory
             .record_workspace_permission(request.clone(), *decision)
             .await
@@ -1423,6 +1518,7 @@ fn validate_tui_preferences(preferences: &TuiPreferences) -> Result<()> {
         && preferences.theme.len() <= 128
         && !preferences.theme.chars().any(char::is_control);
     if !valid_theme
+        || AgentMode::parse(&preferences.agent_mode).is_none()
         || parse_queue_mode(&preferences.steering_mode).is_none()
         || parse_queue_mode(&preferences.follow_up_mode).is_none()
         || TreeFilterMode::parse(&preferences.tree_filter_mode).is_none()
@@ -1456,6 +1552,7 @@ async fn write_tui_preferences(state_root: &Path, preferences: &TuiPreferences) 
 
 async fn persist_app_preferences(state_root: &Path, app: &Arc<Mutex<App>>) -> Result<String> {
     let (
+        agent_mode,
         fast_mode,
         fullscreen,
         scoped_models,
@@ -1478,6 +1575,7 @@ async fn persist_app_preferences(state_root: &Path, app: &Arc<Mutex<App>>) -> Re
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let display = app.preferences_snapshot();
         (
+            app.agent_mode(),
             app.fast_mode(),
             app.fullscreen(),
             app.scoped_models().iter().cloned().collect::<Vec<_>>(),
@@ -1497,6 +1595,7 @@ async fn persist_app_preferences(state_root: &Path, app: &Arc<Mutex<App>>) -> Re
         )
     };
     let mut preferences = load_tui_preferences(state_root).await?;
+    preferences.agent_mode = agent_mode.as_str().into();
     preferences.toggles.fast_mode = fast_mode;
     preferences.toggles.fullscreen = fullscreen;
     preferences.scoped_models = scoped_models;
@@ -1817,6 +1916,18 @@ pub async fn load_tui_rlm_max_depth_status(
 /// Returns a typed settings error if the persisted file is malformed or unsafe.
 pub async fn load_tui_fast_mode(state_root: &Path) -> Result<bool> {
     Ok(load_tui_preferences(state_root).await?.toggles.fast_mode)
+}
+
+/// Loads the persisted command permission mode for interactive startup.
+///
+/// # Errors
+///
+/// Returns a typed settings error if the persisted file is malformed or unsafe.
+pub async fn load_tui_agent_mode(state_root: &Path) -> Result<AgentMode> {
+    let preferences = load_tui_preferences(state_root).await?;
+    AgentMode::parse(&preferences.agent_mode).ok_or_else(|| {
+        crate::error::MimirError::Configuration("invalid persisted agent mode".into())
+    })
 }
 
 /// Applies TUI commands backed by durable state stores.
@@ -2871,7 +2982,8 @@ pub async fn dispatch_runtime_action(
         }
         TuiAction::ShowContext => render_context_tree(runtime).await.map(Some),
         TuiAction::CopyLastMessage => copy_last_assistant_message(runtime).await.map(Some),
-        TuiAction::WorkspacePermission { .. }
+        TuiAction::SetAgentMode(_)
+        | TuiAction::WorkspacePermission { .. }
         | TuiAction::Resume { .. }
         | TuiAction::NewSession { .. }
         | TuiAction::SetSessionName { .. }
@@ -3203,6 +3315,35 @@ mod local_command_tests {
         assert_eq!(prompt_cursor_x(10, 3, 0), 5);
         assert_eq!(prompt_cursor_x(10, 3, 15), 0);
         assert_eq!(prompt_cursor_x(0, 3, 15), 0);
+    }
+
+    #[test]
+    fn fresh_tui_preferences_enable_the_hardware_cursor() {
+        assert!(TuiPreferences::default().show_hardware_cursor);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_once_and_exits_on_a_quick_second_press() {
+        let started = Instant::now();
+        let mut last_press = None;
+
+        assert_eq!(ctrl_c_action(&mut last_press, started), CtrlCAction::Cancel);
+        assert_eq!(
+            ctrl_c_action(&mut last_press, started + Duration::from_millis(900)),
+            CtrlCAction::Exit
+        );
+    }
+
+    #[test]
+    fn ctrl_c_rearms_after_the_double_press_window_expires() {
+        let started = Instant::now();
+        let mut last_press = None;
+
+        assert_eq!(ctrl_c_action(&mut last_press, started), CtrlCAction::Cancel);
+        assert_eq!(
+            ctrl_c_action(&mut last_press, started + Duration::from_millis(1_001)),
+            CtrlCAction::Cancel
+        );
     }
 
     #[test]

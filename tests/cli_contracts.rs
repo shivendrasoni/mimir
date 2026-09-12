@@ -66,7 +66,7 @@ fn provider_defaults_and_base_url_environment_are_provider_scoped() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("model: claude-sonnet-4-6"))
+        .stdout(predicate::str::contains("model: claude-sonnet-5"))
         .stdout(predicate::str::contains(
             "base_url_source: provider_default",
         ));
@@ -341,6 +341,8 @@ fn doctor_never_requires_or_prints_the_api_key() {
         .expect("binary")
         .env("OPENAI_API_KEY", "super-secret-test-value")
         .args([
+            "--provider",
+            "openai",
             "--workspace",
             workspace.path().to_str().expect("workspace path"),
             "--state-dir",
@@ -379,7 +381,7 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
         .expect("binary")
         .env_remove("OPENAI_API_KEY")
         .args(common)
-        .args(["doctor"])
+        .args(["--provider", "openai", "doctor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("credential: present"))

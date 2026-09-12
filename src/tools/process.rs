@@ -128,7 +128,8 @@ impl ProcessTool {
             .chain(input.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
-        if let Some(approvals) = &self.policy.approvals
+        if !self.policy.agent_mode.automatically_approves()
+            && let Some(approvals) = &self.policy.approvals
             && let Some(request) = approvals.requires_approval(&command)?
         {
             return Err(ToolError::ApprovalRequired { request });

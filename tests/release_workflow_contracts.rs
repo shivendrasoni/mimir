@@ -16,6 +16,10 @@ fn ci_checks_every_supported_operating_system_natively() {
         ci.contains("workflow_dispatch:"),
         "CI must retain a manual verification fallback"
     );
+    assert!(
+        ci.contains("branches:\n      - main"),
+        "CI must run automatically for pushes to main"
+    );
     for runner in ["ubuntu-latest", "macos-14", "windows-latest"] {
         assert!(
             ci.contains(runner),

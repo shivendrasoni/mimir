@@ -2,23 +2,38 @@ name: ci
 
 on:
   push:
+    tags-ignore:
+      - "**"
   pull_request:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Format
+        if: runner.os == 'Linux'
         run: cargo fmt --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --target "${{ matrix.target }}" -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --target "${{ matrix.target }}"
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked --target "${{ matrix.target }}"

@@ -122,8 +122,8 @@ fn decode_macos_png_descriptor(descriptor: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn read_platform_image() -> Result<Option<(Vec<u8>, String)>> {
-    Ok(None)
+fn read_platform_image() -> std::future::Ready<Result<Option<(Vec<u8>, String)>>> {
+    std::future::ready(Ok(None))
 }
 
 async fn copy_text(text: &str) -> Result<()> {

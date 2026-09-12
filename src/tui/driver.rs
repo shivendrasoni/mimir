@@ -62,6 +62,13 @@ struct TerminalFrameCache {
     initialized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalFrameDamage {
+    Unchanged,
+    Full,
+    Rows(Vec<u16>),
+}
+
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,27 +91,36 @@ fn ctrl_c_action(last_press: &mut Option<Instant>, now: Instant) -> CtrlCAction 
 }
 
 impl TerminalFrameCache {
-    fn should_render(
+    fn frame_damage(
         &mut self,
         width: u16,
         height: u16,
         body: &str,
         cursor: Option<(u16, u16)>,
-    ) -> bool {
-        if self.initialized
-            && self.width == width
-            && self.height == height
-            && self.body == body
-            && self.cursor == cursor
-        {
-            return false;
-        }
+    ) -> TerminalFrameDamage {
+        let dimensions_changed = !self.initialized || self.width != width || self.height != height;
+        let cursor_changed = self.cursor != cursor;
+        let damage = if dimensions_changed {
+            TerminalFrameDamage::Full
+        } else {
+            let previous = self.body.split("\r\n").collect::<Vec<_>>();
+            let current = body.split("\r\n").collect::<Vec<_>>();
+            let changed_rows = (0..previous.len().max(current.len()))
+                .filter(|&index| previous.get(index) != current.get(index))
+                .filter_map(|index| u16::try_from(index).ok())
+                .collect::<Vec<_>>();
+            if changed_rows.is_empty() && !cursor_changed {
+                TerminalFrameDamage::Unchanged
+            } else {
+                TerminalFrameDamage::Rows(changed_rows)
+            }
+        };
         self.width = width;
         self.height = height;
         body.clone_into(&mut self.body);
         self.cursor = cursor;
         self.initialized = true;
-        true
+        damage
     }
 }
 
@@ -3215,13 +3231,24 @@ fn render_frame(app: &Arc<Mutex<App>>, frame_cache: &mut TerminalFrameCache) -> 
             u16::try_from(cursor_y).unwrap_or(height.saturating_sub(1)),
         )
     });
-    if !frame_cache.should_render(width, height, &body, cursor) {
-        return Ok(());
-    }
-
+    let damage = frame_cache.frame_damage(width, height, &body, cursor);
     let mut stdout = io::stdout();
-    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    stdout.write_all(body.as_bytes())?;
+    match damage {
+        TerminalFrameDamage::Unchanged => return Ok(()),
+        TerminalFrameDamage::Full => {
+            queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+            stdout.write_all(body.as_bytes())?;
+        }
+        TerminalFrameDamage::Rows(rows) => {
+            let body_rows = body.split("\r\n").collect::<Vec<_>>();
+            for row in rows {
+                queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+                if let Some(line) = body_rows.get(usize::from(row)) {
+                    stdout.write_all(line.as_bytes())?;
+                }
+            }
+        }
+    }
     if let Some((cursor_x, cursor_y)) = cursor {
         queue!(stdout, MoveTo(cursor_x, cursor_y), Show)?;
     } else {
@@ -3349,11 +3376,43 @@ mod local_command_tests {
     #[test]
     fn unchanged_terminal_frames_are_not_emitted_again() {
         let mut cache = TerminalFrameCache::default();
-        assert!(cache.should_render(80, 24, "frame-a", None));
-        assert!(!cache.should_render(80, 24, "frame-a", None));
-        assert!(cache.should_render(81, 24, "frame-a", None));
-        assert!(cache.should_render(81, 24, "frame-b", None));
-        assert!(cache.should_render(81, 24, "frame-b", Some((3, 23))));
+        assert_eq!(
+            cache.frame_damage(80, 24, "frame-a", None),
+            TerminalFrameDamage::Full
+        );
+        assert_eq!(
+            cache.frame_damage(80, 24, "frame-a", None),
+            TerminalFrameDamage::Unchanged
+        );
+        assert_eq!(
+            cache.frame_damage(81, 24, "frame-a", None),
+            TerminalFrameDamage::Full
+        );
+        assert_eq!(
+            cache.frame_damage(81, 24, "frame-b", None),
+            TerminalFrameDamage::Rows(vec![0])
+        );
+        assert_eq!(
+            cache.frame_damage(81, 24, "frame-b", Some((3, 23))),
+            TerminalFrameDamage::Rows(Vec::new())
+        );
+    }
+
+    #[test]
+    fn changed_terminal_frames_only_damage_changed_rows() {
+        let mut cache = TerminalFrameCache::default();
+        let stable_transcript = "\u{1b}[32m● stable transcript\u{1b}[0m";
+        let first = format!("{stable_transcript}\r\n\u{1b}[35m✦ Working…\u{1b}[0m");
+        let second = format!("{stable_transcript}\r\n\u{1b}[35m✦ Writing…\u{1b}[0m");
+
+        assert_eq!(
+            cache.frame_damage(80, 24, &first, None),
+            TerminalFrameDamage::Full
+        );
+        assert_eq!(
+            cache.frame_damage(80, 24, &second, None),
+            TerminalFrameDamage::Rows(vec![1])
+        );
     }
 
     #[test]

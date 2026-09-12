@@ -17,8 +17,8 @@ fn ci_checks_enabled_operating_systems_natively() {
         "CI must retain a manual verification fallback"
     );
     assert!(
-        ci.contains("branches:\n      - main"),
-        "CI must run automatically for pushes to main"
+        !ci.contains("push:") && !ci.contains("pull_request:"),
+        "CI is intentionally paused except for explicit manual dispatch"
     );
     for runner in ["ubuntu-latest", "macos-14"] {
         assert!(

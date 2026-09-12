@@ -135,6 +135,7 @@ async fn native_messages_transport_uses_anthropic_headers_and_typed_blocks() {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
         assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
 
         let body = json!({
             "id": "msg-1",
@@ -169,7 +170,8 @@ async fn native_messages_transport_uses_anthropic_headers_and_typed_blocks() {
     assert_eq!(response.message.stop_reason, Some(StopReason::ToolUse));
     assert_eq!(response.message.usage.input_tokens, 16);
     assert_eq!(response.message.usage.output_tokens, 7);
-    assert_eq!(response.message.usage.cached_tokens, 5);
+    assert_eq!(response.message.usage.cached_tokens, 3);
+    assert_eq!(response.message.usage.uncached_input_tokens(), 13);
     assert!(matches!(
         &response.message.content[0],
         Content::Thinking { text, signature, .. } if text == "considering" && signature.as_deref() == Some("sig")
@@ -198,9 +200,10 @@ async fn anthropic_stream_reassembles_tool_json_and_forwards_text_and_thinking()
                 .contains("accept: text/event-stream")
         );
         assert_eq!(body["stream"], true);
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
         let stream = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-stream\",\"content\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-stream\",\"content\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":1,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":2}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n",
@@ -239,8 +242,10 @@ async fn anthropic_stream_reassembles_tool_json_and_forwards_text_and_thinking()
 
     assert_eq!(response.response_id.as_deref(), Some("msg-stream"));
     assert_eq!(response.message.stop_reason, Some(StopReason::ToolUse));
-    assert_eq!(response.message.usage.input_tokens, 9);
+    assert_eq!(response.message.usage.input_tokens, 14);
     assert_eq!(response.message.usage.output_tokens, 6);
+    assert_eq!(response.message.usage.cached_tokens, 3);
+    assert_eq!(response.message.usage.uncached_input_tokens(), 11);
     assert_eq!(
         sink.0.lock().await.as_slice(),
         [
@@ -328,6 +333,7 @@ async fn anthropic_permission_failures_are_not_refreshable_authentication_errors
 fn anthropic_preview_omits_internal_tool_role_and_normalizes_ids() {
     let provider = AnthropicProvider::new(None, "test-secret").expect("provider");
     let preview = provider.request_preview(&request());
+    assert_eq!(preview["cache_control"], json!({"type": "ephemeral"}));
     assert_eq!(preview["messages"][2]["role"], "user");
     assert_eq!(preview["messages"][2]["content"][0]["is_error"], false);
     assert!(
@@ -359,6 +365,23 @@ fn anthropic_oauth_keeps_identity_separate_from_agent_system_prompt() {
             {"type": "text", "text": "Be precise"}
         ])
     );
+    assert_eq!(preview["cache_control"], json!({"type": "ephemeral"}));
+}
+
+#[test]
+fn anthropic_preview_omits_cache_control_for_non_claude_compatible_models() {
+    let provider = AnthropicProvider::new(None, "test-secret").expect("provider");
+    for model in ["MiniMax-M2.7", "kimi-for-coding", "mimo-v2.5-pro"] {
+        let mut request = request();
+        request.model = model.into();
+
+        let preview = provider.request_preview(&request);
+
+        assert!(
+            preview.get("cache_control").is_none(),
+            "non-Claude model {model} must not receive Anthropic cache control"
+        );
+    }
 }
 
 #[test]

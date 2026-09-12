@@ -8,6 +8,30 @@ fn workflow(name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
+fn manifest() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+#[test]
+fn package_name_does_not_change_the_public_mimir_targets() {
+    let manifest = manifest();
+
+    assert!(
+        manifest.contains("[package]\nname = \"mimir-ai\""),
+        "the publishable package must use the available mimir-ai name"
+    );
+    assert!(
+        manifest.contains("[lib]\nname = \"mimir\"\npath = \"src/lib.rs\""),
+        "the Rust library target must remain named mimir"
+    );
+    assert!(
+        manifest.contains("[[bin]]\nname = \"mimir\"\npath = \"src/main.rs\""),
+        "cargo install mimir-ai must continue to install the mimir executable"
+    );
+}
+
 #[test]
 fn ci_checks_enabled_operating_systems_natively() {
     let ci = workflow("ci.yml");
@@ -104,7 +128,7 @@ fn platform_failures_are_isolated_and_successful_artifacts_publish_independently
     );
     assert!(
         release.contains("Update package and lockfile version")
-            && release.contains("Cargo.lock mimir package version was not found")
+            && release.contains("Cargo.lock mimir-ai package version was not found")
             && release.contains("cargo metadata --locked --no-deps"),
         "release preparation must synchronize and validate Cargo.toml and Cargo.lock"
     );

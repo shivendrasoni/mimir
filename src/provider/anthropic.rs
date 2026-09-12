@@ -336,8 +336,15 @@ fn build_request_body(request: &ModelRequest, credential_kind: AnthropicCredenti
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
+    if is_claude_model(&request.model) {
+        body["cache_control"] = json!({"type": "ephemeral"});
+    }
     apply_thinking(&mut body, request);
     body
+}
+
+fn is_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
 }
 
 /// Rebuilds tool exchanges into the adjacency required by the Messages API.
@@ -681,7 +688,7 @@ fn parse_stop_reason(reason: &str) -> StopReason {
 
 fn parse_usage(value: Option<&Value>) -> Usage {
     let value = value.unwrap_or(&Value::Null);
-    let uncached_input_tokens = value
+    let input_tokens = value
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -689,17 +696,16 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached_tokens = value
+    let cache_read_input_tokens = value
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .saturating_add(
-            value
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-    Usage::from_separate_cached_input(uncached_input_tokens, output_tokens, cached_tokens)
+        .unwrap_or(0);
+    let cache_creation_input_tokens = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let fresh_input_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
+    Usage::from_separate_cached_input(fresh_input_tokens, output_tokens, cache_read_input_tokens)
 }
 
 #[derive(Default)]

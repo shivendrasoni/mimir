@@ -24,12 +24,12 @@ The binary is `target/release/mimir`.
 
 ## Releases and installation
 
-CI is paused for pushes and pull requests. When manually dispatched, it verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. With the manifest at `0.5.0`, the next manual release starts at `v0.5.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
+CI is paused for pushes and pull requests. When manually dispatched, it verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. With the manifest at `0.6.0`, the next manual release starts at `v0.6.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
 
 Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
 
 ```bash
-version=v0.1.0
+version=v0.6.0
 curl -fL "https://github.com/shivendrasoni/mimir/releases/latest/download/mimir-${version}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mimir.tar.gz
 tar -xzf /tmp/mimir.tar.gz -C /tmp
 mkdir -p "$HOME/.local/bin"
@@ -38,11 +38,16 @@ install -m 755 /tmp/mimir "$HOME/.local/bin/mimir"
 
 On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. Windows binaries are not currently published.
 
-Minor releases are automatic. To start a new major release line, set the package version to the next `<major>.0.0` and push that commit to `main`; the workflow preserves the manual major version instead of incrementing it:
+The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. The package has not been published yet. After its first publication, Rust users will be able to install it with:
+
+```bash
+cargo install mimir-ai
+```
+
+Releases are started manually from the GitHub Actions **Release** workflow. To start a new major release line, first set the package version to the next `<major>.0.0`; the workflow preserves that manual major version instead of incrementing it:
 
 ```bash
 cargo metadata --no-deps --format-version 1
-git push origin main
 ```
 
 ## Quick start

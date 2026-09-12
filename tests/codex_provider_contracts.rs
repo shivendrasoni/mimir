@@ -45,7 +45,7 @@ async fn codex_oauth_transport_uses_responses_protocol_and_streams_tools() {
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n\n",
             "data: [DONE]"
         );
         let response = format!(
@@ -98,6 +98,8 @@ async fn codex_oauth_transport_uses_responses_protocol_and_streams_tools() {
 
     assert_eq!(response.message.text(), "done");
     assert_eq!(response.message.usage.input_tokens, 4);
+    assert_eq!(response.message.usage.cached_tokens, 2);
+    assert_eq!(response.message.usage.uncached_input_tokens(), 2);
     assert!(matches!(response.message.content[1], Content::ToolCall(_)));
     assert_eq!(
         sink.0.lock().await.as_slice(),

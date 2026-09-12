@@ -10,6 +10,9 @@ on:
 jobs:
   rust:
     name: Rust (${{ matrix.target }})
+    # A platform failure stays visible on its matrix row, but does not stop
+    # healthy platforms or mark the aggregate workflow as failed.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

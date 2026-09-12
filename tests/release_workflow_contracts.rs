@@ -55,7 +55,8 @@ fn release_starts_only_after_successful_main_ci() {
 }
 
 #[test]
-fn release_requires_every_advertised_binary_target() {
+fn platform_failures_are_isolated_and_successful_artifacts_publish_independently() {
+    let ci = workflow("ci.yml");
     let release = workflow("release.yml");
 
     for target in [
@@ -70,11 +71,29 @@ fn release_requires_every_advertised_binary_target() {
         );
     }
     assert!(
-        !release.contains("continue-on-error: true"),
-        "a failed platform build must fail the release"
+        ci.contains("continue-on-error: true"),
+        "a failed native platform must not fail the entire CI workflow"
     );
     assert!(
-        !release.contains("Require at least one successful build"),
-        "publishing only a partial platform set is not allowed"
+        release.contains("continue-on-error: true"),
+        "a failed release target must not block successful targets"
+    );
+    for command in [
+        "cargo clippy --workspace --all-targets --all-features --locked",
+        "cargo test --workspace --all-features --locked",
+        "cargo build --release --locked",
+    ] {
+        assert!(
+            release.contains(command),
+            "each release target must pass its native `{command}` gate"
+        );
+    }
+    assert!(
+        release.contains("gh release upload"),
+        "each successful target must upload its own release artifact"
+    );
+    assert!(
+        !release.contains("actions/download-artifact"),
+        "platform releases must not depend on a combined artifact-publishing job"
     );
 }

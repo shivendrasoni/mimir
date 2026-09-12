@@ -24,7 +24,7 @@ The binary is `target/release/mimir`.
 
 ## Releases and installation
 
-Every successful native Linux, macOS, and Windows CI verification on `main` starts the release workflow. It creates a tagged release commit with the next minor version in `Cargo.toml` and `Cargo.lock`, builds native binaries for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64, and publishes archives with SHA-256 checksums on the GitHub Releases page. The generated version commit is kept on the release tag instead of being pushed back to `main`.
+CI verifies Linux, macOS, and Windows in isolated native jobs. A failed platform remains visible on its matrix row without cancelling healthy platforms or failing the aggregate CI workflow. On `main`, the release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`. Each native target then independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`.
 
 Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
 

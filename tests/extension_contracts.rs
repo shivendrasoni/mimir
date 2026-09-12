@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, time::Duration};
 
 use serde_json::json;
@@ -215,19 +217,17 @@ async fn host_clears_environment_and_parses_json_line_responses() {
 #[tokio::test]
 async fn host_enforces_response_size_limits() {
     let workspace = TempDir::new().expect("workspace");
-    let script_root = TempDir::new().expect("scripts");
-    let script = write_script(
-        &script_root,
-        "large-extension.sh",
-        "#!/bin/sh\nprintf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n",
-    );
     let manifest = ExtensionManifest {
         schema_version: 1,
         name: "large".into(),
         version: "1.0.0".into(),
         entrypoint: mimir::extensions::ExtensionEntrypoint::NativeProcess {
-            program: script.display().to_string(),
-            args: Vec::new(),
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'"
+                    .into(),
+            ],
         },
         capabilities: BTreeSet::from([Capability::Ui]),
     };
@@ -254,7 +254,10 @@ async fn host_enforces_response_size_limits() {
         })
         .await
         .expect_err("oversized response");
-    assert!(error.to_string().contains("response"));
+    assert!(
+        error.to_string().contains("response"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]

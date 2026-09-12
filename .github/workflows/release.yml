@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   prepare:
-    name: Version and verify release
+    name: Version release
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -33,8 +33,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Calculate next release version
         id: version
         shell: bash
@@ -108,12 +106,8 @@ jobs:
               raise SystemExit("Cargo.toml package version was not found")
           path.write_text("".join(lines))
           PY
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features
+      - name: Update lockfile version
+        run: cargo metadata --no-deps --format-version 1 >/dev/null
       - name: Create tagged release commit
         id: commit
         env:
@@ -130,10 +124,25 @@ jobs:
           git tag -a "$TAG_NAME" -m "Mimir $TAG_NAME"
           git push origin "refs/tags/$TAG_NAME"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.commit.outputs.release_sha }}
+          TAG_NAME: ${{ steps.version.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_SHA" \
+              --title "Mimir $TAG_NAME" \
+              --generate-notes
+          fi
 
-  build:
-    name: Build ${{ matrix.target }}
+  build-and-publish:
+    name: Build and publish ${{ matrix.target }}
     needs: prepare
+    # Each target owns its artifact. A failure is isolated to this matrix row.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -158,8 +167,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+          components: clippy
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked --target "${{ matrix.target }}" -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features --locked --target "${{ matrix.target }}"
       - name: Build
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package
@@ -194,29 +208,9 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
-
-  publish:
-    name: Publish GitHub Release
-    needs: [prepare, build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
-      - name: Create release and upload assets
+      - name: Upload platform release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
           TAG_NAME: ${{ needs.prepare.outputs.tag }}
         run: |
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG_NAME" dist/* \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$RELEASE_SHA" \
-              --title "Mimir $TAG_NAME" \
-              --generate-notes
-          fi
+          gh release upload "$TAG_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"

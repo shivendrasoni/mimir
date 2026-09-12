@@ -12,6 +12,10 @@ fn workflow(name: &str) -> String {
 fn ci_checks_every_supported_operating_system_natively() {
     let ci = workflow("ci.yml");
 
+    assert!(
+        ci.contains("workflow_dispatch:"),
+        "CI must retain a manual verification fallback"
+    );
     for runner in ["ubuntu-latest", "macos-14", "windows-latest"] {
         assert!(
             ci.contains(runner),
@@ -40,6 +44,7 @@ fn release_starts_only_after_successful_main_ci() {
         "workflows: [\"ci\"]",
         "github.event.workflow_run.conclusion == 'success'",
         "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.event == 'workflow_dispatch'",
         "github.event.workflow_run.head_branch == 'main'",
     ] {
         assert!(

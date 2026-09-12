@@ -1002,29 +1002,36 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
+#[cfg(unix)]
 fn secure_file_options(options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
 }
 
+#[cfg(not(unix))]
+fn secure_file_options(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn secure_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn secure_file(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 

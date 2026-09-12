@@ -406,6 +406,7 @@ fn anthropic_provider_requires_an_api_key_before_runtime_execution() {
     Command::cargo_bin("mimir")
         .expect("binary")
         .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_OAUTH_TOKEN")
         .args([
             "--provider",
             "anthropic",
@@ -1755,6 +1756,8 @@ fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
     let output = Command::cargo_bin("mimir")
         .expect("binary")
         .current_dir(workspace.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_OAUTH_TOKEN")
         .args(common)
         .write_stdin(
             "{\"id\":\"models\",\"type\":\"get_available_models\"}\n\

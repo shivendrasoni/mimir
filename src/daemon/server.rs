@@ -4,24 +4,28 @@
 )]
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
+};
+#[cfg(unix)]
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::{io::AsyncBufReadExt, sync::broadcast, task::JoinHandle};
+#[cfg(unix)]
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{Mutex, broadcast},
-    task::JoinHandle,
+    io::{AsyncWriteExt, BufReader},
+    sync::Mutex,
 };
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -31,41 +35,50 @@ const AGENT_MESSAGE_RATE_CAPACITY: usize = 3;
 const AGENT_MESSAGE_RATE_REFILL_MS: u64 = 1_000;
 const RECONNECT_CAPABILITIES: [&str; 2] = ["attach_snapshot", "event_sequence"];
 
+#[cfg(unix)]
 use crate::{
-    model::{Content, Message, Role, StopReason},
-    orchestration::{
-        HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule, ScheduleSource, ScheduleStore,
-    },
-    runtime::RuntimeEvent,
-    runtime_events::RuntimeEventEnvelope,
+    model::StopReason,
+    orchestration::ScheduleStore,
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     session_compat::import_jsonl,
     session_tree::SessionBranchCatalog,
 };
+use crate::{
+    model::{Content, Message, Role},
+    orchestration::{HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule, ScheduleSource},
+    runtime::RuntimeEvent,
+    runtime_events::RuntimeEventEnvelope,
+};
 
+#[cfg(unix)]
 use super::{
     IPC_SCHEMA_VERSION,
     journal::{JournalLookup, PublicCommandJournal},
     protocol::{
-        AgentMessageEndpoint, AgentMessageRequest, AgentMessageSafetyStatus, AgentMessageSender,
-        AgentMessagesClearedResponse, AgentSessionMessageReceipt, ClientRequest,
-        DaemonAttachSnapshot, DaemonEventCursor, DaemonHealth, DaemonReplayInfo,
-        DaemonReplayStatus, DaemonSessionEventKind, FailureResponse, LeaseRenewedResponse,
-        LeaseView, NegotiatedResponse, PromptCompletedResponse, PromptRequest, RequestEnvelope,
-        ResponseEnvelope, ServerResponse, SessionAttachedResponse, SessionCatalogView,
-        SessionDetachedResponse, ShutdownAcceptedResponse, negotiate_capabilities,
-        schema_mismatch_error,
+        AgentMessageEndpoint, AgentMessageSafetyStatus, AgentMessageSender,
+        AgentMessagesClearedResponse, AgentSessionMessageReceipt, DaemonAttachSnapshot,
+        DaemonHealth, DaemonSessionEventKind, FailureResponse, LeaseRenewedResponse, LeaseView,
+        NegotiatedResponse, PromptCompletedResponse, RequestEnvelope, ResponseEnvelope,
+        SessionAttachedResponse, SessionCatalogView, SessionDetachedResponse,
+        ShutdownAcceptedResponse, negotiate_capabilities, schema_mismatch_error,
+    },
+    public::{PublicDaemonEventCursor, PublicDaemonSessionSnapshot, PublicDaemonSnapshotRecord},
+    replay::ReplayJournal,
+    session_ops::SessionOps,
+    state::{DaemonMetadataSnapshot, DaemonStateStore},
+    turn_ops::TurnOps,
+};
+use super::{
+    protocol::{
+        AgentMessageRequest, ClientRequest, DaemonEventCursor, DaemonReplayInfo,
+        DaemonReplayStatus, PromptRequest, ServerResponse,
     },
     public::{
         PUBLIC_DAEMON_PROTOCOL_MAX_VERSION, PUBLIC_DAEMON_PROTOCOL_NAME,
         PUBLIC_DAEMON_SNAPSHOT_CHUNK_BYTES, PublicDaemonCommand, PublicDaemonCommandEnvelope,
-        PublicDaemonEventCursor, PublicDaemonSessionSnapshot, PublicDaemonSnapshotRecord,
         PublicImageContent,
     },
-    replay::ReplayJournal,
-    session_ops::SessionOps,
-    state::{DaemonMetadataSnapshot, DaemonStateStore, SessionCatalogEntry, now_ms},
-    turn_ops::TurnOps,
+    state::{SessionCatalogEntry, now_ms},
 };
 
 #[derive(Debug, Error)]
@@ -276,6 +289,9 @@ pub struct DaemonHandle {
 pub struct DaemonHarness {
     core: Arc<ServerCore>,
 }
+
+#[cfg(not(unix))]
+pub struct DaemonHarness;
 
 impl DaemonHandle {
     #[must_use]
@@ -2913,6 +2929,7 @@ fn public_success(id: &str, command: &str, data: Option<Value>) -> Value {
     response
 }
 
+#[cfg(unix)]
 fn public_daemon_hello(core: &ServerCore, client_id: &str) -> Value {
     json!({
         "type": "daemon_hello",

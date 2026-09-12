@@ -14,6 +14,8 @@ const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 
+type ClipboardImageResult = Result<Option<(Vec<u8>, String)>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClipboardCommand {
     program: &'static str,
@@ -63,7 +65,7 @@ pub(super) async fn read_image() -> Result<Option<ImageAttachment>> {
 }
 
 #[cfg(target_os = "macos")]
-async fn read_platform_image() -> Result<Option<(Vec<u8>, String)>> {
+async fn read_platform_image() -> ClipboardImageResult {
     const SCRIPT: &str = r#"try
 return the clipboard as «class PNGf»
 on error
@@ -122,7 +124,7 @@ fn decode_macos_png_descriptor(descriptor: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_platform_image() -> std::future::Ready<Result<Option<(Vec<u8>, String)>>> {
+fn read_platform_image() -> std::future::Ready<ClipboardImageResult> {
     std::future::ready(Ok(None))
 }
 

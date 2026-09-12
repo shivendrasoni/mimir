@@ -1,6 +1,7 @@
 use std::{process::Stdio, time::Duration};
 
 use async_trait::async_trait;
+#[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -479,8 +480,12 @@ async fn terminate_group(
     child.wait().await.ok()
 }
 
+#[cfg(unix)]
 fn kill_process_group(process_group: Option<i32>) {
     if let Some(id) = process_group {
         let _ = killpg(Pid::from_raw(id), Signal::SIGKILL);
     }
 }
+
+#[cfg(not(unix))]
+fn kill_process_group(_process_group: Option<i32>) {}

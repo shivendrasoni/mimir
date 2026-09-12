@@ -182,6 +182,7 @@ impl ToolRegistry {
         registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
         registry.register(file::SearchTool::new(paths.clone(), policy.clone()));
+        #[cfg(unix)]
         if policy.allow_shell {
             registry.register(bash::BashTool::new(paths.root(), policy.clone())?);
         }

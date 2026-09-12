@@ -24,7 +24,6 @@ dotenvy = "0.15"
 futures = "0.3"
 hmac = "0.12"
 regex = "1.11"
-nix = { version = "0.30", features = ["process", "signal"] }
 oxc_allocator = "=0.132.0"
 oxc_codegen = { version = "=0.132.0", default-features = false }
 oxc_parser = "=0.132.0"
@@ -47,6 +46,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["process", "signal"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

@@ -560,6 +560,7 @@ async fn search_results_are_bounded_below_the_general_tool_output_limit() {
     assert!(search.content.contains("many.txt:1:"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn process_tool_times_out_and_returns_a_recovery_hint() {
     let root = TempDir::new().expect("tempdir");
@@ -575,6 +576,7 @@ async fn process_tool_times_out_and_returns_a_recovery_hint() {
     assert!(!observation.next_actions.is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn process_tool_caps_observation_bytes() {
     let root = TempDir::new().expect("tempdir");
@@ -943,6 +945,7 @@ fn default_and_missing_allowlist_policies_do_not_advertise_process_execution() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
     let root = TempDir::new().expect("tempdir");
@@ -986,6 +989,7 @@ async fn bash_runner_is_opt_in_and_keeps_bounded_output_with_a_full_log() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
     let root = TempDir::new().expect("tempdir");
@@ -1040,6 +1044,7 @@ async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
         .expect_err("unlisted command must fail closed");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn model_bash_requires_approval_in_default_mode_and_runs_in_auto_mode() {
     let root = TempDir::new().expect("tempdir");
@@ -1096,6 +1101,27 @@ async fn model_bash_requires_approval_in_default_mode_and_runs_in_auto_mode() {
     assert_eq!(automatic.content, "AUTOMATIC");
 }
 
+#[cfg(not(unix))]
+#[test]
+fn registry_does_not_advertise_bash_without_a_unix_shell() {
+    let root = TempDir::new().expect("tempdir");
+    let tools = ToolRegistry::with_default_tools(
+        root.path(),
+        ToolPolicy {
+            allow_shell: true,
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("tools");
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .all(|definition| definition.name != "bash")
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn bash_runner_timeout_and_abort_terminate_the_process_group() {
     let root = TempDir::new().expect("tempdir");

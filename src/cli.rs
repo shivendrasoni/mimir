@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

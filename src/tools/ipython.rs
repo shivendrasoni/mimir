@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+#[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -772,12 +773,15 @@ async fn read_bounded_line(
     }
 }
 
+#[cfg(unix)]
 fn interrupt_kernel(child: &mut Child) {
-    #[cfg(unix)]
     if let Some(id) = child.id().and_then(|id| i32::try_from(id).ok()) {
         let _ = killpg(Pid::from_raw(id), Signal::SIGINT);
     }
 }
+
+#[cfg(not(unix))]
+fn interrupt_kernel(_child: &mut Child) {}
 
 async fn terminate_kernel(process: Option<KernelProcess>) {
     if let Some(mut process) = process {

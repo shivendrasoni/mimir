@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -554,6 +555,7 @@ where
 }
 
 async fn terminate_group(child: &mut Child) {
+    #[cfg(unix)]
     if let Some(id) = child.id().and_then(|id| i32::try_from(id).ok()) {
         let _ = killpg(Pid::from_raw(id), Signal::SIGKILL);
     }

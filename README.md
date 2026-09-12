@@ -24,7 +24,7 @@ The binary is `target/release/mimir`.
 
 ## Releases and installation
 
-CI verifies Linux, macOS, and Windows in isolated native jobs. A failed platform remains visible on its matrix row without cancelling healthy platforms or failing the aggregate CI workflow. On `main`, the release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`. Each native target then independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`.
+CI verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
 
 Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
 
@@ -36,7 +36,7 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 /tmp/mimir "$HOME/.local/bin/mimir"
 ```
 
-On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. On Windows, download the `x86_64-pc-windows-msvc.zip` archive, extract `mimir.exe`, and add its directory to `PATH`.
+On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. Windows binaries are not currently published.
 
 Minor releases are automatic. To start a new major release line, set the package version to the next `<major>.0.0` and push that commit to `main`; the workflow preserves the manual major version instead of incrementing it:
 

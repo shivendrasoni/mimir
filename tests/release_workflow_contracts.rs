@@ -9,7 +9,7 @@ fn workflow(name: &str) -> String {
 }
 
 #[test]
-fn ci_checks_every_supported_operating_system_natively() {
+fn ci_checks_enabled_operating_systems_natively() {
     let ci = workflow("ci.yml");
 
     assert!(
@@ -20,12 +20,16 @@ fn ci_checks_every_supported_operating_system_natively() {
         ci.contains("branches:\n      - main"),
         "CI must run automatically for pushes to main"
     );
-    for runner in ["ubuntu-latest", "macos-14", "windows-latest"] {
+    for runner in ["ubuntu-latest", "macos-14"] {
         assert!(
             ci.contains(runner),
             "CI must exercise the platform-specific code on {runner}"
         );
     }
+    assert!(
+        !ci.contains("windows-latest") && !ci.contains("x86_64-pc-windows-msvc"),
+        "Windows verification is intentionally disabled until native support returns"
+    );
     for command in [
         "cargo clippy --workspace --all-targets --all-features",
         "cargo test --workspace --all-features",
@@ -40,22 +44,17 @@ fn ci_checks_every_supported_operating_system_natively() {
 }
 
 #[test]
-fn release_starts_only_after_successful_main_ci() {
+fn release_runs_only_on_manual_dispatch() {
     let release = workflow("release.yml");
 
-    for contract in [
-        "workflow_run:",
-        "workflows: [\"ci\"]",
-        "github.event.workflow_run.conclusion == 'success'",
-        "github.event.workflow_run.event == 'push'",
-        "github.event.workflow_run.event == 'workflow_dispatch'",
-        "github.event.workflow_run.head_branch == 'main'",
-    ] {
-        assert!(
-            release.contains(contract),
-            "release workflow is missing the gate `{contract}`"
-        );
-    }
+    assert!(
+        release.contains("workflow_dispatch:"),
+        "releases must support explicit manual dispatch"
+    );
+    assert!(
+        !release.contains("workflow_run:") && !release.contains("github.event.workflow_run"),
+        "CI completion must not publish a release automatically"
+    );
 }
 
 #[test]
@@ -67,13 +66,16 @@ fn platform_failures_are_isolated_and_successful_artifacts_publish_independently
         "x86_64-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
     ] {
         assert!(
             release.contains(target),
             "release workflow must build {target}"
         );
     }
+    assert!(
+        !release.contains("windows-latest") && !release.contains("x86_64-pc-windows-msvc"),
+        "Windows publishing is intentionally disabled until native support returns"
+    );
     assert!(
         ci.contains("continue-on-error: true"),
         "a failed native platform must not fail the entire CI workflow"

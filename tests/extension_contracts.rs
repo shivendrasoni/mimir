@@ -225,7 +225,7 @@ async fn host_enforces_response_size_limits() {
             program: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                "printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'"
+                "IFS= read -r _request; printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'"
                     .into(),
             ],
         },

@@ -1,9 +1,12 @@
+#[cfg(unix)]
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{IPC_SCHEMA_VERSION, state::SessionCatalogEntry};
+#[cfg(unix)]
+use super::IPC_SCHEMA_VERSION;
+use super::state::SessionCatalogEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]

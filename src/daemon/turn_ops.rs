@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex, Weak},
 };
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use serde_json::json;
 use serde_json::{Map, Value};
 #[cfg(unix)]
@@ -615,6 +615,7 @@ fn protocol(message: impl Into<String>) -> DaemonError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::*;
@@ -633,6 +634,7 @@ mod tests {
         json!({"role":"custom","customType":"recovery_note","content":text,"display":true,"timestamp":42})
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn admission_cancels_waiter_but_never_an_owned_prompt() {
         let ops = Arc::new(TurnOps::new());

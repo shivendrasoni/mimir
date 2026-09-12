@@ -4,8 +4,10 @@
 )]
 #![cfg_attr(
     not(unix),
-    allow(dead_code),
-    reason = "the public daemon API fails closed on platforms without Unix-domain sockets"
+    allow(
+        dead_code,
+        reason = "the public daemon API fails closed on platforms without Unix-domain sockets"
+    )
 )]
 
 use std::{
@@ -21,6 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
 use chrono::Utc;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -56,6 +59,8 @@ use crate::{
 };
 
 #[cfg(unix)]
+use super::public::PUBLIC_DAEMON_PROTOCOL_NAME;
+#[cfg(unix)]
 use super::{
     IPC_SCHEMA_VERSION,
     journal::{JournalLookup, PublicCommandJournal},
@@ -79,9 +84,8 @@ use super::{
         DaemonReplayStatus, PromptRequest, ServerResponse,
     },
     public::{
-        PUBLIC_DAEMON_PROTOCOL_MAX_VERSION, PUBLIC_DAEMON_PROTOCOL_NAME,
-        PUBLIC_DAEMON_SNAPSHOT_CHUNK_BYTES, PublicDaemonCommand, PublicDaemonCommandEnvelope,
-        PublicImageContent,
+        PUBLIC_DAEMON_PROTOCOL_MAX_VERSION, PUBLIC_DAEMON_SNAPSHOT_CHUNK_BYTES,
+        PublicDaemonCommand, PublicDaemonCommandEnvelope, PublicImageContent,
     },
     state::{SessionCatalogEntry, now_ms},
 };

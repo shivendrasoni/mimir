@@ -38,6 +38,8 @@ The model has a workspace-rooted `bash` tool. In `default` mode every model-issu
 
 `/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and `write_plan`. It can inspect the repository, pause for a structured clarification, and create or revise one session-bound Markdown file under `plans/`; direct shell commands, extensions, MCP, IPython, child agents, and autonomous continuations are disabled. Plan mode supports native model providers only.
 
+Outside plan mode, an explicit request such as “remember that this project uses strict Clippy” can invoke the built-in `remember` tool. It stores a project-scoped memory by default through the same durable refinement history as `/refine`. Say that the memory is temporary to select session scope, or explicitly request that it apply across projects to select user scope.
+
 When the plan is ready, enter standalone `implement` or `/implement [additional instructions]`. Mimir validates the artifact, switches to auto mode, and starts implementation from the accepted plan. The plan is never committed or pushed automatically.
 
 ## Workspace references

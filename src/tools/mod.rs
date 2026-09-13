@@ -5,6 +5,7 @@ mod extension;
 mod file;
 mod ipython;
 mod mcp;
+mod memory;
 mod path_policy;
 mod plan;
 mod process;
@@ -253,8 +254,13 @@ impl ToolRegistry {
                 "Auto mode is active: workspace writes and model-issued Bash commands run without approval prompts."
             }
         };
+        let remember_guidance = if self.tools.contains_key("remember") {
+            " When the user explicitly asks you to remember or always remember guidance, call the remember tool with a concise standalone memory; do not merely acknowledge the request."
+        } else {
+            ""
+        };
         format!(
-            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. {permission_guidance} Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. Bash and run_process execution are not an OS sandbox.",
+            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. {permission_guidance}{remember_guidance} Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. Bash and run_process execution are not an OS sandbox.",
             self.workspace_root.display(),
         )
     }
@@ -370,7 +376,8 @@ impl ToolRegistry {
                 .tools
                 .iter()
                 .filter(|(name, _)| {
-                    !rlm::is_reserved(name) && !matches!(name.as_str(), "ipython" | "finish_task")
+                    !rlm::is_reserved(name)
+                        && !matches!(name.as_str(), "ipython" | "finish_task" | "remember")
                 })
                 .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
                 .collect(),
@@ -481,6 +488,31 @@ impl ToolRegistry {
             });
         }
         self.register(tool);
+        Ok(())
+    }
+
+    /// Registers explicit natural-language memory for the parent runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error in plan mode or when the tool name is already in use.
+    pub fn register_remember_tool(
+        &mut self,
+        state_root: &Path,
+        session: &str,
+    ) -> Result<(), ToolError> {
+        self.deny_plan_registration("durable memory")?;
+        if self.tools.contains_key("remember") {
+            return Err(ToolError::Execution {
+                tool: "remember".into(),
+                message: "tool name conflicts with an existing tool".into(),
+            });
+        }
+        self.register(memory::RememberTool::new(
+            state_root,
+            self.workspace_root.as_ref(),
+            session,
+        ));
         Ok(())
     }
 

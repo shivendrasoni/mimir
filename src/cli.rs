@@ -7397,6 +7397,11 @@ async fn build_runtime_for_session(
     };
     let mut tool_registry = ToolRegistry::with_default_tools(&workspace, policy.clone())
         .map_err(|error| MimirError::Tool(error.to_string()))?;
+    if !build.no_builtin_tools && !build.agent_mode.is_plan() {
+        tool_registry
+            .register_remember_tool(&state, session)
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+    }
     if build.no_builtin_tools && !build.agent_mode.is_plan() {
         let _ = tool_registry.retain_named(&BTreeSet::new());
     }
@@ -11103,6 +11108,40 @@ export default function activate(pi) {
             .await
             .expect("runtime without builtin tools");
         assert!(runtime.active_tool_names().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_runtime_exposes_explicit_memory_but_plan_mode_does_not() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let state = tempfile::TempDir::new().expect("state");
+        let mut config = build("fake", "test");
+        config.workspace = workspace.path().to_owned();
+        config.state_dir = state.path().to_owned();
+        config.fake_responses = vec!["unused".into()];
+        config.no_extensions = true;
+        config.offline = true;
+        let runtime = build_runtime_for_session(&config, "memory-parent")
+            .await
+            .expect("default runtime");
+        assert!(runtime.tool_definition("remember").is_some());
+        assert!(
+            runtime
+                .system_prompt_snapshot()
+                .await
+                .contains("call the remember tool")
+        );
+
+        config.agent_mode = crate::tools::AgentMode::Plan;
+        let runtime = build_runtime_for_session(&config, "memory-plan")
+            .await
+            .expect("plan runtime");
+        assert!(runtime.tool_definition("remember").is_none());
+        assert!(
+            !runtime
+                .system_prompt_snapshot()
+                .await
+                .contains("call the remember tool")
+        );
     }
 }
 

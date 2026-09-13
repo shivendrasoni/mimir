@@ -7,7 +7,7 @@ The RLM runtime is built for long-running, inspectable work:
 - **Recursive execution:** `spawn_agent` starts a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
 - **Safe long-running execution:** top-level operational budgets are provider-aware, while recursion depth, child count and concurrency, prompt and state size, tool output, and authenticated model discovery remain bounded.
 - **Durable session state:** child sessions and namespaced RLM extension state persist under Mimir's state root, so orchestration can survive an interrupted terminal session.
-- **Continual Harness:** `/refine` turns evidence into small, scoped updates to supplemental prompts, memories, existing-code skills, or reusable subagent specifications. `/learn` manages observe-only project learning, verified canaries, redacted contribution, and signed fleet packs. Neither path rewrites the base system prompt or trains model weights.
+- **Continual Harness:** explicit “remember this” requests use the built-in `remember` tool, while `/refine` turns evidence into small, scoped updates to supplemental prompts, memories, existing-code skills, or reusable subagent specifications. `/learn` manages observe-only project learning, verified canaries, redacted contribution, and signed fleet packs. None of these paths rewrites the base system prompt or trains model weights.
 
 Around that RLM foundation, Mimir provides provider adaptation, model/tool execution, workspace tools, context and skill loading, goals, schedules, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, state migration helpers, and deterministic offline testing.
 

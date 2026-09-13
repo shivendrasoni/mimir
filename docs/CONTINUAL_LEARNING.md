@@ -27,6 +27,14 @@ Approved proposals enter a project canary. A candidate activates only after thre
 
 Candidate validation rejects unknown kinds, base-prompt changes, permission expansion, dependency installation, and generated executable code. State updates use atomic replacement, restrictive file permissions, bounded collections, an in-process mutex, and a stale-recovering cross-process lock.
 
+## Explicit natural-language memory
+
+The parent agent has a built-in `remember` tool. When the user explicitly says “remember this”, “always remember”, or otherwise asks Mimir to retain guidance, the model converts that request into a concise standalone memory and invokes the tool. The tool writes through the same versioned refinement coordinator as `/refine`, so the result is bounded, scoped, visible in harness context, and reversible with `/refine rollback <refinement-id>`.
+
+Project is the default scope. Session scope is used only for explicitly temporary guidance, and user scope only when the user explicitly asks for the memory to apply across projects. The tool is unavailable in plan mode and is not inherited by RLM children. It must not infer remembrance from incidental conversation or store credentials, source code, paths, or tool payloads.
+
+For precise manual control, `/refine --scope session|project|user <instructions>` remains available.
+
 ## Fleet packs and contribution
 
 Fleet consumption and contribution are independent:

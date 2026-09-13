@@ -1337,6 +1337,8 @@ async fn dispatch_coordinator_action(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_agent_mode(AgentMode::Auto);
             let relative = prepared.relative_plan;
+            let learning_workspace = runtime_factory.workspace_root();
+            let learning_session = prepared.session.clone();
             *runtime = prepared.runtime;
             *runtime_key = Some((prepared.model, prepared.session));
             refresh_extension_commands(runtime, app).await;
@@ -1358,6 +1360,8 @@ async fn dispatch_coordinator_action(
                     app_for_run,
                     autonomous_for_run,
                     Message::user(prompt),
+                    learning_workspace,
+                    learning_session,
                 )
                 .await;
             });

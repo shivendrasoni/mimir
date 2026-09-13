@@ -13,23 +13,12 @@ Around that RLM foundation, Mimir provides provider adaptation, model/tool execu
 
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
-## Build
+## Install
+
+Download the latest release from [GitHub Releases](https://github.com/shivendrasoni/mimir/releases/latest). On Linux x86_64:
 
 ```bash
-rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
-cargo build --release
-```
-
-The binary is `target/release/mimir`.
-
-## Releases and installation
-
-CI is paused for pushes and pull requests. When manually dispatched, it verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. With the manifest at `0.7.0`, the next manual release starts at `v0.7.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
-
-Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
-
-```bash
-version=v0.7.0
+version=v0.9.0
 curl -fL "https://github.com/shivendrasoni/mimir/releases/latest/download/mimir-${version}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mimir.tar.gz
 tar -xzf /tmp/mimir.tar.gz -C /tmp
 mkdir -p "$HOME/.local/bin"
@@ -38,17 +27,14 @@ install -m 755 /tmp/mimir "$HOME/.local/bin/mimir"
 
 On macOS, use `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel. Windows binaries are not currently published.
 
-The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. The package has not been published yet. After its first publication, Rust users will be able to install it with:
+To build from source:
 
 ```bash
-cargo install mimir-ai
+rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+cargo build --release
 ```
 
-Releases are started manually from the GitHub Actions **Release** workflow. To start a new major release line, first set the package version to the next `<major>.0.0`; the workflow preserves that manual major version instead of incrementing it:
-
-```bash
-cargo metadata --no-deps --format-version 1
-```
+The binary is `target/release/mimir`. The publishable crates.io package is named `mimir-ai`, but it has not been published yet. See [Releasing](docs/RELEASING.md) for packaging and release-workflow details.
 
 ## Quick start
 
@@ -56,185 +42,41 @@ cargo metadata --no-deps --format-version 1
 # Fully offline
 mimir --provider fake --fake-response "Hello from Rust" --print "hello"
 
-# OpenAI-compatible provider; .env is loaded but never displayed
+# OpenAI-compatible provider
 OPENAI_API_KEY=... mimir --model gpt-5-mini --print "inspect this repository"
 
-# Interactive full-screen TUI; /help lists commands and /quit exits
+# Interactive full-screen TUI
 mimir
 
-# Auto mode lets the agent run Bash commands and workspace edits without prompts
+# Auto mode permits Bash commands and workspace edits without prompts
 mimir --agent-mode auto
 
-# Plan mode inspects and clarifies, then writes one reviewable plan artifact
+# Plan mode produces a reviewable plan before implementation
 mimir --agent-mode plan
-
-# Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
-mimir --max-turns 128
-mimir --max-run-tokens 2000000
-
-# Versioned JSON events
-mimir --output json --print "summarize the project"
-
-# JSON-RPC 2.0, one request per line
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"health"}' | mimir --provider fake --fake-response ok --output rpc
 ```
 
-The model has a workspace-rooted `bash` tool. In `default` mode every model-issued shell command
-requires confirmation, while `/mode auto` runs shell commands and workspace edits immediately.
-Use `/mode default` to return to confirmation.
-
-Inside the TUI, type `@` anywhere in the composer to pick a file or folder from the active
-workspace. Continue typing to filter, use Up/Down or Tab to select, and press Enter to insert the
-workspace-relative reference. Referenced paths are validated against the workspace and are made
-explicit to the model; folders are inspected selectively instead of being injected wholesale.
-
-`/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and
-`write_plan`. It can inspect the repository, pause for a structured clarification, and create or
-revise one session-bound Markdown file under `plans/`; direct shell commands, extensions, MCP,
-IPython, child agents, and autonomous continuations are disabled. Plan mode supports native model
-providers only. When the plan is ready, enter standalone `implement` or
-`/implement [additional instructions]`. Mimir validates the artifact, switches to auto mode, and
-starts implementation from the accepted plan. The plan is never committed or pushed automatically.
-
-Long-running servers should be backgrounded with stdout and stderr redirected to a workspace log.
-Direct TUI commands use `!command` (or `!!command` to exclude the result from model context); auto
-mode runs those without an allowlist.
-
-The narrower argument-vector `run_process` tool remains opt-in and requires an exact program
-allowlist:
+Anthropic OAuth and Claude Sonnet 5 are the default login and model:
 
 ```bash
-mimir --allow-process --allowed-programs cargo,rg --print "run the tests"
-```
-
-## Auth and provider login
-
-```bash
-mimir providers
-# Anthropic OAuth is the default login and Claude Sonnet 5 is the default model
 mimir login
-printf '%s\n' "$OPENAI_API_KEY" | mimir login openai --api-key-stdin
-mimir auth status
-mimir logout openai
-mimir login openai-codex
-printf '%s\n' "$ANTHROPIC_API_KEY" | mimir login anthropic --api-key-stdin
+mimir
 ```
 
-Inside the TUI, use `/login`; credentials are masked while entered. ChatGPT Codex OAuth uses the native Codex Responses transport. Anthropic is native and distinguishes API-key authentication (`x-api-key`) from OAuth bearer authentication; the two credential types are not interchangeable. Bedrock, Vertex, Google, Mistral, OpenAI-compatible, safe custom providers, and extension-provided transports are selected through the same typed runtime factory.
+Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the workspace path picker. See [Using Mimir](docs/USAGE.md) for agent modes, tool permissions, file references, token limits, and machine-readable output.
 
-Providers that are discovery-only or unsupported by the selected runtime fail closed before execution.
+## Documentation
 
-## State and management
-
-State defaults to the global `$HOME/.mimir/` directory and uses versioned JSON/JSONL formats.
-Set `MIMIR_STATE_DIR` or pass `--state-dir` to use an isolated state directory.
-The per-prompt provider-turn budget defaults to 64 and can be changed with
-`--max-turns` or `MIMIR_MAX_TURNS`. Reaching it is a recoverable budget pause:
-the session stays intact and a new message starts a fresh per-prompt budget.
-The cumulative run-token budget defaults to 1,000,000 fresh-input plus output
-tokens and can be changed with `--max-run-tokens` or
-`MIMIR_MAX_RUN_TOKENS`. Provider-cached input remains visible in diagnostics
-and context measurements, but replaying it does not consume the run budget a
-second time.
-
-```bash
-mimir doctor
-mimir session list
-mimir --session work session show
-mimir --session work session export
-mimir daemon start
-mimir daemon status
-mimir daemon prompt "continue"
-mimir daemon stop
-mimir migrate plan --legacy-root <legacy-state-directory>
-mimir migrate apply --legacy-root <legacy-state-directory>
-# Use the journal_path printed by apply:
-mimir migrate rollback --journal <journal-path>
-mimir goal set "finish the next milestone" --token-budget 80000
-mimir goal show
-mimir schedule add heartbeat "continue the goal" --every-seconds 300
-mimir schedule list
-mimir extension list
-mimir rlm list sample-extension workspace
-mimir --provider fake --fake-response ok benchmark prompt "smoke test"
-```
-
-## Local diagnostics
-
-Every agent process writes a versioned, privacy-safe bundle under
-`.mimir/diagnostics/` (or `<state-dir>/diagnostics/` when `--state-dir` is set):
-
-```text
-diagnostics/
-├── index.jsonl
-└── runs/<run-id>/
-    ├── manifest.json
-    ├── events.jsonl
-    ├── summary.json
-    ├── analysis.jsonl
-    └── artifacts/
-```
-
-The recorder runs best-effort in a background thread and cannot fail an agent
-run. It records correlation IDs, event types, timing, raw input, cached input,
-fresh input, output, operational-budget usage, peak context, byte counts,
-hashes, status, and error classes. Prompt text, model output, tool arguments,
-tool output, credentials, environment values, and absolute host paths are not
-stored. If a process exits before its terminal write, readers synthesize an
-`incomplete` outcome instead of presenting the run as successful.
-Diagnostic directories are mode `0700` and files are mode `0600` on Unix.
-Each run is bounded to 100,000 events or 128 MiB of event data, and startup
-retention keeps at most 100 runs and 512 MiB of bundle data.
-
-```bash
-mimir diagnose list
-mimir diagnose show <run-id>
-mimir diagnose query <run-id> --kind tool_finished --status error --json
-mimir diagnose export <run-id> --redacted --output diagnostic.json
-mimir diagnose annotate <run-id> --file assessment.json
-mimir diagnose replay <run-id>
-```
-
-`annotate` appends a typed external assessment without modifying raw evidence.
-The assessment file uses this portable shape (event IDs must belong to the run):
-
-```json
-{
-  "author": "another-harness",
-  "finding": "The process exit event is missing",
-  "confidence": 0.9,
-  "evidence_event_ids": [],
-  "proposed_fix": "Inspect pipe-drain completion",
-  "verification": "Replay the bounded fixture"
-}
-```
-
-`replay` is deliberately verification-only: it validates schema, correlation,
-sequence, and terminal evidence and never calls a provider or executes a tool.
-The TUI `/traces preview` remains available and now links its session metadata
-to matching diagnostic run IDs.
-
-Direct text, JSON, JSON-RPC, ACP, autonomous, REPL, and TUI processes attach the
-diagnostic collector at CLI dispatch. Each daemon-managed prompt attaches its
-own collector for the complete prompt lifecycle, including queued follow-ups
-and autonomous continuations, so long-lived daemon sessions produce one bounded
-bundle per admitted prompt.
-
-## RLM and continual harness
-
-When running an interactive, session-backed agent, Mimir registers its RLM tools automatically. The agent can choose from its currently authenticated models and recursively delegate bounded work; each child is tracked independently from admission through completion, cancellation, or deletion. The default maximum recursion depth is 3, and all child work remains subject to the runtime's budgets and tool policy.
-
-Use `/rlm-max-depth` in the TUI to inspect or set the recursion limit for a session. Use `/refine --scope session|project|user <instructions>` when you want Mimir to review the current trajectory and persist a focused lesson. Session remains the default, and the deprecated `--global` alias still maps to user scope. Fleet scope is read-only. Undo a recorded update with:
-
-```text
-/refine rollback <refinement-id>
-# or, for a global refinement
-/refine rollback <refinement-id> --global
-```
-
-Initialize project learning with `mimir learning init`, then inspect or change it with `mimir learning status`, `mimir learning mode observe|auto|off`, or `/learn`. Observe-only is the default, auto mode unlocks after three observed evidence records, and auto candidates need three applicable verified successes before activation; a verified failure quarantines them. Fleet contribution is separately opt-in. See [Continual learning](docs/CONTINUAL_LEARNING.md) for the storage, trust, privacy, rollout, and rollback contract.
-
-This is harness refinement, not model-weight training: Mimir proposes and validates small durable operating-context changes, then records the before/after state needed to inspect or reverse them.
+- [Using Mimir](docs/USAGE.md) — TUI, agent modes, workspace tools, and output formats
+- [Providers and authentication](docs/PROVIDERS.md) — login, OAuth, API keys, and provider behavior
+- [RLM and continual harness](docs/RLM.md) — child agents, refinement, learning, and rollback
+- [Operations](docs/OPERATIONS.md) — state, sessions, daemon, goals, schedules, and extensions
+- [Diagnostics](docs/DIAGNOSTICS.md) — privacy-safe run evidence, querying, annotation, and replay
+- [Reliability](docs/RELIABILITY.md) — invariants, failures, fault injection, and release gates
+- [Architecture](ARCHITECTURE.md) — runtime flow, modules, persistence, and extension points
+- [Security](SECURITY.md) — trust boundaries, controls, and operational guidance
+- [State migration](STATE-MIGRATION.md) — guarded import and rollback
+- [Performance evidence](BENCHMARKS.md) — benchmark methodology and interpretation
+- [Releasing](docs/RELEASING.md) — CI, packaging, versions, and artifacts
 
 ## Agent harness benchmarks
 
@@ -253,5 +95,3 @@ cargo test --workspace --doc
 cargo build --release
 cargo audit --deny warnings --no-fetch
 ```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md), [STATE-MIGRATION.md](STATE-MIGRATION.md), [SECURITY.md](SECURITY.md), and [BENCHMARKS.md](BENCHMARKS.md).

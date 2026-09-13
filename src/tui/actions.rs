@@ -54,6 +54,9 @@ pub enum TuiAction {
     Refine {
         arguments: Option<String>,
     },
+    Learn {
+        arguments: Option<String>,
+    },
     CopyLastMessage,
     SideQuestion {
         question: String,

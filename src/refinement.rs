@@ -11,29 +11,50 @@ use uuid::Uuid;
 use crate::{
     atomic::{canonical_state_root, path_lock, prepare_state_path, read_json, write_json},
     error::{MimirError, Result},
+    learning::{self, CandidateStatus, FleetLearningPack, LearningCandidate, project_harness_path},
     runtime::AgentRuntime,
     session::{FileSessionStore, SessionPayload, SessionStore},
 };
 
 const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HARNESS_CONTEXT_CHARS: usize = 12 * 1024;
+const MAX_HARNESS_CONTEXT_ENTRIES: usize = 24;
 const REFINEMENT_SYSTEM_PROMPT: &str = r#"You are Mimir's continual harness refinement subsystem.
 Return JSON only with this shape:
 {"summary":"one sentence","rationale":"evidence","expectedOutcome":"outcome","edits":[{"action":"create|update|delete","kind":"prompt|memory|skill|subagent","id":"optional for create","title":"required except delete","content":"required except delete","path":"optional","reference":{},"arguments":{},"metadata":{},"reason":"why"}]}
 Make only small evidence-backed edits. Never rewrite a base system prompt. Skill creates and updates require reference.type=python, a Python import, a callable or call_pattern, and an arguments object."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum HarnessScope {
-    Local,
-    Global,
+    #[serde(rename = "session", alias = "local")]
+    Session,
+    #[serde(rename = "project")]
+    Project,
+    #[serde(rename = "user", alias = "global")]
+    User,
+    #[serde(rename = "fleet")]
+    Fleet,
 }
 
 impl HarnessScope {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Local => "local",
-            Self::Global => "global",
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::User => "user",
+            Self::Fleet => "fleet",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "session" | "local" => Some(Self::Session),
+            "project" => Some(Self::Project),
+            "user" | "global" => Some(Self::User),
+            "fleet" => Some(Self::Fleet),
+            _ => None,
         }
     }
 }
@@ -138,6 +159,8 @@ pub struct HarnessRefinementEvent {
 pub struct HarnessState {
     pub schema: u16,
     #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
     pub entries: HarnessEntries,
     #[serde(default)]
     pub refinements: Vec<HarnessRefinementEvent>,
@@ -146,7 +169,8 @@ pub struct HarnessState {
 impl Default for HarnessState {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: 2,
+            generation: 0,
             entries: HarnessEntries::default(),
             refinements: Vec::new(),
         }
@@ -225,6 +249,8 @@ pub struct RefineOptions<'a> {
     pub instructions: Option<&'a str>,
     pub rollback_id: Option<&'a str>,
     pub global: bool,
+    pub scope: Option<HarnessScope>,
+    pub workspace: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -250,6 +276,10 @@ fn default_summary() -> String {
 /// Returns a validation, provider, JSON protocol, safe-path, or durable I/O
 /// error. Invalid edits are represented as unapplied result entries rather than
 /// aborting otherwise valid edits in the same proposal.
+#[allow(
+    clippy::too_many_lines,
+    reason = "refinement planning and rollback share one atomic coordinator transaction"
+)]
 pub async fn refine(
     runtime: &AgentRuntime,
     state_root: &Path,
@@ -258,67 +288,80 @@ pub async fn refine(
 ) -> Result<RefinementResult> {
     validate_options(session_id, &options)?;
     let root = canonical_state_root(state_root);
-    let (proposal, rollback_of, scope, baseline, state_path) =
-        if let Some(rollback_id) = options.rollback_id {
-            let target = find_history_result(&root, session_id, rollback_id).await?;
-            let (scope, state_path) = rollback_target_path(&root, session_id, &target)?;
-            if !state_path.exists() {
-                return Err(MimirError::Protocol(format!(
-                    "Refinement {} state file not found: {}",
-                    target.id,
-                    state_path.display()
-                )));
-            }
-            let baseline = load_state(&root, &state_path).await?;
-            (
-                rollback_proposal(&target),
-                Some(target.id),
-                scope,
-                baseline,
-                state_path,
-            )
+    let project_root = learning::discover_project_root(options.workspace.unwrap_or(state_root))?;
+    let (proposal, rollback_of, scope, baseline, state_path) = if let Some(rollback_id) =
+        options.rollback_id
+    {
+        let target = find_history_result(&root, &project_root, session_id, rollback_id).await?;
+        let (scope, state_path) = rollback_target_path(&root, &project_root, session_id, &target)?;
+        if scope == HarnessScope::Fleet {
+            return Err(MimirError::Configuration(
+                "fleet learning packs are read-only; install a signed rollback pack".into(),
+            ));
+        }
+        if !state_path.exists() {
+            return Err(MimirError::Protocol(format!(
+                "Refinement {} state file not found: {}",
+                target.id,
+                state_path.display()
+            )));
+        }
+        let baseline = load_state(&root, &state_path).await?;
+        (
+            rollback_proposal(&target),
+            Some(target.id),
+            scope,
+            baseline,
+            state_path,
+        )
+    } else {
+        let scope = options.scope.unwrap_or(if options.global {
+            HarnessScope::User
         } else {
-            let scope = if options.global {
-                HarnessScope::Global
-            } else {
-                HarnessScope::Local
-            };
-            let state_path = harness_state_path(&root, session_id, scope);
-            let baseline = load_state(&root, &state_path).await?;
-            let global_context = if scope == HarnessScope::Local {
-                let global_path = harness_state_path(&root, session_id, HarnessScope::Global);
-                Some(load_state(&root, &global_path).await?)
-            } else {
-                None
-            };
-            let history = load_all_history(&root, session_id).await?;
-            let prompt = refinement_prompt(
-                runtime,
-                &baseline,
-                global_context.as_ref(),
-                &history,
-                options.instructions,
-                scope,
-            )
+            HarnessScope::Session
+        });
+        if scope == HarnessScope::Fleet {
+            return Err(MimirError::Configuration(
+                "fleet learning packs are read-only and cannot be changed by /refine".into(),
+            ));
+        }
+        if scope == HarnessScope::Project {
+            learning::ensure_project_marker(&project_root).await?;
+        }
+        let state_path = harness_state_path(&root, &project_root, session_id, scope);
+        let storage_root = storage_root_for_scope(&root, &project_root, scope);
+        let baseline = load_state(storage_root, &state_path).await?;
+        let inherited_context =
+            load_inherited_state(&root, &project_root, session_id, scope).await?;
+        let history = load_all_history(&root, &project_root, session_id).await?;
+        let prompt = refinement_prompt(
+            runtime,
+            &baseline,
+            inherited_context.as_ref(),
+            &history,
+            options.instructions,
+            scope,
+        )
+        .await?;
+        let response = runtime
+            .complete_control_request(REFINEMENT_SYSTEM_PROMPT, &prompt, 32_000)
             .await?;
-            let response = runtime
-                .complete_control_request(REFINEMENT_SYSTEM_PROMPT, &prompt, 32_000)
-                .await?;
-            (
-                parse_proposal(&response)?,
-                None,
-                scope,
-                baseline,
-                state_path,
-            )
-        };
+        (
+            parse_proposal(&response)?,
+            None,
+            scope,
+            baseline,
+            state_path,
+        )
+    };
 
     let history_path = history_path_for_state(&state_path)?;
-    prepare_state_path(&root, &state_path).await?;
-    prepare_state_path(&root, &history_path).await?;
+    let storage_root = storage_root_for_scope(&root, &project_root, scope);
+    prepare_state_path(storage_root, &state_path).await?;
+    prepare_state_path(storage_root, &history_path).await?;
     let lock = path_lock(&state_path);
     let _guard = lock.lock().await;
-    let mut state = load_state(&root, &state_path).await?;
+    let mut state = load_state(storage_root, &state_path).await?;
     let id = format!("refine_{}", Uuid::new_v4().simple());
     let applied_edits = apply_proposal(&mut state, &baseline, &proposal, scope);
     let created_at = Utc::now().to_rfc3339();
@@ -346,9 +389,11 @@ pub async fn refine(
         created_at,
         result: Some(result.clone()),
     });
+    state.schema = 2;
+    state.generation = state.generation.saturating_add(1);
     write_json(&state_path, &state).await?;
     set_private_permissions(&state_path).await?;
-    append_history(&root, &history_path, &result).await?;
+    append_history(storage_root, &history_path, &result).await?;
     Ok(result)
 }
 
@@ -371,70 +416,334 @@ fn history_path_for_state(state_path: &Path) -> Result<PathBuf> {
 ///
 /// Returns a safe-path, JSON, or I/O error while loading either harness store.
 pub async fn load_harness_context(state_root: &Path, session_id: &str) -> Result<String> {
-    validate_options(session_id, &RefineOptions::default())?;
-    let root = canonical_state_root(state_root);
-    let global = load_state(
-        &root,
-        &harness_state_path(&root, session_id, HarnessScope::Global),
-    )
-    .await?;
-    let local = load_state(
-        &root,
-        &harness_state_path(&root, session_id, HarnessScope::Local),
-    )
-    .await?;
-    Ok(format_harness_context(&global, &local))
+    load_harness_context_for_workspace(state_root, state_root, session_id, None).await
 }
 
-fn format_harness_context(global: &HarnessState, local: &HarnessState) -> String {
+/// Loads all continual-learning layers for a workspace. The optional query is
+/// used to rank applicable entries while enforcing a fixed context budget.
+///
+/// # Errors
+///
+/// Returns an error for unsafe state paths, malformed persisted state, or an
+/// invalid session identifier or signed fleet pack.
+pub async fn load_harness_context_for_workspace(
+    state_root: &Path,
+    workspace: &Path,
+    session_id: &str,
+    query: Option<&str>,
+) -> Result<String> {
+    validate_options(session_id, &RefineOptions::default())?;
+    let root = canonical_state_root(state_root);
+    let project_root = learning::discover_project_root(workspace)?;
+    let user = load_state(
+        &root,
+        &harness_state_path(&root, &project_root, session_id, HarnessScope::User),
+    )
+    .await?;
+    let session = load_state(
+        &root,
+        &harness_state_path(&root, &project_root, session_id, HarnessScope::Session),
+    )
+    .await?;
+    let project_path = harness_state_path(&root, &project_root, session_id, HarnessScope::Project);
+    let project = if project_path.exists() {
+        load_state(&project_root, &project_path).await?
+    } else {
+        HarnessState::default()
+    };
+    let learning_state = learning::load_learning_state(&project_root).await?;
+    let project = merge_active_candidates(project, &learning_state.candidates);
+    let fleet = learning::load_fleet_pack(&root, learning_state.pinned_fleet_version.as_deref())
+        .await?
+        .map_or_else(HarnessState::default, |pack| {
+            fleet_harness_state(&pack.pack)
+        });
+    Ok(format_harness_context(
+        &fleet, &user, &project, &session, query,
+    ))
+}
+
+fn format_harness_context(
+    fleet: &HarnessState,
+    user: &HarnessState,
+    project: &HarnessState,
+    session: &HarnessState,
+    query: Option<&str>,
+) -> String {
     let mut lines = vec![
         "## Continual Harness".to_owned(),
-        "Use these persisted prompt notes, memories, skills, and subagent specifications as reusable context. Local entries take precedence for this session.".to_owned(),
+        "Use these persisted prompt notes, memories, skills, and subagent specifications as reusable context. More specific scopes take precedence: session, project, user, then fleet.".to_owned(),
     ];
-    for (scope, state) in [(HarnessScope::Global, global), (HarnessScope::Local, local)] {
+    let mut selected = BTreeMap::<(String, String), (HarnessScope, HarnessEntry)>::new();
+    for (scope, state) in [
+        (HarnessScope::Fleet, fleet),
+        (HarnessScope::User, user),
+        (HarnessScope::Project, project),
+        (HarnessScope::Session, session),
+    ] {
         for kind in [
             RefinementKind::Prompt,
             RefinementKind::Memory,
             RefinementKind::Skill,
             RefinementKind::Subagent,
         ] {
-            for entry in state.entries.records(kind).values().take(6) {
-                let content = compact_text(&entry.content, 180);
-                lines.push(format!(
-                    "- [{} {}:{}] {} ({} v{}): {content}",
-                    scope.as_str(),
-                    kind.as_str(),
-                    entry.id,
-                    entry.title,
-                    entry.path,
-                    entry.version
-                ));
-                if kind == RefinementKind::Skill {
-                    if !entry.reference.is_empty() {
-                        lines.push(format!(
-                            "  reference: {}",
-                            serde_json::Value::Object(
-                                entry.reference.clone().into_iter().collect()
-                            )
-                        ));
-                    }
-                    if !entry.arguments.is_empty() {
-                        lines.push(format!(
-                            "  arguments: {}",
-                            serde_json::Value::Object(
-                                entry.arguments.clone().into_iter().collect()
-                            )
-                        ));
-                    }
-                }
+            for entry in state.entries.records(kind).values() {
+                selected.insert(
+                    (kind.as_str().into(), entry.id.clone()),
+                    (scope, entry.clone()),
+                );
             }
         }
+    }
+    let mut ranked = selected.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        relevance_score(&right.1, right.0, query)
+            .cmp(&relevance_score(&left.1, left.0, query))
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    let mut used_chars = lines.iter().map(String::len).sum::<usize>();
+    for (scope, entry) in ranked.into_iter().take(MAX_HARNESS_CONTEXT_ENTRIES) {
+        let content = compact_text(&entry.content, 360);
+        let mut block = vec![format!(
+            "- [{} {}:{}] {} ({} v{}): {content}",
+            scope.as_str(),
+            entry.kind.as_str(),
+            entry.id,
+            entry.title,
+            entry.path,
+            entry.version
+        )];
+        if entry.kind == RefinementKind::Skill {
+            if !entry.reference.is_empty() {
+                block.push(format!(
+                    "  reference: {}",
+                    serde_json::Value::Object(entry.reference.into_iter().collect())
+                ));
+            }
+            if !entry.arguments.is_empty() {
+                block.push(format!(
+                    "  arguments: {}",
+                    serde_json::Value::Object(entry.arguments.into_iter().collect())
+                ));
+            }
+        }
+        let block_chars = block.iter().map(String::len).sum::<usize>() + block.len();
+        if used_chars.saturating_add(block_chars) > MAX_HARNESS_CONTEXT_CHARS {
+            continue;
+        }
+        used_chars = used_chars.saturating_add(block_chars);
+        lines.extend(block);
     }
     if lines.len() == 2 {
         String::new()
     } else {
         lines.join("\n")
     }
+}
+
+async fn load_inherited_state(
+    root: &Path,
+    project_root: &Path,
+    session_id: &str,
+    target_scope: HarnessScope,
+) -> Result<Option<HarnessState>> {
+    let mut inherited = HarnessState::default();
+    let scopes: &[HarnessScope] = match target_scope {
+        HarnessScope::Session => &[
+            HarnessScope::Fleet,
+            HarnessScope::User,
+            HarnessScope::Project,
+        ],
+        HarnessScope::Project => &[HarnessScope::Fleet, HarnessScope::User],
+        HarnessScope::User => &[HarnessScope::Fleet],
+        HarnessScope::Fleet => &[],
+    };
+    for scope in scopes {
+        let state = if *scope == HarnessScope::Fleet {
+            learning::load_active_fleet_pack(root)
+                .await?
+                .map_or_else(HarnessState::default, |pack| {
+                    fleet_harness_state(&pack.pack)
+                })
+        } else {
+            let path = harness_state_path(root, project_root, session_id, *scope);
+            load_state(storage_root_for_scope(root, project_root, *scope), &path).await?
+        };
+        merge_entries(&mut inherited.entries, state.entries);
+    }
+    Ok((!harness_entries_empty(&inherited.entries)).then_some(inherited))
+}
+
+fn storage_root_for_scope<'a>(
+    state_root: &'a Path,
+    project_root: &'a Path,
+    scope: HarnessScope,
+) -> &'a Path {
+    match scope {
+        HarnessScope::Project => project_root,
+        HarnessScope::Session | HarnessScope::User | HarnessScope::Fleet => state_root,
+    }
+}
+
+fn fleet_harness_state(pack: &FleetLearningPack) -> HarnessState {
+    let revoked = pack
+        .revoked_entry_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut state = HarnessState::default();
+    for entry in &pack.entries {
+        if revoked.contains(entry.id.as_str()) {
+            continue;
+        }
+        let mut metadata = entry.metadata.clone();
+        metadata.insert(
+            "applicability_tags".into(),
+            serde_json::json!(entry.applicability.tags),
+        );
+        metadata.insert(
+            "applicability_languages".into(),
+            serde_json::json!(entry.applicability.languages),
+        );
+        let harness_entry = HarnessEntry {
+            id: entry.id.clone(),
+            kind: entry.kind,
+            title: entry.title.clone(),
+            content: entry.content.clone(),
+            path: entry.path.clone(),
+            scope: HarnessScope::Fleet,
+            reference: entry.reference.clone(),
+            arguments: entry.arguments.clone(),
+            metadata,
+            source: format!("fleet:{}", pack.version),
+            created_at: pack.created_at.to_rfc3339(),
+            updated_at: pack.created_at.to_rfc3339(),
+            version: 1,
+        };
+        state
+            .entries
+            .records_mut(entry.kind)
+            .insert(entry.id.clone(), harness_entry);
+    }
+    state
+}
+
+fn merge_active_candidates(
+    mut state: HarnessState,
+    candidates: &[LearningCandidate],
+) -> HarnessState {
+    for candidate in candidates.iter().filter(|candidate| {
+        matches!(
+            candidate.status,
+            CandidateStatus::Canary | CandidateStatus::Active
+        )
+    }) {
+        for edit in &candidate.edits {
+            let id = edit
+                .id
+                .clone()
+                .unwrap_or_else(|| slug(edit.title.as_deref().unwrap_or("entry")));
+            if edit.action == RefinementAction::Delete {
+                state.entries.records_mut(edit.kind).remove(&id);
+                continue;
+            }
+            if !matches!(
+                edit.action,
+                RefinementAction::Create | RefinementAction::Update
+            ) {
+                continue;
+            }
+            let existing = state.entries.records(edit.kind).get(&id);
+            let Some(title) = edit
+                .title
+                .clone()
+                .or_else(|| existing.map(|entry| entry.title.clone()))
+            else {
+                continue;
+            };
+            let Some(content) = edit
+                .content
+                .clone()
+                .or_else(|| existing.map(|entry| entry.content.clone()))
+            else {
+                continue;
+            };
+            let now = candidate.updated_at.to_rfc3339();
+            let mut metadata = edit.metadata.clone().unwrap_or_default();
+            metadata.insert(
+                "applicability_tags".into(),
+                serde_json::json!(candidate.applicability.tags),
+            );
+            metadata.insert(
+                "applicability_languages".into(),
+                serde_json::json!(candidate.applicability.languages),
+            );
+            let entry = HarnessEntry {
+                id: id.clone(),
+                kind: edit.kind,
+                title,
+                content,
+                path: edit.path.clone().unwrap_or_else(|| "general".into()),
+                scope: HarnessScope::Project,
+                reference: edit.reference.clone().unwrap_or_default(),
+                arguments: edit.arguments.clone().unwrap_or_default(),
+                metadata,
+                source: format!("learning:{}", candidate.id),
+                created_at: candidate.created_at.to_rfc3339(),
+                updated_at: now,
+                version: existing.map_or(1, |entry| entry.version.saturating_add(1)),
+            };
+            state.entries.records_mut(edit.kind).insert(id, entry);
+        }
+    }
+    state
+}
+
+fn merge_entries(target: &mut HarnessEntries, source: HarnessEntries) {
+    target.prompt.extend(source.prompt);
+    target.memory.extend(source.memory);
+    target.skill.extend(source.skill);
+    target.subagent.extend(source.subagent);
+}
+
+fn harness_entries_empty(entries: &HarnessEntries) -> bool {
+    entries.prompt.is_empty()
+        && entries.memory.is_empty()
+        && entries.skill.is_empty()
+        && entries.subagent.is_empty()
+}
+
+fn relevance_score(entry: &HarnessEntry, scope: HarnessScope, query: Option<&str>) -> u32 {
+    let scope_score = match scope {
+        HarnessScope::Session => 400,
+        HarnessScope::Project => 300,
+        HarnessScope::User => 200,
+        HarnessScope::Fleet => 100,
+    };
+    let priority = entry
+        .metadata
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value.min(100)).ok())
+        .unwrap_or(0);
+    let Some(query) = query.map(str::to_ascii_lowercase) else {
+        return scope_score + priority;
+    };
+    let haystack = format!(
+        "{} {} {} {}",
+        entry.title,
+        entry.path,
+        entry.content,
+        serde_json::to_string(&entry.metadata).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let matches = query
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .filter(|token| haystack.contains(token))
+        .count();
+    scope_score + priority + u32::try_from(matches.min(20)).unwrap_or(20) * 25
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
@@ -482,7 +791,7 @@ fn validate_options(session_id: &str, options: &RefineOptions<'_>) -> Result<()>
 async fn refinement_prompt(
     runtime: &AgentRuntime,
     state: &HarnessState,
-    global_context: Option<&HarnessState>,
+    inherited_context: Option<&HarnessState>,
     history: &[RefinementResult],
     instructions: Option<&str>,
     scope: HarnessScope,
@@ -490,17 +799,19 @@ async fn refinement_prompt(
     let messages = runtime.messages_snapshot().await;
     let trajectory = suffix_chars(&serde_json::to_string(&messages)?, 80_000);
     let current_state = serde_json::to_string(state)?;
-    let global_context = global_context
+    let inherited_context = inherited_context
         .map(serde_json::to_string)
         .transpose()?
         .unwrap_or_else(|| "null".into());
     let history = serde_json::to_string(&history[history.len().saturating_sub(20)..])?;
     let scope = match scope {
-        HarnessScope::Local => "local session",
-        HarnessScope::Global => "global cross-session",
+        HarnessScope::Session => "session scratch",
+        HarnessScope::Project => "project across sessions",
+        HarnessScope::User => "user across projects",
+        HarnessScope::Fleet => "signed fleet pack",
     };
     Ok(format!(
-        "<current_harness_state>\n{current_state}\n</current_harness_state>\n\n<global_read_only_context>\n{global_context}\n</global_read_only_context>\n\n<refinement_history>\n{history}\n</refinement_history>\n\n<conversation>\n{trajectory}\n</conversation>\n\n<scope>{scope}</scope>\n\n<user_refine_instructions>{}</user_refine_instructions>\n\nReturn JSON only.",
+        "<current_harness_state>\n{current_state}\n</current_harness_state>\n\n<inherited_read_only_context>\n{inherited_context}\n</inherited_read_only_context>\n\n<refinement_history>\n{history}\n</refinement_history>\n\n<conversation>\n{trajectory}\n</conversation>\n\n<scope>{scope}</scope>\n\n<user_refine_instructions>{}</user_refine_instructions>\n\nReturn JSON only.",
         instructions.unwrap_or_default()
     ))
 }
@@ -716,6 +1027,10 @@ fn validate_edit(edit: &RefinementEdit, id: &str) -> Option<String> {
 fn strip_scope_prefix(id: &str) -> &str {
     id.strip_prefix("local:")
         .or_else(|| id.strip_prefix("global:"))
+        .or_else(|| id.strip_prefix("session:"))
+        .or_else(|| id.strip_prefix("project:"))
+        .or_else(|| id.strip_prefix("user:"))
+        .or_else(|| id.strip_prefix("fleet:"))
         .unwrap_or(id)
 }
 
@@ -798,10 +1113,11 @@ fn rollback_proposal(target: &RefinementResult) -> RefinementProposal {
 
 fn rollback_target_path(
     root: &Path,
+    project_root: &Path,
     session_id: &str,
     target: &RefinementResult,
 ) -> Result<(HarnessScope, PathBuf)> {
-    let fallback = harness_state_path(root, session_id, target.scope);
+    let fallback = harness_state_path(root, project_root, session_id, target.scope);
     let path = if target.harness_state_path.trim().is_empty() {
         fallback
     } else {
@@ -812,7 +1128,10 @@ fn rollback_target_path(
             root.join(recorded)
         }
     };
-    if !path.starts_with(root.join("harness"))
+    let allowed_state = path.starts_with(root.join("harness"));
+    let allowed_project = path.starts_with(learning::project_learning_dir(project_root));
+    let allowed_fleet = path.starts_with(learning::fleet_root(root));
+    if !(allowed_state || allowed_project || allowed_fleet)
         || path.file_name().and_then(std::ffi::OsStr::to_str) != Some("harness_state.json")
     {
         return Err(MimirError::Session {
@@ -820,20 +1139,35 @@ fn rollback_target_path(
             message: "recorded refinement path escapes the configured harness root".into(),
         });
     }
-    let global_path = harness_state_path(root, session_id, HarnessScope::Global);
-    let scope = if path == global_path {
-        HarnessScope::Global
+    let user_path = harness_state_path(root, project_root, session_id, HarnessScope::User);
+    let project_path = harness_state_path(root, project_root, session_id, HarnessScope::Project);
+    let fleet_path = harness_state_path(root, project_root, session_id, HarnessScope::Fleet);
+    let scope = if path == user_path {
+        HarnessScope::User
+    } else if path == project_path {
+        HarnessScope::Project
+    } else if path == fleet_path {
+        HarnessScope::Fleet
     } else {
-        HarnessScope::Local
+        HarnessScope::Session
     };
     Ok((scope, path))
 }
 
-async fn load_all_history(root: &Path, session_id: &str) -> Result<Vec<RefinementResult>> {
+async fn load_all_history(
+    root: &Path,
+    project_root: &Path,
+    session_id: &str,
+) -> Result<Vec<RefinementResult>> {
     let mut history = Vec::new();
-    for scope in [HarnessScope::Global, HarnessScope::Local] {
-        let state_path = harness_state_path(root, session_id, scope);
-        let state = load_state(root, &state_path).await?;
+    for scope in [
+        HarnessScope::User,
+        HarnessScope::Project,
+        HarnessScope::Session,
+    ] {
+        let state_path = harness_state_path(root, project_root, session_id, scope);
+        let storage_root = storage_root_for_scope(root, project_root, scope);
+        let state = load_state(storage_root, &state_path).await?;
         for result in state
             .refinements
             .into_iter()
@@ -841,8 +1175,8 @@ async fn load_all_history(root: &Path, session_id: &str) -> Result<Vec<Refinemen
         {
             upsert_history(&mut history, result);
         }
-        let history_path = refinement_history_path(root, session_id, scope);
-        for result in load_history(root, &history_path).await? {
+        let history_path = refinement_history_path(root, project_root, session_id, scope);
+        for result in load_history(storage_root, &history_path).await? {
             upsert_history(&mut history, result);
         }
     }
@@ -871,8 +1205,13 @@ fn upsert_history(history: &mut Vec<RefinementResult>, result: RefinementResult)
     }
 }
 
-async fn find_history_result(root: &Path, session_id: &str, id: &str) -> Result<RefinementResult> {
-    if let Some(result) = load_all_history(root, session_id)
+async fn find_history_result(
+    root: &Path,
+    project_root: &Path,
+    session_id: &str,
+    id: &str,
+) -> Result<RefinementResult> {
+    if let Some(result) = load_all_history(root, project_root, session_id)
         .await?
         .into_iter()
         .find(|result| result.id == id)
@@ -928,18 +1267,33 @@ async fn append_history(root: &Path, path: &Path, result: &RefinementResult) -> 
     Ok(())
 }
 
-fn harness_state_path(root: &Path, session_id: &str, scope: HarnessScope) -> PathBuf {
-    harness_dir(root, session_id, scope).join("harness_state.json")
+fn harness_state_path(
+    root: &Path,
+    project_root: &Path,
+    session_id: &str,
+    scope: HarnessScope,
+) -> PathBuf {
+    harness_dir(root, project_root, session_id, scope).join("harness_state.json")
 }
 
-fn refinement_history_path(root: &Path, session_id: &str, scope: HarnessScope) -> PathBuf {
-    harness_dir(root, session_id, scope).join("refinements.jsonl")
+fn refinement_history_path(
+    root: &Path,
+    project_root: &Path,
+    session_id: &str,
+    scope: HarnessScope,
+) -> PathBuf {
+    harness_dir(root, project_root, session_id, scope).join("refinements.jsonl")
 }
 
-fn harness_dir(root: &Path, session_id: &str, scope: HarnessScope) -> PathBuf {
+fn harness_dir(root: &Path, project_root: &Path, session_id: &str, scope: HarnessScope) -> PathBuf {
     match scope {
-        HarnessScope::Local => root.join("harness/sessions").join(session_id),
-        HarnessScope::Global => root.join("harness/global"),
+        HarnessScope::Session => root.join("harness/sessions").join(session_id),
+        HarnessScope::Project => project_harness_path(project_root)
+            .parent()
+            .unwrap_or(project_root)
+            .to_path_buf(),
+        HarnessScope::User => root.join("harness/global"),
+        HarnessScope::Fleet => root.join("learning/fleet/active/harness"),
     }
 }
 

@@ -211,6 +211,18 @@ fn parses_extended_reference_commands_and_side_alias() {
             arguments: Some("--global retain provider lessons".into()),
         })
     );
+    assert_eq!(
+        parse_slash_command("/refine --scope project retain repository lessons"),
+        Some(SlashCommand::Refine {
+            arguments: Some("--scope project retain repository lessons".into()),
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/learn feedback yes"),
+        Some(SlashCommand::Learn {
+            arguments: Some("feedback yes".into()),
+        })
+    );
     assert_eq!(parse_slash_command("/copy"), Some(SlashCommand::Copy));
     for command in ["/btw is the build green?", "/side is the build green?"] {
         assert_eq!(

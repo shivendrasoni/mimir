@@ -51,6 +51,7 @@ struct SideQuestionRun {
 /// operations.
 pub struct RuntimeOperations {
     state_root: PathBuf,
+    workspace: PathBuf,
     side_questions: Mutex<HashMap<SideQuestionKey, SideQuestionRun>>,
     branch_summaries: Mutex<HashMap<String, CancellationToken>>,
     bash_sessions: Mutex<HashSet<String>>,
@@ -58,9 +59,16 @@ pub struct RuntimeOperations {
 
 impl RuntimeOperations {
     #[must_use]
+    #[cfg(test)]
     pub fn new(state_root: PathBuf) -> Self {
+        Self::with_workspace(state_root.clone(), state_root)
+    }
+
+    #[must_use]
+    pub fn with_workspace(state_root: PathBuf, workspace: PathBuf) -> Self {
         Self {
             state_root,
+            workspace,
             side_questions: Mutex::new(HashMap::new()),
             branch_summaries: Mutex::new(HashMap::new()),
             bash_sessions: Mutex::new(HashSet::new()),
@@ -345,6 +353,17 @@ impl RuntimeOperations {
         let instructions = optional_bounded_string(command, "instructions")?;
         let rollback_id = optional_bounded_string(command, "rollbackId")?;
         let global = optional_bool(command, "global")?.unwrap_or(false);
+        let scope = optional_bounded_string(command, "scope")?
+            .map(|value| {
+                refinement::HarnessScope::parse(value)
+                    .ok_or_else(|| DaemonError::Protocol("invalid refinement scope".into()))
+            })
+            .transpose()?;
+        if scope == Some(refinement::HarnessScope::Fleet) {
+            return Err(DaemonError::Protocol(
+                "fleet learning packs are read-only".into(),
+            ));
+        }
         let result = refinement::refine(
             runtime.as_ref(),
             &self.state_root,
@@ -353,6 +372,8 @@ impl RuntimeOperations {
                 instructions,
                 rollback_id,
                 global,
+                scope,
+                workspace: Some(&self.workspace),
             },
         )
         .await
@@ -364,9 +385,14 @@ impl RuntimeOperations {
             .map_err(protocol)?;
         runtime
             .set_harness_context(
-                refinement::load_harness_context(&self.state_root, session_id)
-                    .await
-                    .map_err(protocol)?,
+                refinement::load_harness_context_for_workspace(
+                    &self.state_root,
+                    &self.workspace,
+                    session_id,
+                    None,
+                )
+                .await
+                .map_err(protocol)?,
             )
             .await;
         Ok(value)

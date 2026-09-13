@@ -277,7 +277,7 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
         value["id"] == "refine"
     });
     assert_eq!(refined["success"], true);
-    assert_eq!(refined["data"]["scope"], "local");
+    assert_eq!(refined["data"]["scope"], "session");
     assert_eq!(refined["data"]["appliedEdits"][0]["applied"], true);
     let refinement_id = refined["data"]["id"]
         .as_str()
@@ -297,7 +297,7 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
             .expect("harness JSON");
     assert_eq!(
         harness["entries"]["memory"]["rust_migration"]["scope"],
-        "local"
+        "session"
     );
     assert_eq!(harness["entries"]["memory"]["rust_migration"]["version"], 1);
 

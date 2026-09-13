@@ -24,6 +24,7 @@ use crossterm::{
 use crate::{
     auth::{AuthStore, DeviceAuthorization, OAuthProvider, PendingOAuth},
     error::Result,
+    learning::{self, LearningMode},
     mcp::{McpAuthCoordinator, McpOAuthAuthorization, McpOAuthClient, McpOAuthCodeReceiver},
     model::{Content, Message, Role, Usage},
     orchestration::{
@@ -303,6 +304,11 @@ struct TuiSink {
 #[async_trait]
 pub trait TuiRuntimeFactory: Send + Sync {
     async fn build(&self, model: &str, session: &str) -> Result<Arc<AgentRuntime>>;
+
+    /// Returns the canonical workspace whose marker owns project learning.
+    fn workspace_root(&self) -> Option<PathBuf> {
+        None
+    }
 
     /// Returns the command permission mode used when building runtimes.
     fn agent_mode(&self) -> AgentMode {
@@ -899,8 +905,18 @@ pub async fn run_tui_with_autonomous(
                     let runtime = runtime.clone();
                     let app_for_run = app.clone();
                     let autonomous = autonomous.clone();
+                    let learning_workspace = runtime_factory.workspace_root();
+                    let learning_session = session.clone();
                     tokio::spawn(async move {
-                        run_tui_prompt_loop(runtime, app_for_run, autonomous, message).await;
+                        run_tui_prompt_loop(
+                            runtime,
+                            app_for_run,
+                            autonomous,
+                            message,
+                            learning_workspace,
+                            learning_session,
+                        )
+                        .await;
                     });
                 }
                 if let Some(request) = ui_request {
@@ -1011,6 +1027,8 @@ async fn run_tui_prompt_loop(
     app: Arc<Mutex<App>>,
     autonomous: Arc<Mutex<AutonomousState>>,
     message: Message,
+    learning_workspace: Option<PathBuf>,
+    learning_session: String,
 ) {
     let generation = autonomous
         .lock()
@@ -1025,6 +1043,27 @@ async fn run_tui_prompt_loop(
             .await
             .is_err()
         {
+            if let Some(workspace) = &learning_workspace
+                && let Ok(state) =
+                    learning::record_runtime_failure(workspace, &learning_session).await
+                && state.mode == LearningMode::Auto
+            {
+                match learning::propose_project_candidate(&runtime, workspace).await {
+                    Ok(candidate) => app
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_system_message(format!(
+                            "Automatic learning candidate {} is {:?}: {}",
+                            candidate.id, candidate.status, candidate.summary
+                        )),
+                    Err(error) => app
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_system_message(format!(
+                            "Automatic learning proposal failed safely: {error}"
+                        )),
+                }
+            }
             app.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_run_active(false);
@@ -1070,6 +1109,17 @@ async fn run_tui_prompt_loop(
             app.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push_system_message(status);
+        }
+        if let Some(workspace) = learning_workspace
+            && learning::request_feedback_if_informative(&workspace)
+                .await
+                .unwrap_or(false)
+        {
+            app.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_system_message(
+                    "Did this achieve the goal? Use /learn feedback yes or /learn feedback no.",
+                );
         }
         app.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1275,7 +1325,25 @@ async fn dispatch_coordinator_action(
         } => manage_tui_heartbeat(runtime, state_root, session, *id, *action).await,
         TuiAction::Refine { arguments } => {
             let session = active_session(runtime_key.as_ref())?;
-            run_tui_refinement(runtime, state_root, session, arguments.as_deref()).await
+            run_tui_refinement(
+                runtime,
+                state_root,
+                runtime_factory.workspace_root().as_deref(),
+                session,
+                arguments.as_deref(),
+            )
+            .await
+        }
+        TuiAction::Learn { arguments } => {
+            let session = active_session(runtime_key.as_ref())?;
+            run_tui_learning(
+                runtime,
+                state_root,
+                runtime_factory.workspace_root().as_deref(),
+                session,
+                arguments.as_deref(),
+            )
+            .await
         }
         TuiAction::ShowChangelog => show_tui_changelog(state_root).await.map(Some),
         TuiAction::ShowSystemPrompt => {
@@ -1411,14 +1479,37 @@ async fn invoke_tui_extension(
 async fn run_tui_refinement(
     runtime: &AgentRuntime,
     state_root: &Path,
+    workspace: Option<&Path>,
     session: &str,
     arguments: Option<&str>,
 ) -> Result<Option<String>> {
     let mut rest = arguments.unwrap_or_default().trim();
     let mut global = false;
+    let mut scope = None;
     if let Some(value) = strip_command_option(rest, "--global") {
         global = true;
         rest = value;
+    }
+    if let Some(value) = strip_command_option(rest, "--scope") {
+        let split = value.find(char::is_whitespace).unwrap_or(value.len());
+        let requested = &value[..split];
+        let remaining = value[split..].trim_start();
+        if requested.is_empty() {
+            return Err(crate::error::MimirError::Configuration(
+                "Usage: /refine --scope <session|project|user> [instructions]".into(),
+            ));
+        }
+        scope = Some(refinement::HarnessScope::parse(requested).ok_or_else(|| {
+            crate::error::MimirError::Configuration(
+                "refine scope must be session, project, or user; fleet is read-only".into(),
+            )
+        })?);
+        if scope == Some(refinement::HarnessScope::Fleet) {
+            return Err(crate::error::MimirError::Configuration(
+                "fleet learning packs are read-only".into(),
+            ));
+        }
+        rest = remaining;
     }
     let mut rollback_id = None;
     let mut instructions = (!rest.is_empty()).then_some(rest);
@@ -1449,6 +1540,8 @@ async fn run_tui_refinement(
             instructions,
             rollback_id,
             global,
+            scope,
+            workspace,
         },
     )
     .await?;
@@ -1456,7 +1549,15 @@ async fn run_tui_refinement(
         .record_runtime_event("refinement", &serde_json::to_string(&result)?)
         .await?;
     runtime
-        .set_harness_context(refinement::load_harness_context(state_root, session).await?)
+        .set_harness_context(
+            refinement::load_harness_context_for_workspace(
+                state_root,
+                workspace.unwrap_or(state_root),
+                session,
+                None,
+            )
+            .await?,
+        )
         .await;
     let applied = result
         .applied_edits
@@ -1467,6 +1568,174 @@ async fn run_tui_refinement(
         "Refinement {} complete: {} ({applied} edits applied)",
         result.id, result.summary
     )))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the learning command dispatcher keeps one exhaustive command-to-coordinator mapping"
+)]
+async fn run_tui_learning(
+    runtime: &AgentRuntime,
+    state_root: &Path,
+    workspace: Option<&Path>,
+    session: &str,
+    arguments: Option<&str>,
+) -> Result<Option<String>> {
+    let workspace = workspace.unwrap_or(state_root);
+    let arguments = arguments.unwrap_or("status").trim();
+    let (command, rest) = arguments
+        .split_once(char::is_whitespace)
+        .map_or((arguments, ""), |(command, rest)| (command, rest.trim()));
+    let output = match command {
+        "" | "status" => {
+            serde_json::to_string_pretty(&learning::learning_status(workspace, state_root).await?)?
+        }
+        "candidates" => {
+            let root = learning::discover_project_root(workspace)?;
+            let state = learning::load_learning_state(&root).await?;
+            serde_json::to_string_pretty(&state.candidates)?
+        }
+        "propose" => {
+            let candidate = learning::propose_project_candidate(runtime, workspace).await?;
+            runtime
+                .set_harness_context(
+                    refinement::load_harness_context_for_workspace(
+                        state_root,
+                        workspace,
+                        session,
+                        Some(&candidate.summary),
+                    )
+                    .await?,
+                )
+                .await;
+            format!(
+                "Learning candidate {} is {:?}: {}. Did this achieve the goal? Use /learn feedback yes or /learn feedback no.",
+                candidate.id, candidate.status, candidate.summary
+            )
+        }
+        "feedback" => {
+            let achieved = match rest {
+                "yes" => true,
+                "no" => false,
+                _ => {
+                    return Err(crate::error::MimirError::Configuration(
+                        "Usage: /learn feedback <yes|no>".into(),
+                    ));
+                }
+            };
+            learning::record_feedback(workspace, session, achieved, None).await?;
+            runtime
+                .set_harness_context(
+                    refinement::load_harness_context_for_workspace(
+                        state_root, workspace, session, None,
+                    )
+                    .await?,
+                )
+                .await;
+            if achieved {
+                "Feedback recorded as verified success".into()
+            } else {
+                "Feedback recorded as verified failure; the candidate was quarantined".into()
+            }
+        }
+        "rollback" => {
+            let id = Uuid::parse_str(rest).map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "Usage: /learn rollback <candidate-id>".into(),
+                )
+            })?;
+            learning::rollback_candidate(workspace, id).await?;
+            runtime
+                .set_harness_context(
+                    refinement::load_harness_context_for_workspace(
+                        state_root, workspace, session, None,
+                    )
+                    .await?,
+                )
+                .await;
+            format!("Learning candidate {id} rolled back")
+        }
+        "mode" => {
+            let mode = match rest {
+                "off" => LearningMode::Off,
+                "observe" => LearningMode::Observe,
+                "auto" => LearningMode::Auto,
+                _ => {
+                    return Err(crate::error::MimirError::Configuration(
+                        "Usage: /learn mode <off|observe|auto>".into(),
+                    ));
+                }
+            };
+            learning::set_mode(workspace, mode).await?;
+            format!("Project learning mode set to {mode:?}").to_ascii_lowercase()
+        }
+        "contribution" => {
+            let enabled = match rest {
+                "enable" => true,
+                "disable" => false,
+                _ => {
+                    return Err(crate::error::MimirError::Configuration(
+                        "Usage: /learn contribution <enable|disable>".into(),
+                    ));
+                }
+            };
+            learning::set_contribution(workspace, enabled).await?;
+            format!(
+                "Redacted fleet contribution {}",
+                if enabled { "enabled" } else { "disabled" }
+            )
+        }
+        "check" => format!(
+            "Fleet learning transport: endpoint={}, public_key={}, active_pack={}",
+            std::env::var_os("MIMIR_LEARNING_PACK_URL").is_some(),
+            std::env::var_os("MIMIR_LEARNING_PUBLIC_KEY").is_some(),
+            learning::load_active_fleet_pack(state_root)
+                .await?
+                .map_or_else(|| "none".into(), |item| item.pack.version)
+        ),
+        "update" => {
+            let endpoint = std::env::var("MIMIR_LEARNING_PACK_URL").map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "MIMIR_LEARNING_PACK_URL is not configured".into(),
+                )
+            })?;
+            let key = std::env::var("MIMIR_LEARNING_PUBLIC_KEY").map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "MIMIR_LEARNING_PUBLIC_KEY is not configured".into(),
+                )
+            })?;
+            let path = learning::fetch_and_install_signed_pack(state_root, &endpoint, &key).await?;
+            format!("Fleet learning pack activated at {}", path.display())
+        }
+        "submit" => {
+            let id = Uuid::parse_str(rest).map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "Usage: /learn submit <candidate-id>".into(),
+                )
+            })?;
+            let endpoint = std::env::var("MIMIR_LEARNING_CONTRIBUTION_URL").map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "MIMIR_LEARNING_CONTRIBUTION_URL is not configured".into(),
+                )
+            })?;
+            learning::submit_fleet_contribution(workspace, &endpoint, id).await?;
+            format!("Redacted learning candidate {id} submitted")
+        }
+        "pin" => {
+            learning::pin_fleet_version(workspace, (!rest.is_empty()).then_some(rest)).await?;
+            if rest.is_empty() {
+                "Fleet learning pack unpinned".into()
+            } else {
+                format!("Fleet learning pack pinned to {rest}")
+            }
+        }
+        _ => {
+            return Err(crate::error::MimirError::Configuration(
+                "Usage: /learn [status|candidates|propose|feedback yes|no|rollback <id>|mode off|observe|auto|contribution enable|disable|check|update|submit <id>|pin [version]]".into(),
+            ));
+        }
+    };
+    Ok(Some(output))
 }
 
 async fn refresh_extension_commands(runtime: &AgentRuntime, app: &Arc<Mutex<App>>) {
@@ -3012,6 +3281,7 @@ pub async fn dispatch_runtime_action(
         | TuiAction::Reload
         | TuiAction::Mcp(_)
         | TuiAction::Refine { .. }
+        | TuiAction::Learn { .. }
         | TuiAction::SideQuestion { .. }
         | TuiAction::ExportSession { .. }
         | TuiAction::ImportSession { .. }
@@ -3602,6 +3872,8 @@ mod local_command_tests {
                     byte_size: 5,
                 }],
             ),
+            None,
+            "default".into(),
         )
         .await;
 

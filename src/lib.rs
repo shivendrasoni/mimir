@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod error;
 pub mod extensions;
+pub mod learning;
 pub mod mcp;
 pub mod migration;
 pub mod model;

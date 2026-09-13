@@ -53,6 +53,9 @@ pub enum SlashCommand {
     Refine {
         arguments: Option<String>,
     },
+    Learn {
+        arguments: Option<String>,
+    },
     Copy,
     SideQuestion {
         question: String,
@@ -140,6 +143,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "refine" => Some(SlashCommand::Refine {
             arguments: argument,
         }),
+        "learn" | "learning" => Some(SlashCommand::Learn {
+            arguments: argument,
+        }),
         "copy" => Some(no_argument(command, arguments, SlashCommand::Copy)),
         "btw" | "side" => Some(if arguments.is_empty() {
             SlashCommand::Invalid {
@@ -204,12 +210,17 @@ pub(super) fn builtin_command_usage(command: &str) -> Option<&'static str> {
         "heartbeat" => Some("/heartbeat [--every <interval>] [--steer|--follow-up] <instruction>"),
         "import" => Some("/import <path.jsonl>"),
         "login" => Some("/login [provider]"),
+        "learn" | "learning" => Some(
+            "/learn [status|candidates|propose|feedback yes|no|rollback <id>|mode off|observe|auto|contribution enable|disable|check|update|submit <id>|pin [version]]",
+        ),
         "logout" => Some("/logout [provider]"),
         "mcp" => Some("/mcp [list|login <name>|logout <name>]"),
         "model" => Some("/model [provider/model]"),
         "mode" => Some("/mode [default|auto]"),
         "name" | "rename" => Some("/name [name]"),
-        "refine" => Some("/refine [instructions|rollback <refinement-id>]"),
+        "refine" => {
+            Some("/refine [--scope session|project|user] [instructions|rollback <refinement-id>]")
+        }
         "resume" => Some("/resume [session]"),
         "rlm-max-depth" => Some("/rlm-max-depth [<non-negative integer> [--global]]"),
         "sessions" => Some("/sessions [id]"),

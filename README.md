@@ -7,7 +7,7 @@ The RLM runtime is built for long-running, inspectable work:
 - **Recursive execution:** `rlm_run` admits a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
 - **Bounded by design:** recursion depth, child count and concurrency, prompt and state size, duration, output tokens, and authenticated model discovery are all limited by the runtime.
 - **Durable session state:** child sessions and namespaced RLM extension state persist under Mimir's state root, so orchestration can survive an interrupted terminal session.
-- **Continual Harness:** `/refine` turns evidence from a session into small, structured updates to supplemental prompts, memories, skills, or reusable subagent specifications. It never rewrites the base system prompt, records refinement history, and supports rollback with `/refine rollback <refinement-id>`.
+- **Continual Harness:** `/refine` turns evidence into small, scoped updates to supplemental prompts, memories, existing-code skills, or reusable subagent specifications. `/learn` manages observe-only project learning, verified canaries, redacted contribution, and signed fleet packs. Neither path rewrites the base system prompt or trains model weights.
 
 Around that RLM foundation, Mimir provides provider adaptation, model/tool execution, workspace tools, context and skill loading, goals, schedules, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, state migration helpers, and deterministic offline testing.
 
@@ -24,12 +24,12 @@ The binary is `target/release/mimir`.
 
 ## Releases and installation
 
-CI is paused for pushes and pull requests. When manually dispatched, it verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. With the manifest at `0.6.0`, the next manual release starts at `v0.6.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
+CI is paused for pushes and pull requests. When manually dispatched, it verifies Linux and macOS in isolated native jobs. A failed platform remains visible on its matrix row without cancelling the healthy platform or failing the aggregate CI workflow. Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`, then each native target independently passes Clippy, tests, and a release build before uploading its own archive and SHA-256 checksum to the GitHub Releases page. With the manifest at `0.7.0`, the next manual release starts at `v0.7.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
 
 Download the latest release from [github.com/shivendrasoni/mimir/releases/latest](https://github.com/shivendrasoni/mimir/releases/latest). For example, on Linux x86_64:
 
 ```bash
-version=v0.6.0
+version=v0.7.0
 curl -fL "https://github.com/shivendrasoni/mimir/releases/latest/download/mimir-${version}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mimir.tar.gz
 tar -xzf /tmp/mimir.tar.gz -C /tmp
 mkdir -p "$HOME/.local/bin"
@@ -206,13 +206,15 @@ bundle per admitted prompt.
 
 When running an interactive, session-backed agent, Mimir registers its RLM tools automatically. The agent can choose from its currently authenticated models and recursively delegate bounded work; each child is tracked independently from admission through completion, cancellation, or deletion. The default maximum recursion depth is 3, and all child work remains subject to the runtime's budgets and tool policy.
 
-Use `/rlm-max-depth` in the TUI to inspect or set the recursion limit for a session. Use `/refine <instructions>` when you want Mimir to review the current trajectory and persist a focused lesson. Refinements are local to the session by default; pass `--global` only when a lesson should be shared, and undo a recorded update with:
+Use `/rlm-max-depth` in the TUI to inspect or set the recursion limit for a session. Use `/refine --scope session|project|user <instructions>` when you want Mimir to review the current trajectory and persist a focused lesson. Session remains the default, and the deprecated `--global` alias still maps to user scope. Fleet scope is read-only. Undo a recorded update with:
 
 ```text
 /refine rollback <refinement-id>
 # or, for a global refinement
 /refine rollback <refinement-id> --global
 ```
+
+Initialize project learning with `mimir learning init`, then inspect or change it with `mimir learning status`, `mimir learning mode observe|auto|off`, or `/learn`. Observe-only is the default, auto mode unlocks after three observed evidence records, and auto candidates need three applicable verified successes before activation; a verified failure quarantines them. Fleet contribution is separately opt-in. See [Continual learning](docs/CONTINUAL_LEARNING.md) for the storage, trust, privacy, rollout, and rollback contract.
 
 This is harness refinement, not model-weight training: Mimir proposes and validates small durable operating-context changes, then records the before/after state needed to inspect or reverse them.
 

@@ -40,6 +40,7 @@ const BUILTIN_COMPLETIONS: &[&str] = &[
     "/hotkeys",
     "/import",
     "/login",
+    "/learn",
     "/logout",
     "/logs",
     "/mcp",
@@ -1617,6 +1618,9 @@ impl App {
             }
             SlashCommand::Refine { arguments } => {
                 self.pending_tui_action = Some(TuiAction::Refine { arguments });
+            }
+            SlashCommand::Learn { arguments } => {
+                self.pending_tui_action = Some(TuiAction::Learn { arguments });
             }
             SlashCommand::Copy => self.pending_tui_action = Some(TuiAction::CopyLastMessage),
             SlashCommand::SideQuestion { question } => {

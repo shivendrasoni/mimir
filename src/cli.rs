@@ -45,6 +45,7 @@ use crate::{
         RlmChildToolRegistryFactory, RlmExecutionRequest, RlmLimits, RlmModel, RlmProviderFactory,
         RlmRuntime, RlmRuntimeLimits, RlmStore, RuntimeLimits,
     },
+    learning::{self, LearningMode},
     mcp::{
         McpAuthCoordinator, McpCatalogHttp, McpCatalogServer, McpCatalogStdio,
         McpOAuthAuthorization, McpOAuthClient, McpOAuthCodeReceiver, McpServerCatalog,
@@ -659,6 +660,12 @@ enum Command {
         #[command(subcommand)]
         action: DiagnoseCommand,
     },
+    /// Inspect and manage project and fleet continual learning.
+    #[command(alias = "learn")]
+    Learning {
+        #[command(subcommand)]
+        action: LearningCommand,
+    },
     /// Configure, authenticate, and invoke local or remote MCP servers.
     Mcp {
         #[command(subcommand)]
@@ -684,6 +691,65 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LearningModeArg {
+    Off,
+    Observe,
+    Auto,
+}
+
+impl From<LearningModeArg> for LearningMode {
+    fn from(value: LearningModeArg) -> Self {
+        match value {
+            LearningModeArg::Off => Self::Off,
+            LearningModeArg::Observe => Self::Observe,
+            LearningModeArg::Auto => Self::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FeedbackArg {
+    Yes,
+    No,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ToggleArg {
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum LearningCommand {
+    /// Create the nearest project marker and bounded learning store.
+    Init,
+    /// Show project, candidate, feedback, contribution, and fleet-pack state.
+    Status,
+    /// Set off, observe-only, or automatic project learning.
+    Mode { mode: LearningModeArg },
+    /// Enable or disable redacted fleet contribution.
+    Contribution { action: ToggleArg },
+    /// Record lightweight verified feedback for the pending candidate.
+    Feedback {
+        outcome: FeedbackArg,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List bounded project candidates without exposing transcripts.
+    Candidates,
+    /// Quarantine and roll back a project learning candidate.
+    Rollback { id: Uuid },
+    /// Inspect signed fleet-pack transport configuration.
+    Check,
+    /// Download, verify, and atomically activate the configured fleet pack.
+    Update,
+    /// Submit one active candidate through the opt-in redacted channel.
+    Submit { id: Uuid },
+    /// Pin or unpin a fleet-pack version for this project.
+    Pin { version: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1069,6 +1135,8 @@ struct LegacyRpcRequest {
     rollback_id: Option<String>,
     #[serde(default)]
     global: Option<bool>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 struct RpcSessionContext {
@@ -1819,10 +1887,42 @@ async fn dispatch_run_with_diagnostics(
         }
         recorder.finish_open();
     });
+    let learning_runtime = Arc::clone(&runtime);
     let result = dispatch_run(cli, runtime, initial_prompt).await;
     let _ = stop_sender.send(());
     let _ = collector.await;
+    if let Err(error) = ingest_learning_diagnostics(cli, &state).await {
+        eprintln!("warning: project learning evidence was not recorded: {error}");
+    }
+    if result.is_err() {
+        let mode = match learning::discover_project_root(&cli.workspace) {
+            Ok(project) => learning::load_learning_state(&project)
+                .await
+                .map(|state| state.mode),
+            Err(error) => Err(error),
+        };
+        if matches!(mode, Ok(LearningMode::Auto))
+            && let Err(error) =
+                learning::propose_project_candidate(&learning_runtime, &cli.workspace).await
+        {
+            eprintln!("warning: automatic learning proposal failed safely: {error}");
+        }
+    }
     result
+}
+
+async fn ingest_learning_diagnostics(cli: &Cli, state_root: &Path) -> Result<()> {
+    let root = diagnostics_root(state_root);
+    for run in list_runs(&root)?
+        .into_iter()
+        .filter(|run| run.session_id == cli.session)
+    {
+        let bundle = load_bundle(&root, &run.run_id.to_string())?;
+        if let Some(summary) = bundle.summary {
+            learning::record_diagnostic_evidence(&cli.workspace, &cli.session, &summary).await?;
+        }
+    }
+    Ok(())
 }
 
 fn daemon_runtime_error(error: MimirError) -> DaemonError {
@@ -2241,6 +2341,7 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
         })),
         Command::Session { action } => run_session_management(cli, action, &state).await,
         Command::Diagnose { action } => run_diagnose_management(action, &state).await,
+        Command::Learning { action } => run_learning_management(cli, action, &state).await,
         Command::Mcp { action } => run_mcp_management(action, &state).await,
         Command::Goal { action } => {
             let store = GoalStore::new(&state);
@@ -2398,6 +2499,96 @@ fn run_self_update(action: UpdateAction, force: bool) -> Result<()> {
             "self-update is not configured: this build has no signed release transport; install a newer trusted binary using the same method used for this installation"
                 .into(),
         )),
+    }
+}
+
+async fn run_learning_management(
+    cli: &Cli,
+    action: &LearningCommand,
+    state_root: &Path,
+) -> Result<()> {
+    match action {
+        LearningCommand::Init => {
+            let marker = learning::initialize_project(&cli.workspace).await?;
+            print_json(&json!({
+                "schema_version": learning::LEARNING_SCHEMA_VERSION,
+                "initialized": true,
+                "project_id": marker.project_id,
+                "project_root": learning::discover_project_root(&cli.workspace)?,
+            }))
+        }
+        LearningCommand::Status => print_json(&serde_json::to_value(
+            learning::learning_status(&cli.workspace, state_root).await?,
+        )?),
+        LearningCommand::Mode { mode } => print_json(&serde_json::to_value(
+            learning::set_mode(&cli.workspace, (*mode).into()).await?,
+        )?),
+        LearningCommand::Contribution { action } => {
+            let enabled = *action == ToggleArg::Enable;
+            print_json(&serde_json::to_value(
+                learning::set_contribution(&cli.workspace, enabled).await?,
+            )?)
+        }
+        LearningCommand::Feedback { outcome, note } => print_json(&serde_json::to_value(
+            learning::record_feedback(
+                &cli.workspace,
+                &cli.session,
+                *outcome == FeedbackArg::Yes,
+                note.as_deref(),
+            )
+            .await?,
+        )?),
+        LearningCommand::Candidates => {
+            let project = learning::discover_project_root(&cli.workspace)?;
+            let state = learning::load_learning_state(&project).await?;
+            print_json(&json!({
+                "schema_version": learning::LEARNING_SCHEMA_VERSION,
+                "candidates": state.candidates,
+            }))
+        }
+        LearningCommand::Rollback { id } => print_json(&serde_json::to_value(
+            learning::rollback_candidate(&cli.workspace, *id).await?,
+        )?),
+        LearningCommand::Check => print_json(&json!({
+            "schema_version": learning::LEARNING_SCHEMA_VERSION,
+            "endpoint_configured": std::env::var_os("MIMIR_LEARNING_PACK_URL").is_some(),
+            "public_key_configured": std::env::var_os("MIMIR_LEARNING_PUBLIC_KEY").is_some(),
+            "contribution_endpoint_configured": std::env::var_os("MIMIR_LEARNING_CONTRIBUTION_URL").is_some(),
+            "active_pack": learning::load_active_fleet_pack(state_root).await?.map(|item| item.pack.version),
+        })),
+        LearningCommand::Update => {
+            if cli.offline {
+                return Err(MimirError::Configuration(
+                    "fleet learning update is unavailable in offline mode".into(),
+                ));
+            }
+            let endpoint = std::env::var("MIMIR_LEARNING_PACK_URL").map_err(|_| {
+                MimirError::Configuration("MIMIR_LEARNING_PACK_URL is not configured".into())
+            })?;
+            let public_key = std::env::var("MIMIR_LEARNING_PUBLIC_KEY").map_err(|_| {
+                MimirError::Configuration("MIMIR_LEARNING_PUBLIC_KEY is not configured".into())
+            })?;
+            let path =
+                learning::fetch_and_install_signed_pack(state_root, &endpoint, &public_key).await?;
+            print_json(&json!({"updated": true, "path": path}))
+        }
+        LearningCommand::Submit { id } => {
+            if cli.offline {
+                return Err(MimirError::Configuration(
+                    "fleet learning contribution is unavailable in offline mode".into(),
+                ));
+            }
+            let endpoint = std::env::var("MIMIR_LEARNING_CONTRIBUTION_URL").map_err(|_| {
+                MimirError::Configuration(
+                    "MIMIR_LEARNING_CONTRIBUTION_URL is not configured".into(),
+                )
+            })?;
+            learning::submit_fleet_contribution(&cli.workspace, &endpoint, *id).await?;
+            print_json(&json!({"submitted": true, "candidate_id": id}))
+        }
+        LearningCommand::Pin { version } => print_json(&serde_json::to_value(
+            learning::pin_fleet_version(&cli.workspace, version.as_deref()).await?,
+        )?),
     }
 }
 
@@ -3616,10 +3807,13 @@ impl MessageDedupe {
 
 impl RuntimePromptHandler {
     fn new(build: RuntimeBuildConfig, state: PathBuf) -> Self {
+        let workspace = build.workspace.clone();
         Self {
             build,
             state_root: state.clone(),
-            runtime_operations: Arc::new(crate::daemon::runtime_ops::RuntimeOperations::new(state)),
+            runtime_operations: Arc::new(
+                crate::daemon::runtime_ops::RuntimeOperations::with_workspace(state, workspace),
+            ),
             runtimes: tokio::sync::Mutex::new(HashMap::new()),
             durable_bindings: tokio::sync::Mutex::new(HashMap::new()),
             follow_ups: tokio::sync::Mutex::new(HashMap::new()),
@@ -4240,7 +4434,7 @@ impl RuntimePromptHandler {
         runtime: &AgentRuntime,
         arguments: &str,
     ) -> std::result::Result<Value, DaemonError> {
-        let (instructions, rollback_id, global) = parse_recovered_refine_args(arguments)?;
+        let (instructions, rollback_id, global, scope) = parse_recovered_refine_args(arguments)?;
         let result = refinement::refine(
             runtime,
             &self.state_root,
@@ -4249,15 +4443,22 @@ impl RuntimePromptHandler {
                 instructions: instructions.as_deref(),
                 rollback_id: rollback_id.as_deref(),
                 global,
+                scope,
+                workspace: Some(&self.build.workspace),
             },
         )
         .await
         .map_err(|error| DaemonError::Protocol(error.to_string()))?;
         runtime
             .set_harness_context(
-                refinement::load_harness_context(&self.state_root, session_id)
-                    .await
-                    .map_err(|error| DaemonError::Protocol(error.to_string()))?,
+                refinement::load_harness_context_for_workspace(
+                    &self.state_root,
+                    &self.build.workspace,
+                    session_id,
+                    None,
+                )
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?,
             )
             .await;
         serde_json::to_value(result).map_err(DaemonError::from)
@@ -4331,11 +4532,19 @@ impl RuntimePromptHandler {
     }
 }
 
+type RecoveredRefineArgs = (
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<refinement::HarnessScope>,
+);
+
 fn parse_recovered_refine_args(
     arguments: &str,
-) -> std::result::Result<(Option<String>, Option<String>, bool), DaemonError> {
+) -> std::result::Result<RecoveredRefineArgs, DaemonError> {
     let mut rest = arguments.trim();
     let mut global = false;
+    let mut scope = None;
     if let Some(value) = rest.strip_prefix("--global") {
         if !value.is_empty() && !value.starts_with(char::is_whitespace) {
             return Err(DaemonError::Protocol(
@@ -4344,6 +4553,27 @@ fn parse_recovered_refine_args(
         }
         global = true;
         rest = value.trim_start();
+    }
+    if let Some(value) = rest.strip_prefix("--scope") {
+        if !value.starts_with(char::is_whitespace) {
+            return Err(DaemonError::Protocol(
+                "invalid refine --scope option".into(),
+            ));
+        }
+        let value = value.trim_start();
+        let split = value.find(char::is_whitespace).unwrap_or(value.len());
+        let requested = &value[..split];
+        scope = Some(refinement::HarnessScope::parse(requested).ok_or_else(|| {
+            DaemonError::Protocol(
+                "refine scope must be session, project, or user; fleet is read-only".into(),
+            )
+        })?);
+        if scope == Some(refinement::HarnessScope::Fleet) {
+            return Err(DaemonError::Protocol(
+                "fleet learning packs are read-only".into(),
+            ));
+        }
+        rest = value[split..].trim_start();
     }
     if rest == "rollback" {
         return Err(DaemonError::Protocol(
@@ -4361,9 +4591,9 @@ fn parse_recovered_refine_args(
                 "refine rollback requires a refinement id".into(),
             ));
         }
-        return Ok((None, Some(rollback_id.into()), global));
+        return Ok((None, Some(rollback_id.into()), global, scope));
     }
-    Ok(((!rest.is_empty()).then(|| rest.into()), None, global))
+    Ok(((!rest.is_empty()).then(|| rest.into()), None, global, scope))
 }
 
 fn autonomous_status_value(state: Option<&AutonomousState>) -> Value {
@@ -4513,6 +4743,10 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
                 .await?;
         }
         Ok(runtime)
+    }
+
+    fn workspace_root(&self) -> Option<PathBuf> {
+        std::fs::canonicalize(&self.build.workspace).ok()
     }
 
     fn agent_mode(&self) -> AgentMode {
@@ -7160,7 +7394,10 @@ async fn build_runtime_for_session(
         runtime.set_extension_flag(&name, value).await?;
     }
     runtime
-        .set_harness_context(refinement::load_harness_context(&state, session).await?)
+        .set_harness_context(
+            refinement::load_harness_context_for_workspace(&state, &workspace, session, None)
+                .await?,
+        )
         .await;
     Ok(runtime)
 }
@@ -7580,11 +7817,14 @@ async fn start_legacy_compaction_refinement(
     }
     let runtime = context.runtime.clone();
     let state_dir = context.build.state_dir.clone();
+    let workspace = context.build.workspace.clone();
     let session_id = context.session_id.clone();
     let activity = context.activity.clone();
     context.control_worker = Some(tokio::spawn(async move {
-        let response =
-            execute_legacy_compaction_refinement(runtime, state_dir, session_id, request).await;
+        let response = execute_legacy_compaction_refinement(
+            runtime, state_dir, workspace, session_id, request,
+        )
+        .await;
         activity.lock().await.control_running = None;
         emit_rpc_value(&response);
     }));
@@ -7594,12 +7834,15 @@ async fn start_legacy_compaction_refinement(
 async fn execute_legacy_compaction_refinement(
     runtime: Arc<AgentRuntime>,
     state_dir: PathBuf,
+    workspace: PathBuf,
     session_id: String,
     request: LegacyRpcRequest,
 ) -> Value {
     match request.command.as_str() {
         "compact" => execute_legacy_compact(runtime, request).await,
-        "refine" => execute_legacy_refine(runtime, &state_dir, &session_id, request).await,
+        "refine" => {
+            execute_legacy_refine(runtime, &state_dir, &workspace, &session_id, request).await
+        }
         command => legacy_error(request.id, command, "unsupported compaction command"),
     }
 }
@@ -7658,6 +7901,7 @@ fn emit_legacy_compact_error(request: LegacyRpcRequest, message: &str) -> Value 
 async fn execute_legacy_refine(
     runtime: Arc<AgentRuntime>,
     state_dir: &Path,
+    workspace: &Path,
     session_id: &str,
     request: LegacyRpcRequest,
 ) -> Value {
@@ -7665,14 +7909,34 @@ async fn execute_legacy_refine(
         Ok(state) => state,
         Err(error) => return legacy_error(request.id, "refine", &error.to_string()),
     };
+    let scope = match request.scope.as_deref() {
+        Some(value) => match refinement::HarnessScope::parse(value) {
+            Some(refinement::HarnessScope::Fleet) => {
+                return legacy_error(request.id, "refine", "fleet learning packs are read-only");
+            }
+            Some(scope) => Some(scope),
+            None => return legacy_error(request.id, "refine", "invalid refinement scope"),
+        },
+        None => None,
+    };
     let options = RefineOptions {
         instructions: request.instructions.as_deref(),
         rollback_id: request.rollback_id.as_deref(),
         global: request.global.unwrap_or(false),
+        scope,
+        workspace: Some(workspace),
     };
     match refinement::refine(runtime.as_ref(), &state, session_id, options).await {
         Ok(result) => {
-            finish_legacy_refine(runtime.as_ref(), &state, session_id, request.id, result).await
+            finish_legacy_refine(
+                runtime.as_ref(),
+                &state,
+                workspace,
+                session_id,
+                request.id,
+                result,
+            )
+            .await
         }
         Err(error) => {
             emit_rpc_value(&json!({"type": "refine_failed", "error": error.to_string()}));
@@ -7684,6 +7948,7 @@ async fn execute_legacy_refine(
 async fn finish_legacy_refine(
     runtime: &AgentRuntime,
     state: &Path,
+    workspace: &Path,
     session_id: &str,
     id: Option<Value>,
     result: refinement::RefinementResult,
@@ -7698,10 +7963,13 @@ async fn finish_legacy_refine(
     {
         return legacy_error(id, "refine", &error.to_string());
     }
-    let harness_context = match refinement::load_harness_context(state, session_id).await {
-        Ok(context) => context,
-        Err(error) => return legacy_error(id, "refine", &error.to_string()),
-    };
+    let harness_context =
+        match refinement::load_harness_context_for_workspace(state, workspace, session_id, None)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => return legacy_error(id, "refine", &error.to_string()),
+        };
     runtime.set_harness_context(harness_context).await;
     emit_rpc_value(&json!({"type": "refine_complete", "result": data}));
     legacy_success(id, "refine", Some(data))
@@ -9565,6 +9833,7 @@ mod tui_model_selection_tests {
         diagnostics::{DiagnosticOutcome, diagnostics_root, list_runs, load_bundle},
         error::MimirError,
         model::{Message, ThinkingLevel},
+        refinement::HarnessScope,
         runtime::QueueMode,
         session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
         tools::AgentMode,
@@ -9868,11 +10137,21 @@ mod tui_model_selection_tests {
     fn recovered_refine_commands_parse_native_options() {
         assert_eq!(
             parse_recovered_refine_args("tighten the prompt").expect("instructions"),
-            (Some("tighten the prompt".into()), None, false)
+            (Some("tighten the prompt".into()), None, false, None)
         );
         assert_eq!(
             parse_recovered_refine_args("--global rollback ref-42").expect("global rollback"),
-            (None, Some("ref-42".into()), true)
+            (None, Some("ref-42".into()), true, None)
+        );
+        assert_eq!(
+            parse_recovered_refine_args("--scope project retain conventions")
+                .expect("project scope"),
+            (
+                Some("retain conventions".into()),
+                None,
+                false,
+                Some(HarnessScope::Project),
+            )
         );
         assert!(parse_recovered_refine_args("rollback").is_err());
         assert!(parse_recovered_refine_args("--globalized invalid").is_err());

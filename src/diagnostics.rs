@@ -717,6 +717,14 @@ impl RuntimeDiagnosticRecorder {
                 },
                 None,
             ),
+            RuntimeEvent::UserInputRequested { .. } => (
+                DiagnosticEventKind::SessionEvent {
+                    event_type: "user_input_requested".into(),
+                    status: Some("waiting".into()),
+                    provider: None,
+                },
+                None,
+            ),
             RuntimeEvent::ToolUpdated {
                 id,
                 name,

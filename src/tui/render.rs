@@ -291,6 +291,10 @@ fn human_bytes(bytes: usize) -> String {
     format!("{}.{:01} MiB", tenths / 10, tenths % 10)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "overlay rendering exhaustively maps each mutually exclusive TUI surface"
+)]
 fn append_overlay(app: &App, lines: &mut Vec<String>) {
     match app.overlay() {
         Overlay::None => {}
@@ -302,7 +306,9 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
                     .into(),
             );
             lines.push("/tree /fork /clone".into());
-            lines.push("/compact /refine /goal /autonomous /heartbeat /heartbeats".into());
+            lines.push(
+                "/implement /compact /refine /goal /autonomous /heartbeat /heartbeats".into(),
+            );
             lines.push("/fast /scoped-models /copy /btw /export /import /share /traces".into());
             lines.push("/system-prompt /logs /changelog /update /rlm-max-depth /fullscreen".into());
             lines.push("/skill:<name> [request] (names are exposed by get_commands)".into());
@@ -339,6 +345,35 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
                 ));
             }
             lines.push("Up/Down choose · Enter decide · Esc deny".into());
+        }
+        Overlay::Clarification {
+            request,
+            selected,
+            input,
+        } => {
+            lines.push(String::new());
+            lines.push(request.header.clone());
+            lines.push(request.question.clone());
+            for (index, option) in request.options.iter().enumerate() {
+                let recommended = if index == 0 { " (Recommended)" } else { "" };
+                lines.push(format!(
+                    "{} {}{} — {}",
+                    if *selected == index { ">" } else { " " },
+                    option.label,
+                    recommended,
+                    option.description
+                ));
+            }
+            lines.push(format!(
+                "{} Other: {}",
+                if *selected == request.options.len() {
+                    ">"
+                } else {
+                    " "
+                },
+                input
+            ));
+            lines.push("Up/Down choose · Type for Other · Enter answer · Esc close".into());
         }
         Overlay::Login { provider, input } => {
             lines.push(String::new());

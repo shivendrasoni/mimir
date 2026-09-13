@@ -2776,6 +2776,10 @@ fn public_runtime_event(
             "type": "workspace_permission_required",
             "request": request
         }),
+        RuntimeEvent::UserInputRequested { request } => json!({
+            "type": "user_input_requested",
+            "request": request
+        }),
         RuntimeEvent::ToolUpdated {
             id,
             name,

@@ -494,7 +494,10 @@ fn require_write_approval(
     Ok(())
 }
 
-async fn atomic_replace(path: &std::path::Path, content: &[u8]) -> Result<(), ToolError> {
+pub(super) async fn atomic_replace(
+    path: &std::path::Path,
+    content: &[u8],
+) -> Result<(), ToolError> {
     let parent = path.parent().ok_or_else(|| ToolError::Execution {
         tool: "write_file".into(),
         message: "target has no parent".into(),

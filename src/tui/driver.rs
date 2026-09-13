@@ -418,6 +418,10 @@ pub trait TuiRuntimeFactory: Send + Sync {
 
 #[async_trait]
 impl EventSink for TuiSink {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "runtime event translation exhaustively maps the public event surface"
+    )]
     async fn emit(&self, event: RuntimeEvent) {
         if let RuntimeEvent::MessageCompleted { message } = &event {
             let mut state = self
@@ -480,13 +484,32 @@ impl EventSink for TuiSink {
                     .open_workspace_permission(request);
                 None
             }
+            RuntimeEvent::UserInputRequested { request } => {
+                Some(StreamEvent::UserInputRequested(request))
+            }
             RuntimeEvent::ToolFinished {
                 name, observation, ..
-            } => Some(StreamEvent::ToolFinished {
-                name,
-                summary: observation.summary,
-                failed: observation.status == ObservationStatus::Error,
-            }),
+            } => {
+                let summary = if observation.artifacts.is_empty() {
+                    observation.summary
+                } else {
+                    format!(
+                        "{} · {}",
+                        observation.summary,
+                        observation
+                            .artifacts
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Some(StreamEvent::ToolFinished {
+                    name,
+                    summary,
+                    failed: observation.status == ObservationStatus::Error,
+                })
+            }
             RuntimeEvent::ExtensionError {
                 extension_path,
                 event,
@@ -672,6 +695,11 @@ pub async fn run_tui_with_autonomous(
         state.select_session(&initial_session);
     }
     refresh_extension_commands(&runtime, &app).await;
+    if let Some(question) = runtime.pending_plan_question().await? {
+        app.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open_clarification(question);
+    }
     let mut runtime_key = Some((initial_model, initial_session));
     let mut runtime_needs_refresh = false;
     let mut autonomous_state = AutonomousState::default();
@@ -790,6 +818,17 @@ pub async fn run_tui_with_autonomous(
                 };
                 if let Some(prompt) = prompt {
                     if let Some(user_bash) = parse_user_bash_submission(&prompt) {
+                        if app
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .agent_mode()
+                            == AgentMode::Plan
+                        {
+                            app.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push_system_message("Direct commands are disabled in plan mode");
+                            continue;
+                        }
                         if user_bash.command.is_empty() {
                             app.lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1142,6 +1181,76 @@ fn user_message(prompt: &str, images: Vec<super::ImageAttachment>) -> Message {
     Message::user_content(content)
 }
 
+struct PreparedPlanImplementation {
+    runtime: Arc<AgentRuntime>,
+    model: String,
+    session: String,
+    relative_plan: String,
+}
+
+async fn rebuild_plan_as_auto(
+    runtime: &AgentRuntime,
+    runtime_factory: &dyn TuiRuntimeFactory,
+    runtime_key: Option<&(String, String)>,
+    state_root: &Path,
+) -> Result<PreparedPlanImplementation> {
+    if runtime_factory.agent_mode() != AgentMode::Plan {
+        return Err(crate::error::MimirError::Configuration(
+            "implement is available only in plan mode".into(),
+        ));
+    }
+    let artifact = runtime.plan_artifact().await?.ok_or_else(|| {
+        crate::error::MimirError::Configuration(
+            "no non-empty plan artifact is ready; finish the plan first".into(),
+        )
+    })?;
+    let relative_plan = artifact
+        .strip_prefix(runtime.workspace_root())
+        .map_err(|_| {
+            crate::error::MimirError::Configuration(
+                "plan artifact escaped the active workspace".into(),
+            )
+        })?
+        .display()
+        .to_string();
+    let previous = runtime_factory.agent_mode();
+    runtime_factory.set_agent_mode(AgentMode::Auto)?;
+    let session = active_session(runtime_key)?.to_owned();
+    let model = current_model(runtime, runtime_key).await;
+    let updated =
+        match build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                let _ = runtime_factory.set_agent_mode(previous);
+                return Err(error);
+            }
+        };
+    if let Err(error) = runtime.mark_plan_handed_off().await {
+        let _ = runtime_factory.set_agent_mode(previous);
+        return Err(error);
+    }
+    Ok(PreparedPlanImplementation {
+        runtime: updated,
+        model,
+        session,
+        relative_plan,
+    })
+}
+
+fn implementation_prompt(relative_plan: &str, instructions: Option<&str>) -> String {
+    let mut prompt = format!(
+        "Implement the accepted plan at $WORKSPACE/{relative_plan}. Follow it exactly and verify the result."
+    );
+    if let Some(instructions) = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str(" Additional instructions: ");
+        prompt.push_str(instructions);
+    }
+    prompt
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1184,13 +1293,21 @@ async fn dispatch_coordinator_action(
                     *runtime_key = Some((model, session));
                     refresh_extension_commands(runtime, app).await;
                     persist_app_preferences(state_root, app).await?;
+                    if let Some(question) = runtime.pending_plan_question().await? {
+                        app.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .open_clarification(question);
+                    }
                     Ok(Some(format!(
                         "Mode set to {}. {}",
                         mode.as_str(),
-                        if *mode == AgentMode::Auto {
-                            "Shell commands and workspace edits will run without confirmation."
-                        } else {
-                            "Model-issued shell commands and workspace edits require confirmation."
+                        match mode {
+                            AgentMode::Auto =>
+                                "Shell commands and workspace edits will run without confirmation.",
+                            AgentMode::Plan =>
+                                "Only inspection, clarification, and the bound plan artifact are available.",
+                            AgentMode::Default =>
+                                "Model-issued shell commands and workspace edits require confirmation.",
                         }
                     )))
                 }
@@ -1202,6 +1319,51 @@ async fn dispatch_coordinator_action(
                     Err(error)
                 }
             }
+        }
+        TuiAction::ImplementPlan { instructions } => {
+            let bash_active = app
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .bash_active();
+            if runtime.is_running() || bash_active {
+                return Err(crate::error::MimirError::Configuration(
+                    "wait for the active agent or command before implementing".into(),
+                ));
+            }
+            let prepared =
+                rebuild_plan_as_auto(runtime, runtime_factory, runtime_key.as_ref(), state_root)
+                    .await?;
+            app.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_agent_mode(AgentMode::Auto);
+            let relative = prepared.relative_plan;
+            *runtime = prepared.runtime;
+            *runtime_key = Some((prepared.model, prepared.session));
+            refresh_extension_commands(runtime, app).await;
+            persist_app_preferences(state_root, app).await?;
+            let prompt = implementation_prompt(&relative, instructions.as_deref());
+            {
+                let mut state = app
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.set_run_active(true);
+                state.push_user_submission(&prompt, 0);
+            }
+            let runtime_for_run = Arc::clone(runtime);
+            let app_for_run = Arc::clone(app);
+            let autonomous_for_run = Arc::clone(autonomous);
+            tokio::spawn(async move {
+                run_tui_prompt_loop(
+                    runtime_for_run,
+                    app_for_run,
+                    autonomous_for_run,
+                    Message::user(prompt),
+                )
+                .await;
+            });
+            Ok(Some(format!(
+                "Mode set to auto. Implementing $WORKSPACE/{relative}"
+            )))
         }
         TuiAction::WorkspacePermission { request, decision } => runtime_factory
             .record_workspace_permission(request.clone(), *decision)
@@ -1416,6 +1578,11 @@ async fn dispatch_coordinator_action(
                 .map(Some)
         }
         TuiAction::Autonomous { arguments } => {
+            if runtime_factory.agent_mode() == AgentMode::Plan {
+                return Err(crate::error::MimirError::Configuration(
+                    "autonomous execution is disabled in plan mode".into(),
+                ));
+            }
             let (message, cancel_run) = apply_autonomous_command(
                 &mut autonomous
                     .lock()
@@ -3268,6 +3435,7 @@ pub async fn dispatch_runtime_action(
         TuiAction::ShowContext => render_context_tree(runtime).await.map(Some),
         TuiAction::CopyLastMessage => copy_last_assistant_message(runtime).await.map(Some),
         TuiAction::SetAgentMode(_)
+        | TuiAction::ImplementPlan { .. }
         | TuiAction::WorkspacePermission { .. }
         | TuiAction::Resume { .. }
         | TuiAction::NewSession { .. }
@@ -3559,8 +3727,12 @@ fn convert_key(key: crossterm::event::KeyEvent) -> Option<KeyEvent> {
 
 #[cfg(test)]
 mod local_command_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    };
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
@@ -3569,11 +3741,75 @@ mod local_command_tests {
         provider::FakeProvider,
         runtime::RuntimeConfig,
         session::InMemorySessionStore,
-        tools::{ToolPolicy, ToolRegistry},
+        tools::{AgentMode, PlanContextStore, ToolPolicy, ToolRegistry},
     };
 
     struct TestFactory {
         state: PathBuf,
+    }
+
+    struct PlanTransitionFactory {
+        workspace: PathBuf,
+        state: PathBuf,
+        mode: RwLock<AgentMode>,
+        fail_build: AtomicBool,
+    }
+
+    #[async_trait]
+    impl TuiRuntimeFactory for PlanTransitionFactory {
+        async fn build(&self, model: &str, session: &str) -> Result<Arc<AgentRuntime>> {
+            if self.fail_build.load(Ordering::SeqCst) {
+                return Err(crate::error::MimirError::Configuration(
+                    "injected rebuild failure".into(),
+                ));
+            }
+            let mode = self.agent_mode();
+            let plan_context = if mode.is_plan() {
+                let context = Arc::new(
+                    PlanContextStore::new(&self.workspace, &self.state, session)
+                        .map_err(|error| crate::error::MimirError::Tool(error.to_string()))?,
+                );
+                context
+                    .prepare()
+                    .await
+                    .map_err(|error| crate::error::MimirError::Tool(error.to_string()))?;
+                Some(context)
+            } else {
+                None
+            };
+            let tools = ToolRegistry::with_default_tools(
+                &self.workspace,
+                ToolPolicy {
+                    agent_mode: mode,
+                    plan_context,
+                    ..ToolPolicy::default()
+                },
+            )
+            .map_err(|error| crate::error::MimirError::Configuration(error.to_string()))?;
+            AgentRuntime::resume(
+                Arc::new(FakeProvider::default()),
+                Arc::new(tools),
+                Arc::new(InMemorySessionStore::default()),
+                RuntimeConfig::default_for_model(model),
+            )
+            .await
+            .map(Arc::new)
+        }
+
+        fn agent_mode(&self) -> AgentMode {
+            *self
+                .mode
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn set_agent_mode(&self, mode: AgentMode) -> Result<()> {
+            *self
+                .mode
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -3591,6 +3827,105 @@ mod local_command_tests {
             .await
             .map(Arc::new)
         }
+    }
+
+    #[tokio::test]
+    async fn plan_handoff_requires_an_artifact_rolls_back_and_then_rebuilds_auto() {
+        let workspace = TempDir::new().expect("workspace");
+        let state = TempDir::new().expect("state");
+        let session = "plan-session";
+        let context = Arc::new(
+            PlanContextStore::new(workspace.path(), state.path(), session).expect("context"),
+        );
+        context.prepare().await.expect("prepare");
+        let tools = Arc::new(
+            ToolRegistry::with_default_tools(
+                workspace.path(),
+                ToolPolicy {
+                    agent_mode: AgentMode::Plan,
+                    plan_context: Some(Arc::clone(&context)),
+                    ..ToolPolicy::default()
+                },
+            )
+            .expect("plan tools"),
+        );
+        let runtime = AgentRuntime::resume(
+            Arc::new(FakeProvider::default()),
+            Arc::clone(&tools),
+            Arc::new(InMemorySessionStore::default()),
+            RuntimeConfig::default_for_model("fake/model"),
+        )
+        .await
+        .expect("plan runtime");
+        let factory = PlanTransitionFactory {
+            workspace: workspace.path().to_path_buf(),
+            state: state.path().to_path_buf(),
+            mode: RwLock::new(AgentMode::Plan),
+            fail_build: AtomicBool::new(false),
+        };
+        let key = ("fake/model".into(), session.into());
+
+        let Err(missing) = rebuild_plan_as_auto(&runtime, &factory, Some(&key), state.path()).await
+        else {
+            panic!("missing plan was accepted");
+        };
+        assert!(missing.to_string().contains("no non-empty plan"));
+        assert_eq!(factory.agent_mode(), AgentMode::Plan);
+
+        tools
+            .execute(
+                "write_plan",
+                json!({
+                    "title":"Transition",
+                    "markdown":"# Transition\n\n## Summary\nReady.\n\n## Implementation Changes\nChange it.\n\n## Public Interfaces\nNone.\n\n## Tests\nRun them.\n\n## Assumptions\nNone.\n"
+                }),
+            )
+            .await
+            .expect("plan artifact");
+        factory.fail_build.store(true, Ordering::SeqCst);
+        let Err(failed) = rebuild_plan_as_auto(&runtime, &factory, Some(&key), state.path()).await
+        else {
+            panic!("injected rebuild failure was ignored");
+        };
+        assert!(failed.to_string().contains("injected rebuild failure"));
+        assert_eq!(factory.agent_mode(), AgentMode::Plan);
+        assert!(
+            runtime
+                .plan_artifact()
+                .await
+                .expect("artifact retained")
+                .is_some()
+        );
+
+        factory.fail_build.store(false, Ordering::SeqCst);
+        let prepared = rebuild_plan_as_auto(&runtime, &factory, Some(&key), state.path())
+            .await
+            .expect("successful handoff");
+        assert_eq!(factory.agent_mode(), AgentMode::Auto);
+        assert_eq!(prepared.relative_plan, "plans/transition.md");
+        assert!(
+            prepared
+                .runtime
+                .plan_artifact()
+                .await
+                .expect("auto context")
+                .is_none()
+        );
+        assert_eq!(
+            implementation_prompt(&prepared.relative_plan, Some("keep the API stable")),
+            "Implement the accepted plan at $WORKSPACE/plans/transition.md. Follow it exactly and verify the result. Additional instructions: keep the API stable"
+        );
+
+        let reset =
+            PlanContextStore::new(workspace.path(), state.path(), session).expect("reset context");
+        reset.prepare().await.expect("prepare after handoff");
+        assert!(
+            reset
+                .validated_artifact()
+                .await
+                .expect("reset state")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3793,6 +4128,7 @@ mod local_command_tests {
         app.lock()
             .expect("app")
             .set_preferences(AppPreferenceState {
+                agent_mode: AgentMode::Plan,
                 show_images: false,
                 auto_resize_images: false,
                 block_images: true,
@@ -3811,6 +4147,7 @@ mod local_command_tests {
         let loaded = load_tui_preferences(state.path())
             .await
             .expect("load preferences");
+        assert_eq!(loaded.agent_mode, "plan");
         assert!(!loaded.show_images);
         assert!(!loaded.auto_resize_images);
         assert!(loaded.block_images);
@@ -3821,6 +4158,21 @@ mod local_command_tests {
         assert_eq!(loaded.editor_padding_x, 8);
         assert!(!loaded.show_terminal_progress);
         assert!(!loaded.show_warnings);
+    }
+
+    #[tokio::test]
+    async fn older_tui_preferences_default_to_default_agent_mode() {
+        let state = TempDir::new().expect("state");
+        let path = tui_preferences_path(state.path());
+        std::fs::create_dir_all(path.parent().expect("settings parent"))
+            .expect("settings directory");
+        std::fs::write(&path, "{}").expect("legacy settings");
+        assert_eq!(
+            load_tui_agent_mode(state.path())
+                .await
+                .expect("legacy mode"),
+            AgentMode::Default
+        );
     }
 
     #[tokio::test]

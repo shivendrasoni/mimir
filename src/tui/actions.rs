@@ -12,6 +12,9 @@ use super::commands::McpCommand;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     SetAgentMode(AgentMode),
+    ImplementPlan {
+        instructions: Option<String>,
+    },
     WorkspacePermission {
         request: PermissionRequest,
         decision: ApprovalDecision,

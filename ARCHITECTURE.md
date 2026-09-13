@@ -17,7 +17,7 @@
 | `budget` | Turn, tool, token, elapsed, and context bounds |
 | `provider` | Async interface plus fake, OpenAI/Codex, Anthropic, Bedrock, Google/Vertex, Mistral, Cloudflare, and compatible custom adapters |
 | `auth` | Stored API keys, OAuth/device credentials, provider login status |
-| `tools` | Registry plus read/write/edit/list/search/process tools |
+| `tools` | Registry plus read/write/edit/list/search/process and plan-mode tools |
 | `session` | Schema-versioned JSONL, bounded streaming replay, recovery, and atomic compaction checkpoints |
 | `resources` | Context and skill discovery with deterministic precedence |
 | `runtime` | Serialized model/tool state machine, cancellation, events, compaction |
@@ -34,6 +34,8 @@
 - The crate forbids unsafe Rust.
 - Provider configuration cannot be constructed with blank URL, model, or key; debug output redacts the key.
 - Tools are registered explicitly. File operations cannot escape the canonical workspace.
+- Plan mode is a registry-level capability boundary: only repository reads, structured clarification, and one session-bound `plans/*.md` artifact are available. Late extension, MCP, IPython, and child-runtime registrations fail closed.
+- Plan context is stored privately beneath `.mimir`, keyed by canonical workspace and session. A pending clarification and bound plan survive restart; implementation requires a valid non-empty regular plan file before rebuilding in auto mode.
 - Model-issued Bash commands require confirmation in default mode and run immediately only after selecting auto mode. The shell is rooted at the workspace, clears inherited environment values except `PATH`, and uses process groups, timeouts, cancellation, and bounded output; it is not an OS sandbox.
 - The narrower `run_process` tool remains opt-in, requires an exact non-empty program allowlist, and rejects compound shell syntax.
 - Internal state rejects symlinked path components and shares path-scoped mutation locks across store instances.

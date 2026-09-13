@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use mimir::tools::{
-    AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus, ToolError,
-    ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
+    AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus,
+    PlanContextStore, ToolError, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -22,6 +22,7 @@ fn registry(root: &TempDir) -> ToolRegistry {
             agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["sleep".into(), "printf".into()]),
             approvals: None,
+            plan_context: None,
         },
     )
     .expect("registry should initialize")
@@ -42,10 +43,433 @@ fn approval_registry(root: &TempDir) -> (ToolRegistry, Arc<WorkspaceApprovalStor
             agent_mode: AgentMode::Default,
             allowed_programs: None,
             approvals: Some(Arc::clone(&approvals)),
+            plan_context: None,
         },
     )
     .expect("registry should initialize");
     (tools, approvals)
+}
+
+fn valid_plan(title: &str) -> String {
+    format!(
+        "# {title}\n\n## Summary\nReady.\n\n## Implementation Changes\nChange it.\n\n## Public Interfaces\nDocumented.\n\n## Tests\nVerify it.\n\n## Assumptions\nNone.\n"
+    )
+}
+
+#[tokio::test]
+async fn plan_mode_exposes_only_safe_planning_tools_and_denies_stale_calls() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "session").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let mut tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            allow_write: false,
+            allow_process: false,
+            allow_shell: false,
+            plan_context: Some(context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("plan registry");
+    let mut names = tools
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "ask_user",
+            "list_files",
+            "read_file",
+            "search",
+            "write_plan"
+        ]
+    );
+    assert!(
+        tools
+            .register_extension_tools(Vec::new(), workspace.path())
+            .expect_err("late extension registration must fail")
+            .to_string()
+            .contains("plan mode")
+    );
+    assert!(matches!(
+        tools
+            .execute("write_file", json!({"path":"bad", "content":"bad"}))
+            .await,
+        Err(ToolError::Disabled { .. })
+    ));
+    assert!(!workspace.path().join("bad").exists());
+}
+
+#[tokio::test]
+async fn plan_artifact_is_bound_updated_and_collision_safe() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let first_context =
+        Arc::new(PlanContextStore::new(workspace.path(), state.path(), "first").expect("context"));
+    first_context.prepare().await.expect("prepare");
+    let first = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(first_context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    let written = first
+        .execute(
+            "write_plan",
+            json!({"title":"Add Plan Mode", "markdown":valid_plan("Add Plan Mode")}),
+        )
+        .await
+        .expect("write plan");
+    assert!(written.artifacts[0].ends_with("plans/add-plan-mode.md"));
+    let revised = valid_plan("Revised Plan");
+    let updated = first
+        .execute(
+            "write_plan",
+            json!({"title":"A Different Title", "markdown":revised}),
+        )
+        .await
+        .expect("update plan");
+    assert_eq!(updated.artifacts, written.artifacts);
+
+    let second_context =
+        Arc::new(PlanContextStore::new(workspace.path(), state.path(), "second").expect("context"));
+    second_context.prepare().await.expect("prepare");
+    let second = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(second_context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    let collision = second
+        .execute(
+            "write_plan",
+            json!({"title":"Add Plan Mode", "markdown":valid_plan("Add Plan Mode")}),
+        )
+        .await
+        .expect("collision-safe plan");
+    assert!(collision.artifacts[0].ends_with("plans/add-plan-mode-2.md"));
+}
+
+#[tokio::test]
+async fn plan_writer_requires_structured_sections_and_sanitizes_the_title() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "validation").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    let error = tools
+        .execute(
+            "write_plan",
+            json!({"title":"Incomplete", "markdown":"Summary\nNo headings."}),
+        )
+        .await
+        .expect_err("missing headings");
+    assert!(error.to_string().contains("summary"));
+
+    let observation = tools
+        .execute(
+            "write_plan",
+            json!({"title":"../../Outside", "markdown":valid_plan("Contained")}),
+        )
+        .await
+        .expect("sanitized title");
+    assert!(
+        observation.artifacts[0].starts_with(
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join("plans")
+        )
+    );
+    assert!(
+        !workspace
+            .path()
+            .parent()
+            .expect("parent")
+            .join("Outside.md")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn clarification_is_persisted_as_typed_user_input_request() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "question").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(Arc::clone(&context)),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    let result = tools
+        .execute(
+            "ask_user",
+            json!({
+                "id":"surface",
+                "header":"Surface",
+                "question":"Where should this ship?",
+                "options":[
+                    {"label":"TUI", "description":"Interactive first."},
+                    {"label":"Everywhere", "description":"Larger scope."}
+                ]
+            }),
+        )
+        .await;
+    assert!(matches!(result, Err(ToolError::UserInputRequired { .. })));
+    assert_eq!(
+        context
+            .pending_question()
+            .await
+            .expect("pending")
+            .expect("question")
+            .id,
+        "surface"
+    );
+
+    let resumed =
+        PlanContextStore::new(workspace.path(), state.path(), "question").expect("resumed context");
+    resumed.prepare().await.expect("resume");
+    assert_eq!(
+        resumed
+            .pending_question()
+            .await
+            .expect("pending after restart")
+            .expect("resumed question")
+            .id,
+        "surface"
+    );
+    resumed.clear_pending_question().await.expect("answer");
+    assert!(
+        resumed
+            .pending_question()
+            .await
+            .expect("cleared question")
+            .is_none()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plan_state_dir = state.path().join("plan-mode");
+        let state_file = std::fs::read_dir(&plan_state_dir)
+            .expect("plan state directory")
+            .next()
+            .expect("state entry")
+            .expect("state file")
+            .path();
+        assert_eq!(
+            std::fs::metadata(plan_state_dir)
+                .expect("state dir mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(state_file)
+                .expect("state file mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[tokio::test]
+async fn plan_state_resets_only_after_a_completed_handoff() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "handoff").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(Arc::clone(&context)),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    tools
+        .execute(
+            "write_plan",
+            json!({"title":"Handoff", "markdown":valid_plan("Handoff")}),
+        )
+        .await
+        .expect("plan");
+
+    let resumed =
+        PlanContextStore::new(workspace.path(), state.path(), "handoff").expect("resumed context");
+    resumed.prepare().await.expect("resume before handoff");
+    assert!(
+        resumed
+            .validated_artifact()
+            .await
+            .expect("artifact")
+            .is_some()
+    );
+    resumed.mark_handed_off().await.expect("handoff");
+
+    let next =
+        PlanContextStore::new(workspace.path(), state.path(), "handoff").expect("next context");
+    next.prepare().await.expect("prepare after handoff");
+    assert!(
+        next.validated_artifact()
+            .await
+            .expect("reset artifact")
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bound_plan_rejects_a_replacement_symlink() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let outside = TempDir::new().expect("outside");
+    let outside_file = outside.path().join("outside.md");
+    std::fs::write(&outside_file, "outside").expect("outside fixture");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "symlink").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    let first = tools
+        .execute(
+            "write_plan",
+            json!({"title":"Safe Target", "markdown":valid_plan("Safe Target")}),
+        )
+        .await
+        .expect("first plan");
+    let plan = &first.artifacts[0];
+    std::fs::remove_file(plan).expect("remove plan fixture");
+    std::os::unix::fs::symlink(&outside_file, plan).expect("replace with symlink");
+
+    let error = tools
+        .execute(
+            "write_plan",
+            json!({"title":"Safe Target", "markdown":valid_plan("Revision")}),
+        )
+        .await
+        .expect_err("symlink must fail closed");
+    assert!(error.to_string().contains("symlink"));
+    assert_eq!(
+        std::fs::read_to_string(outside_file).expect("outside remains readable"),
+        "outside"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_changes_only_its_bound_project_artifact() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    std::fs::create_dir(workspace.path().join("src")).expect("src");
+    std::fs::write(workspace.path().join("src/lib.rs"), "pub fn stable() {}\n").expect("fixture");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "snapshot").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let tools = ToolRegistry::with_default_tools(
+        workspace.path(),
+        ToolPolicy {
+            agent_mode: AgentMode::Plan,
+            plan_context: Some(context),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("registry");
+    tools
+        .execute("list_files", json!({"path":"."}))
+        .await
+        .expect("inspect");
+    tools
+        .execute("read_file", json!({"path":"src/lib.rs"}))
+        .await
+        .expect("read");
+    let artifact = tools
+        .execute(
+            "write_plan",
+            json!({"title":"Snapshot", "markdown":valid_plan("Snapshot")}),
+        )
+        .await
+        .expect("write plan")
+        .artifacts
+        .remove(0);
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("src/lib.rs")).expect("source"),
+        "pub fn stable() {}\n"
+    );
+    let files = walkdir::WalkDir::new(workspace.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(workspace.path())
+                .expect("relative")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    assert!(files.contains(&std::path::PathBuf::from("src/lib.rs")));
+    let canonical_workspace = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    assert!(
+        files.contains(
+            &artifact
+                .strip_prefix(canonical_workspace)
+                .expect("artifact relative")
+                .to_owned()
+        )
+    );
 }
 
 #[tokio::test]
@@ -106,6 +530,7 @@ async fn mockup_workspace_explains_how_to_access_a_sibling_vv_file() {
             agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["find".into()]),
             approvals: None,
+            plan_context: None,
         },
     )
     .expect("registry");
@@ -230,6 +655,7 @@ async fn process_path_screening_preserves_normal_flags_and_urls() {
             agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["printf".into()]),
             approvals: None,
+            plan_context: None,
         },
     )
     .expect("registry");
@@ -593,6 +1019,7 @@ async fn process_tool_caps_observation_bytes() {
             agent_mode: AgentMode::Default,
             allowed_programs: Some(vec!["printf".into()]),
             approvals: None,
+            plan_context: None,
         },
     )
     .expect("registry should initialize");
@@ -638,6 +1065,7 @@ fn process_registry(
                     .collect(),
             ),
             approvals: None,
+            plan_context: None,
         },
     )
     .expect("registry should initialize")

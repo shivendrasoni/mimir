@@ -5,6 +5,7 @@ mod file;
 mod ipython;
 mod mcp;
 mod path_policy;
+mod plan;
 mod process;
 mod rlm;
 
@@ -29,6 +30,7 @@ pub use approval::{
 pub use bash::{BashResult, BashRunner};
 pub use mcp::{McpRegistrationReport, McpUnavailableServer};
 pub use path_policy::WorkspacePathPolicy;
+pub use plan::{ClarifyingOption, ClarifyingQuestion, PlanContextStore};
 
 #[derive(Debug, Clone)]
 #[allow(
@@ -46,6 +48,7 @@ pub struct ToolPolicy {
     pub agent_mode: AgentMode,
     pub allowed_programs: Option<Vec<String>>,
     pub approvals: Option<Arc<WorkspaceApprovalStore>>,
+    pub plan_context: Option<Arc<PlanContextStore>>,
 }
 
 impl Default for ToolPolicy {
@@ -61,6 +64,7 @@ impl Default for ToolPolicy {
             agent_mode: AgentMode::Default,
             allowed_programs: None,
             approvals: None,
+            plan_context: None,
         }
     }
 }
@@ -70,6 +74,7 @@ impl Default for ToolPolicy {
 pub enum AgentMode {
     #[default]
     Default,
+    Plan,
     Auto,
 }
 
@@ -78,6 +83,7 @@ impl AgentMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Plan => "plan",
             Self::Auto => "auto",
         }
     }
@@ -86,6 +92,7 @@ impl AgentMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "default" => Some(Self::Default),
+            "plan" => Some(Self::Plan),
             "auto" => Some(Self::Auto),
             _ => None,
         }
@@ -94,6 +101,11 @@ impl AgentMode {
     #[must_use]
     pub const fn automatically_approves(self) -> bool {
         matches!(self, Self::Auto)
+    }
+
+    #[must_use]
+    pub const fn is_plan(self) -> bool {
+        matches!(self, Self::Plan)
     }
 }
 
@@ -136,6 +148,8 @@ pub enum ToolError {
     Disabled { tool: String },
     #[error("workspace approval required to {}: {command}", request.action.label(), command = request.command)]
     ApprovalRequired { request: PermissionRequest },
+    #[error("user input is required")]
+    UserInputRequired { request: ClarifyingQuestion },
     #[error("tool {tool} failed: {message}")]
     Execution { tool: String, message: String },
     #[error(transparent)]
@@ -161,6 +175,7 @@ pub struct ToolRegistry {
     rlm_runtime: Option<Arc<crate::extensions::RlmRuntime>>,
     workspace_root: Arc<PathBuf>,
     agent_mode: AgentMode,
+    plan_context: Option<Arc<PlanContextStore>>,
 }
 
 impl ToolRegistry {
@@ -176,12 +191,29 @@ impl ToolRegistry {
             rlm_runtime: None,
             workspace_root: Arc::new(paths.root().to_owned()),
             agent_mode: policy.agent_mode,
+            plan_context: policy.plan_context.clone(),
         };
         registry.register(file::ReadFileTool::new(paths.clone(), policy.clone()));
-        registry.register(file::WriteFileTool::new(paths.clone(), policy.clone()));
-        registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
         registry.register(file::SearchTool::new(paths.clone(), policy.clone()));
+        if policy.agent_mode == AgentMode::Plan {
+            let context = policy
+                .plan_context
+                .clone()
+                .ok_or_else(|| ToolError::Execution {
+                    tool: "plan_mode".into(),
+                    message: "plan mode requires a durable plan context".into(),
+                })?;
+            registry.register(plan::AskUserTool::new(Arc::clone(&context)));
+            registry.register(plan::WritePlanTool::new(
+                paths,
+                context,
+                policy.max_write_bytes,
+            ));
+            return Ok(registry);
+        }
+        registry.register(file::WriteFileTool::new(paths.clone(), policy.clone()));
+        registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
         #[cfg(unix)]
         if policy.allow_shell {
             registry.register(bash::BashTool::new(paths.root(), policy.clone())?);
@@ -203,6 +235,9 @@ impl ToolRegistry {
         let permission_guidance = match self.agent_mode {
             AgentMode::Default => {
                 "Workspace writes and model-issued Bash commands require explicit approval."
+            }
+            AgentMode::Plan => {
+                "Plan mode is active. Explore the workspace before deciding. Ask one focused clarifying question with ask_user whenever a material product or implementation choice cannot be discovered. Recommend the best option first and resolve low-risk details yourself. Do not implement, run commands, delegate, or mutate workspace files. When the plan is decision-complete, write it with write_plan; that bound plan artifact is the only workspace file plan mode may create or update."
             }
             AgentMode::Auto => {
                 "Auto mode is active: workspace writes and model-issued Bash commands run without approval prompts."
@@ -234,6 +269,7 @@ impl ToolRegistry {
         &mut self,
         manager: &Arc<crate::extensions::ExtensionManager>,
     ) -> Result<(), ToolError> {
+        self.deny_plan_registration("extension tools")?;
         for descriptor in manager.tools() {
             if self.tools.contains_key(&descriptor.name) {
                 return Err(ToolError::Execution {
@@ -259,6 +295,7 @@ impl ToolRegistry {
         entries: Vec<crate::extensions::CatalogEntry>,
         workspace: &Path,
     ) -> Result<(), ToolError> {
+        self.deny_plan_registration("extension tools")?;
         let tool = extension::ExtensionInvokeTool::from_catalog(entries, workspace)?;
         if !tool.is_empty() {
             self.register(tool);
@@ -282,6 +319,7 @@ impl ToolRegistry {
         &mut self,
         state_root: &Path,
     ) -> Result<McpRegistrationReport, ToolError> {
+        self.deny_plan_registration("MCP tools")?;
         let discovery = mcp::discover(state_root).await?;
         let mut report = discovery.report;
         for tool in discovery.tools {
@@ -327,6 +365,7 @@ impl ToolRegistry {
             rlm_runtime: None,
             workspace_root: Arc::clone(&self.workspace_root),
             agent_mode: self.agent_mode,
+            plan_context: self.plan_context.clone(),
         }
     }
 
@@ -339,6 +378,7 @@ impl ToolRegistry {
         &mut self,
         runtime: Arc<crate::extensions::RlmRuntime>,
     ) -> Result<(), ToolError> {
+        self.deny_plan_registration("RLM child tools")?;
         rlm::register(self, Arc::clone(&runtime))?;
         self.rlm_runtime = Some(runtime);
         Ok(())
@@ -419,6 +459,7 @@ impl ToolRegistry {
         session: &str,
         policy: ToolPolicy,
     ) -> Result<(), ToolError> {
+        self.deny_plan_registration("IPython")?;
         let tool = ipython::IpythonTool::new(workspace, state_root, session, policy)?;
         if self.tools.contains_key("ipython") {
             return Err(ToolError::Execution {
@@ -452,6 +493,7 @@ impl ToolRegistry {
     ///
     /// Returns a typed error for unknown tools, invalid arguments, denied policy, or execution failure.
     pub async fn execute(&self, name: &str, input: Value) -> Result<ToolObservation, ToolError> {
+        self.enforce_mode(name)?;
         let tool = self.tools.get(name).ok_or_else(|| ToolError::Execution {
             tool: name.into(),
             message: "tool is not registered".into(),
@@ -472,11 +514,88 @@ impl ToolRegistry {
         input: Value,
         cancellation: &CancellationToken,
     ) -> Result<ToolObservation, ToolError> {
+        self.enforce_mode(name)?;
         let tool = self.tools.get(name).ok_or_else(|| ToolError::Execution {
             tool: name.into(),
             message: "tool is not registered".into(),
         })?;
         tool.execute_cancellable(input, cancellation).await
+    }
+
+    fn enforce_mode(&self, name: &str) -> Result<(), ToolError> {
+        if self.agent_mode == AgentMode::Plan
+            && !matches!(
+                name,
+                "read_file" | "list_files" | "search" | "ask_user" | "write_plan"
+            )
+        {
+            return Err(ToolError::Disabled { tool: name.into() });
+        }
+        Ok(())
+    }
+
+    fn deny_plan_registration(&self, capability: &str) -> Result<(), ToolError> {
+        if self.agent_mode.is_plan() {
+            return Err(ToolError::Execution {
+                tool: "plan_mode".into(),
+                message: format!("{capability} are disabled in plan mode"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the unresolved structured clarification for the active plan session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error when private plan state cannot be read.
+    pub async fn pending_plan_question(&self) -> Result<Option<ClarifyingQuestion>, ToolError> {
+        let Some(context) = self.plan_context() else {
+            return Ok(None);
+        };
+        context.pending_question().await
+    }
+
+    /// Clears the active plan session's pending clarification after a user answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error when private plan state cannot be written.
+    pub async fn clear_pending_plan_question(&self) -> Result<(), ToolError> {
+        if let Some(context) = self.plan_context() {
+            context.clear_pending_question().await?;
+        }
+        Ok(())
+    }
+
+    /// Returns the validated regular plan artifact bound to the active plan session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy or I/O error when the bound artifact is unsafe or unreadable.
+    pub async fn plan_artifact(&self) -> Result<Option<PathBuf>, ToolError> {
+        let Some(context) = self.plan_context() else {
+            return Ok(None);
+        };
+        context.validated_artifact().await
+    }
+
+    /// Records that the bound plan was handed to a rebuilt implementation runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error when no plan is bound or state cannot be written.
+    pub async fn mark_plan_handed_off(&self) -> Result<(), ToolError> {
+        let Some(context) = self.plan_context() else {
+            return Err(ToolError::Disabled {
+                tool: "write_plan".into(),
+            });
+        };
+        context.mark_handed_off().await
+    }
+
+    fn plan_context(&self) -> Option<Arc<PlanContextStore>> {
+        self.plan_context.clone()
     }
 }
 

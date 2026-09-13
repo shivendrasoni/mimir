@@ -18,7 +18,8 @@ use mimir::{
         FileSessionStore, InMemorySessionStore, SessionPayload, SessionRecord, SessionStore,
     },
     tools::{
-        AgentMode, ApprovalDecision, DestructiveAction, PermissionRequest, ToolPolicy, ToolRegistry,
+        AgentMode, ApprovalDecision, ClarifyingOption, ClarifyingQuestion, DestructiveAction,
+        PermissionRequest, ToolPolicy, ToolRegistry,
     },
 };
 use tempfile::TempDir;
@@ -63,6 +64,18 @@ fn parses_supported_slash_commands_and_arguments() {
         parse_slash_command("/mode auto"),
         Some(SlashCommand::Mode {
             mode: Some(AgentMode::Auto),
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/mode plan"),
+        Some(SlashCommand::Mode {
+            mode: Some(AgentMode::Plan),
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/implement keep compatibility"),
+        Some(SlashCommand::Implement {
+            instructions: Some("keep compatibility".into()),
         })
     );
     assert!(matches!(
@@ -359,12 +372,74 @@ fn mode_command_switches_between_confirmed_and_automatic_execution() {
         Some(TuiAction::SetAgentMode(AgentMode::Auto))
     );
 
+    submit_command(&mut app, "/mode plan");
+    assert_eq!(app.agent_mode(), AgentMode::Plan);
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::SetAgentMode(AgentMode::Plan))
+    );
+
+    submit_command(&mut app, "IMPLEMENT");
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::ImplementPlan { instructions: None })
+    );
+
+    submit_command(&mut app, "please implement after another revision");
+    assert_eq!(
+        app.pending_submission().as_deref(),
+        Some("please implement after another revision")
+    );
+    app.clear_pending_submission();
+
     submit_command(&mut app, "/mode default");
     assert_eq!(app.agent_mode(), AgentMode::Default);
     assert_eq!(
         app.take_tui_action(),
         Some(TuiAction::SetAgentMode(AgentMode::Default))
     );
+}
+
+#[test]
+fn clarification_overlay_accepts_options_and_free_form_answers() {
+    let request = ClarifyingQuestion {
+        id: "surface".into(),
+        header: "Surface".into(),
+        question: "Where should this ship?".into(),
+        options: vec![
+            ClarifyingOption {
+                label: "TUI".into(),
+                description: "Interactive first.".into(),
+            },
+            ClarifyingOption {
+                label: "Everywhere".into(),
+                description: "Larger scope.".into(),
+            },
+        ],
+    };
+    let mut app = App::new(AppConfig::default());
+    app.apply_stream_event(StreamEvent::UserInputRequested(request.clone()));
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 24,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+    assert!(rendered.contains("TUI (Recommended)"));
+    assert!(rendered.contains("Other:"));
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(app.pending_submission().as_deref(), Some("TUI"));
+
+    app.clear_pending_submission();
+    app.open_clarification(request);
+    app.apply_key(KeyEvent::plain(KeyCode::Char('c')));
+    app.apply_key(KeyEvent::plain(KeyCode::Char('u')));
+    app.apply_key(KeyEvent::plain(KeyCode::Char('s')));
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(app.pending_submission().as_deref(), Some("cus"));
 }
 
 #[test]
@@ -378,6 +453,17 @@ fn settings_overlay_is_an_interactive_runtime_selector() {
             if selector.kind == OverlayKind::Settings && selector.options.len() >= 8
     ));
     for _ in 0..6 {
+        app.apply_key(KeyEvent::plain(KeyCode::Down));
+    }
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(app.agent_mode(), AgentMode::Plan);
+    assert_eq!(
+        app.take_tui_action(),
+        Some(TuiAction::SetAgentMode(AgentMode::Plan))
+    );
+
+    submit_command(&mut app, "/settings");
+    for _ in 0..7 {
         app.apply_key(KeyEvent::plain(KeyCode::Down));
     }
     app.apply_key(KeyEvent::plain(KeyCode::Enter));

@@ -5,6 +5,7 @@ use std::{
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HARNESS_CONTEXT_CHARS: usize = 12 * 1024;
 const MAX_HARNESS_CONTEXT_ENTRIES: usize = 24;
+const MAX_REMEMBER_BYTES: usize = 4 * 1024;
 const REFINEMENT_SYSTEM_PROMPT: &str = r#"You are Mimir's continual harness refinement subsystem.
 Return JSON only with this shape:
 {"summary":"one sentence","rationale":"evidence","expectedOutcome":"outcome","edits":[{"action":"create|update|delete","kind":"prompt|memory|skill|subagent","id":"optional for create","title":"required except delete","content":"required except delete","path":"optional","reference":{},"arguments":{},"metadata":{},"reason":"why"}]}
@@ -355,8 +357,140 @@ pub async fn refine(
         )
     };
 
-    let history_path = history_path_for_state(&state_path)?;
+    persist_proposal(
+        &root,
+        &project_root,
+        scope,
+        baseline,
+        state_path,
+        proposal,
+        rollback_of,
+    )
+    .await
+}
+
+/// Persists one explicit user-requested memory through the same versioned
+/// refinement coordinator used by `/refine`.
+///
+/// # Errors
+///
+/// Returns a validation, safe-path, concurrency, or durable I/O error. Fleet
+/// memory is read-only and must arrive through a signed learning pack.
+pub async fn remember(
+    state_root: &Path,
+    workspace: &Path,
+    session_id: &str,
+    scope: HarnessScope,
+    memory: &str,
+) -> Result<RefinementResult> {
+    validate_options(session_id, &RefineOptions::default())?;
+    if scope == HarnessScope::Fleet {
+        return Err(MimirError::Configuration(
+            "fleet learning packs are read-only and cannot store a memory".into(),
+        ));
+    }
+    let memory = memory.trim();
+    if memory.is_empty() || memory.len() > MAX_REMEMBER_BYTES {
+        return Err(MimirError::Configuration(format!(
+            "remembered text must be between 1 and {MAX_REMEMBER_BYTES} bytes"
+        )));
+    }
+
+    let root = canonical_state_root(state_root);
+    let project_root = learning::discover_project_root(workspace)?;
+    if scope == HarnessScope::Project {
+        learning::ensure_project_marker(&project_root).await?;
+    }
+    let state_path = harness_state_path(&root, &project_root, session_id, scope);
     let storage_root = storage_root_for_scope(&root, &project_root, scope);
+    let baseline = load_state(storage_root, &state_path).await?;
+    let title = remembered_title(memory);
+    let id = remembered_id(memory);
+    let action = if baseline.entries.memory.contains_key(&id) {
+        RefinementAction::Update
+    } else {
+        RefinementAction::Create
+    };
+    let proposal = RefinementProposal {
+        summary: format!("Remembered {title}"),
+        rationale: "The user explicitly requested durable remembrance.".into(),
+        expected_outcome: "Future applicable turns receive this memory as bounded harness context."
+            .into(),
+        edits: vec![RefinementEdit {
+            action,
+            kind: RefinementKind::Memory,
+            id: Some(id),
+            title: Some(title),
+            content: Some(memory.to_owned()),
+            path: Some("remembered".into()),
+            reference: None,
+            arguments: None,
+            metadata: Some(BTreeMap::from([
+                ("origin".into(), serde_json::json!("explicit_user_memory")),
+                ("priority".into(), serde_json::json!(50)),
+            ])),
+            reason: Some("Explicit natural-language remember request".into()),
+        }],
+    };
+    let result = persist_proposal(
+        &root,
+        &project_root,
+        scope,
+        baseline,
+        state_path,
+        proposal,
+        None,
+    )
+    .await?;
+    if let Some(edit) = result.applied_edits.first()
+        && !edit.applied
+    {
+        return Err(MimirError::Protocol(
+            edit.error
+                .clone()
+                .unwrap_or_else(|| "memory refinement was not applied".into()),
+        ));
+    }
+    Ok(result)
+}
+
+fn remembered_title(memory: &str) -> String {
+    let compact = memory.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = compact.chars().take(72).collect::<String>();
+    if compact.chars().count() > 72 {
+        title.push_str("...");
+    }
+    title
+}
+
+fn remembered_id(memory: &str) -> String {
+    let digest = Sha256::digest(memory.as_bytes());
+    let suffix = digest[..6]
+        .iter()
+        .fold(String::with_capacity(12), |mut output, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{byte:02x}");
+            output
+        });
+    let prefix = slug(memory);
+    format!("remember_{prefix}_{suffix}")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the coordinator transaction receives explicit validated scope, paths, baseline, proposal, and rollback provenance"
+)]
+async fn persist_proposal(
+    root: &Path,
+    project_root: &Path,
+    scope: HarnessScope,
+    baseline: HarnessState,
+    state_path: PathBuf,
+    proposal: RefinementProposal,
+    rollback_of: Option<String>,
+) -> Result<RefinementResult> {
+    let history_path = history_path_for_state(&state_path)?;
+    let storage_root = storage_root_for_scope(root, project_root, scope);
     prepare_state_path(storage_root, &state_path).await?;
     prepare_state_path(storage_root, &history_path).await?;
     let lock = path_lock(&state_path);

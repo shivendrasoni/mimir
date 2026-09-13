@@ -1,8 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
-use mimir::tools::{
-    AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus,
-    PlanContextStore, ToolError, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
+use mimir::{
+    refinement,
+    tools::{
+        AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus,
+        PlanContextStore, ToolError, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
+    },
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -1615,4 +1618,107 @@ async fn writes_reject_symlinks_that_escape_the_workspace() {
         std::fs::read_to_string(outside_file).expect("outside remains"),
         "unchanged"
     );
+}
+
+#[tokio::test]
+async fn remember_tool_persists_deduplicated_project_memory_and_stays_parent_only() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let mut tools =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
+    tools
+        .register_remember_tool(state.path(), "main")
+        .expect("remember tool");
+
+    let definition = tools
+        .definitions()
+        .into_iter()
+        .find(|definition| definition.name == "remember")
+        .expect("remember definition");
+    assert_eq!(definition.parameters["required"], json!(["memory"]));
+    assert_eq!(
+        definition.parameters["properties"]["scope"]["default"],
+        "project"
+    );
+    assert!(
+        tools
+            .fork_for_child_runtime()
+            .definitions()
+            .iter()
+            .all(|definition| definition.name != "remember")
+    );
+
+    let input = json!({"memory": "Always run strict Clippy before completion."});
+    let first = tools
+        .execute("remember", input.clone())
+        .await
+        .expect("remember project guidance");
+    assert_eq!(first.status, ObservationStatus::Success);
+    let first_content: serde_json::Value =
+        serde_json::from_str(&first.content).expect("structured observation");
+    assert_eq!(first_content["scope"], "project");
+    let memory_id = first_content["memory_id"]
+        .as_str()
+        .expect("memory id")
+        .to_owned();
+
+    tools
+        .execute("remember", input)
+        .await
+        .expect("repeat updates the same memory");
+    let harness_path = workspace
+        .path()
+        .join(".mimir/learning/harness/harness_state.json");
+    let harness: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&harness_path).expect("project harness state"))
+            .expect("project harness json");
+    assert_eq!(harness["entries"]["memory"][&memory_id]["version"], 2);
+    assert_eq!(
+        harness["entries"]["memory"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(1)
+    );
+
+    let context = refinement::load_harness_context_for_workspace(
+        state.path(),
+        workspace.path(),
+        "fresh-session",
+        Some("Clippy completion"),
+    )
+    .await
+    .expect("future project context");
+    assert!(context.contains("Always run strict Clippy before completion."));
+    assert!(context.contains("[project memory:"));
+
+    tools
+        .execute(
+            "remember",
+            json!({
+                "memory": "Across all projects, explain native build implications one step at a time.",
+                "scope": "user"
+            }),
+        )
+        .await
+        .expect("remember explicit cross-project guidance");
+    let other_workspace = TempDir::new().expect("other workspace");
+    let user_context = refinement::load_harness_context_for_workspace(
+        state.path(),
+        other_workspace.path(),
+        "other-session",
+        None,
+    )
+    .await
+    .expect("user context");
+    assert!(user_context.contains("Across all projects"));
+    assert!(user_context.contains("[user memory:"));
+
+    let error = tools
+        .execute(
+            "remember",
+            json!({"memory": "Unsigned shared memory", "scope": "fleet"}),
+        )
+        .await
+        .expect_err("fleet memory remains read-only");
+    assert!(error.to_string().contains("read-only"));
 }

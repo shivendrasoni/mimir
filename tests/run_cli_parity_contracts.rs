@@ -107,6 +107,45 @@ fn help_exposes_reference_run_flags_and_rejects_unsafe_combinations() {
 }
 
 #[test]
+fn operational_limit_flags_and_environment_accept_unlimited() {
+    let flags = binary()
+        .args([
+            "--max-turns",
+            "unlimited",
+            "--max-run-tokens",
+            "unlimited",
+            "--autonomous-max-continuations",
+            "unlimited",
+            "--autonomous-max-turns",
+            "unlimited",
+            "--autonomous-max-tokens",
+            "unlimited",
+            "--autonomous-timeout-ms",
+            "unlimited",
+            "--help",
+        ])
+        .output()
+        .expect("unlimited flags");
+    assert!(
+        flags.status.success(),
+        "{}",
+        String::from_utf8_lossy(&flags.stderr)
+    );
+
+    let environment = binary()
+        .env("MIMIR_MAX_TURNS", "unlimited")
+        .env("MIMIR_MAX_RUN_TOKENS", "unlimited")
+        .arg("--help")
+        .output()
+        .expect("unlimited environment");
+    assert!(
+        environment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&environment.stderr)
+    );
+}
+
+#[test]
 fn process_tool_selection_requires_explicit_authorization_and_an_exact_allowlist() {
     let workspace = TempDir::new().expect("workspace");
     let state = workspace.path().join("state");
@@ -731,67 +770,4 @@ fn package_cli_uses_the_audited_local_package_manager() {
         "{}",
         String::from_utf8_lossy(&removed.stderr)
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn autonomous_quality_gates_execute_without_a_shell_and_honor_retries() {
-    let workspace = TempDir::new().expect("workspace");
-    let state = workspace.path().join("state");
-    let success = binary()
-        .args([
-            "--provider",
-            "fake",
-            "--workspace",
-            workspace.path().to_str().expect("workspace"),
-            "--state-dir",
-            state.to_str().expect("state"),
-            "--no-session",
-            "--allow-process",
-            "--allowed-programs",
-            "/usr/bin/true",
-            "--autonomous-gate",
-            "/usr/bin/true",
-            "--fake-response",
-            "done",
-            "--print",
-            "implement",
-        ])
-        .output()
-        .expect("successful gate");
-    assert!(
-        success.status.success(),
-        "{}",
-        String::from_utf8_lossy(&success.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&success.stdout).lines().count(), 1);
-
-    let failure = binary()
-        .args([
-            "--provider",
-            "fake",
-            "--workspace",
-            workspace.path().to_str().expect("workspace"),
-            "--state-dir",
-            state.to_str().expect("state"),
-            "--no-session",
-            "--allow-process",
-            "--allowed-programs",
-            "/usr/bin/false",
-            "--autonomous-gate",
-            "/usr/bin/false",
-            "--autonomous-gate-retries",
-            "1",
-            "--fake-response",
-            "first",
-            "--fake-response",
-            "second",
-            "--print",
-            "implement",
-        ])
-        .output()
-        .expect("failing gate");
-    assert!(!failure.status.success());
-    assert!(String::from_utf8_lossy(&failure.stderr).contains("quality gates failed"));
-    assert_eq!(String::from_utf8_lossy(&failure.stdout).lines().count(), 2);
 }

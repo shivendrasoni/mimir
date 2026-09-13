@@ -48,7 +48,7 @@ Every release must preserve these invariants:
 | Provider | `provider_rate_limited` | HTTP 429 | Bounded backoff |
 | Provider | `provider_unavailable` | timeout, connection reset, 5xx | Bounded backoff |
 | Provider | `provider_protocol` | malformed SSE, incomplete tool JSON | No blind retry; preserve evidence |
-| Budget | `budget_paused` | turn, tool-call, fresh-input-plus-output, or elapsed ceiling reached | Preserve the session; continue with a fresh run or restart with an explicit limit |
+| Budget | `budget_paused` | an explicitly configured or metered-provider ceiling is reached | Preserve the session; raise the finite limit or select its `unlimited` override |
 | Context | `context_pressure` | projected request crosses threshold | Compact before provider call |
 | Process | `process_spawn_failed` | executable unavailable | No retry without changed input |
 | Process | `process_exit_nonzero` | command exits with failure | Agent may adjust command |

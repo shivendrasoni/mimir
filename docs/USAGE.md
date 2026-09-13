@@ -20,9 +20,10 @@ mimir --agent-mode auto
 # Plan mode inspects and clarifies, then writes one reviewable plan artifact
 mimir --agent-mode plan
 
-# Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
+# Apply or remove explicit operational limits
 mimir --max-turns 128
 mimir --max-run-tokens 2000000
+mimir --max-turns unlimited --max-run-tokens unlimited
 
 # Versioned JSON events
 mimir --output json --print "summarize the project"
@@ -59,6 +60,10 @@ Python 3 is optional and starts only when the explicitly authorized `ipython` to
 
 ## Runtime budgets
 
-The per-prompt provider-turn budget defaults to 64. Change it with `--max-turns` or `MIMIR_MAX_TURNS`. Reaching the limit is a recoverable budget pause: the session remains intact and a new message starts a fresh per-prompt budget.
+Official `anthropic` and `openai-codex` providers default to unrestricted top-level turns, tool calls, operational tokens, elapsed time, and autonomous continuations. Other providers default to a 1,000,000-token ceiling per logical task, counting fresh input plus output. Provider-cached input remains visible in diagnostics and context measurements but is not charged to the operational budget again.
 
-The cumulative run-token budget defaults to 1,000,000 fresh-input plus output tokens. Change it with `--max-run-tokens` or `MIMIR_MAX_RUN_TOKENS`. Provider-cached input remains visible in diagnostics and context measurements, but replaying it does not consume the run budget a second time.
+Use `--max-turns`, `--max-run-tokens`, or their `MIMIR_MAX_TURNS` and `MIMIR_MAX_RUN_TOKENS` environment equivalents to override that policy with a positive number or `unlimited`. Autonomous-specific limit flags accept the same `unlimited` value and supersede ordinary run limits for the full initial-prompt-plus-continuations task.
+
+Context windows are never unlimited. Automatic compaction remains enabled by default and runs before the projected provider request reaches the model's configured context threshold. Per-request provider timeouts, cancellation, tool/output bounds, recursive-child budgets, and provider quota errors also remain enforced.
+
+Autonomous mode exposes `finish_task` only while it is active. The agent calls it after completing and validating the work; configured quality gates must pass before completion is accepted. `/autonomous cancel` or normal cancellation remains available at any time.

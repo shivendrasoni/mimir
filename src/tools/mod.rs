@@ -1,5 +1,6 @@
 mod approval;
 mod bash;
+mod completion;
 mod extension;
 mod file;
 mod ipython;
@@ -28,6 +29,7 @@ pub use approval::{
     ApprovalDecision, DestructiveAction, PermissionRequest, WorkspaceApprovalStore,
 };
 pub use bash::{BashResult, BashRunner};
+pub use completion::TaskCompletion;
 pub use mcp::{McpRegistrationReport, McpUnavailableServer};
 pub use path_policy::WorkspacePathPolicy;
 pub use plan::{ClarifyingOption, ClarifyingQuestion, PlanContextStore};
@@ -176,6 +178,7 @@ pub struct ToolRegistry {
     workspace_root: Arc<PathBuf>,
     agent_mode: AgentMode,
     plan_context: Option<Arc<PlanContextStore>>,
+    task_completion: Option<Arc<completion::TaskCompletionSignal>>,
 }
 
 impl ToolRegistry {
@@ -192,6 +195,7 @@ impl ToolRegistry {
             workspace_root: Arc::new(paths.root().to_owned()),
             agent_mode: policy.agent_mode,
             plan_context: policy.plan_context.clone(),
+            task_completion: None,
         };
         registry.register(file::ReadFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::ListFilesTool::new(paths.clone(), policy.clone()));
@@ -214,6 +218,12 @@ impl ToolRegistry {
         }
         registry.register(file::WriteFileTool::new(paths.clone(), policy.clone()));
         registry.register(file::EditFileTool::new(paths.clone(), policy.clone()));
+        let completion = Arc::new(completion::TaskCompletionSignal::default());
+        registry.register(completion::FinishTaskTool::new(
+            paths.clone(),
+            Arc::clone(&completion),
+        ));
+        registry.task_completion = Some(completion);
         #[cfg(unix)]
         if policy.allow_shell {
             registry.register(bash::BashTool::new(paths.root(), policy.clone())?);
@@ -359,13 +369,16 @@ impl ToolRegistry {
             tools: self
                 .tools
                 .iter()
-                .filter(|(name, _)| !rlm::is_reserved(name) && name.as_str() != "ipython")
+                .filter(|(name, _)| {
+                    !rlm::is_reserved(name) && !matches!(name.as_str(), "ipython" | "finish_task")
+                })
                 .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
                 .collect(),
             rlm_runtime: None,
             workspace_root: Arc::clone(&self.workspace_root),
             agent_mode: self.agent_mode,
             plan_context: self.plan_context.clone(),
+            task_completion: None,
         }
     }
 
@@ -472,14 +485,47 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.tools
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str() != "finish_task"
+                    || self
+                        .task_completion
+                        .as_ref()
+                        .is_some_and(|signal| signal.enabled())
+            })
+            .map(|(_, tool)| tool.definition())
+            .collect()
+    }
+
+    pub fn set_autonomous_completion_enabled(&self, enabled: bool) {
+        if let Some(signal) = &self.task_completion {
+            signal.set_enabled(enabled);
+        }
+    }
+
+    pub async fn clear_task_completion(&self) {
+        if let Some(signal) = &self.task_completion {
+            signal.clear().await;
+        }
+    }
+
+    pub async fn take_task_completion(&self) -> Option<TaskCompletion> {
+        let signal = self.task_completion.as_ref()?;
+        signal.take().await
+    }
+
+    pub async fn task_completion(&self) -> Option<TaskCompletion> {
+        let signal = self.task_completion.as_ref()?;
+        signal.get().await
     }
 
     /// Retains only explicitly selected tool names and returns requested names
     /// that were not registered. This keeps CLI allowlists fail-closed after
     /// extensions and remote MCP tools have been discovered.
     pub fn retain_named(&mut self, allowed: &BTreeSet<String>) -> Vec<String> {
-        self.tools.retain(|name, _| allowed.contains(name));
+        self.tools
+            .retain(|name, _| name == "finish_task" || allowed.contains(name));
         allowed
             .iter()
             .filter(|name| !self.tools.contains_key(*name))
@@ -523,6 +569,14 @@ impl ToolRegistry {
     }
 
     fn enforce_mode(&self, name: &str) -> Result<(), ToolError> {
+        if name == "finish_task"
+            && !self
+                .task_completion
+                .as_ref()
+                .is_some_and(|signal| signal.enabled())
+        {
+            return Err(ToolError::Disabled { tool: name.into() });
+        }
         if self.agent_mode == AgentMode::Plan
             && !matches!(
                 name,

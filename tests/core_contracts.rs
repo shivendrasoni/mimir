@@ -42,10 +42,10 @@ fn message_contract_round_trips_tool_calls_without_losing_arguments() {
 #[test]
 fn budget_names_the_first_exhausted_limit() {
     let budget = Budget {
-        max_turns: 2,
-        max_tool_calls: 3,
-        max_tokens: 100,
-        max_elapsed: Duration::from_secs(10),
+        max_turns: Some(2),
+        max_tool_calls: Some(3),
+        max_tokens: Some(100),
+        max_elapsed: Some(Duration::from_secs(10)),
         max_context_messages: 20,
         max_context_tokens: 128_000,
         auto_compaction_threshold_percent: 80,
@@ -88,8 +88,8 @@ fn normalized_usage_does_not_double_count_cached_input() {
 #[test]
 fn cached_context_replay_does_not_exhaust_the_operational_run_budget() {
     let budget = Budget {
-        max_turns: 64,
-        max_tokens: 1_000_000,
+        max_turns: Some(64),
+        max_tokens: Some(1_000_000),
         ..Budget::default()
     };
     let cached_turn = Usage {
@@ -116,8 +116,8 @@ fn cached_context_replay_does_not_exhaust_the_operational_run_budget() {
 #[test]
 fn genuinely_fresh_usage_still_exhausts_the_operational_run_budget() {
     let budget = Budget {
-        max_turns: 64,
-        max_tokens: 1_000_000,
+        max_turns: Some(64),
+        max_tokens: Some(1_000_000),
         ..Budget::default()
     };
     let fresh_turn = Usage {

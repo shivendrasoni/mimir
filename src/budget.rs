@@ -8,13 +8,20 @@ use thiserror::Error;
 
 use crate::model::Usage;
 
+pub const DEFAULT_METERED_TASK_TOKENS: u64 = 1_000_000;
+
+#[must_use]
+pub fn provider_default_token_limit(provider: &str) -> Option<u64> {
+    (!matches!(provider, "anthropic" | "openai-codex")).then_some(DEFAULT_METERED_TASK_TOKENS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
-    pub max_turns: u32,
-    pub max_tool_calls: u32,
+    pub max_turns: Option<u32>,
+    pub max_tool_calls: Option<u32>,
     /// Cumulative fresh-input plus output token ceiling for one run.
-    pub max_tokens: u64,
-    pub max_elapsed: Duration,
+    pub max_tokens: Option<u64>,
+    pub max_elapsed: Option<Duration>,
     pub max_context_messages: usize,
     /// Provider context-window ceiling used by automatic compaction.
     pub max_context_tokens: u64,
@@ -25,10 +32,10 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_turns: 64,
-            max_tool_calls: 48,
-            max_tokens: 1_000_000,
-            max_elapsed: Duration::from_secs(30 * 60),
+            max_turns: None,
+            max_tool_calls: None,
+            max_tokens: Some(DEFAULT_METERED_TASK_TOKENS),
+            max_elapsed: None,
             max_context_messages: 200,
             max_context_tokens: 128_000,
             auto_compaction_threshold_percent: 80,
@@ -194,24 +201,26 @@ impl BudgetUsage {
     ///
     /// Returns the first exhausted budget in deterministic priority order.
     pub fn check(&self, budget: &Budget) -> Result<(), BudgetError> {
-        if self.turns >= budget.max_turns {
-            return Err(BudgetError::Turns {
-                limit: budget.max_turns,
-            });
+        if let Some(limit) = budget.max_turns
+            && self.turns >= limit
+        {
+            return Err(BudgetError::Turns { limit });
         }
-        if self.tool_calls >= budget.max_tool_calls {
-            return Err(BudgetError::ToolCalls {
-                limit: budget.max_tool_calls,
-            });
+        if let Some(limit) = budget.max_tool_calls
+            && self.tool_calls >= limit
+        {
+            return Err(BudgetError::ToolCalls { limit });
         }
-        if self.tokens >= budget.max_tokens {
-            return Err(BudgetError::Tokens {
-                limit: budget.max_tokens,
-            });
+        if let Some(limit) = budget.max_tokens
+            && self.tokens >= limit
+        {
+            return Err(BudgetError::Tokens { limit });
         }
-        if self.started_at.elapsed() >= budget.max_elapsed {
+        if let Some(limit) = budget.max_elapsed
+            && self.started_at.elapsed() >= limit
+        {
             return Err(BudgetError::Elapsed {
-                limit_ms: duration_millis(budget.max_elapsed),
+                limit_ms: duration_millis(limit),
             });
         }
         Ok(())

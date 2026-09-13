@@ -1616,3 +1616,63 @@ async fn writes_reject_symlinks_that_escape_the_workspace() {
         "unchanged"
     );
 }
+
+#[tokio::test]
+async fn finish_task_is_visible_only_while_autonomous_and_records_validated_completion() {
+    let root = TempDir::new().expect("tempdir");
+    std::fs::write(root.path().join("result.txt"), "done").expect("artifact");
+    let tools = registry(&root);
+
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .all(|definition| definition.name != "finish_task")
+    );
+    assert!(matches!(
+        tools
+            .execute("finish_task", json!({"summary": "done"}))
+            .await,
+        Err(ToolError::Disabled { .. })
+    ));
+
+    tools.set_autonomous_completion_enabled(true);
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.name == "finish_task")
+    );
+    let observation = tools
+        .execute(
+            "finish_task",
+            json!({"summary": "validated", "artifacts": ["result.txt"]}),
+        )
+        .await
+        .expect("finish task");
+    assert_eq!(observation.status, ObservationStatus::Success);
+    let completion = tools.take_task_completion().await.expect("completion");
+    assert_eq!(completion.summary, "validated");
+    assert_eq!(
+        completion.artifacts,
+        [std::path::PathBuf::from("result.txt")]
+    );
+    assert!(tools.take_task_completion().await.is_none());
+
+    let error = tools
+        .execute(
+            "finish_task",
+            json!({"summary": "invalid", "artifacts": ["../outside"]}),
+        )
+        .await
+        .expect_err("escaping artifact");
+    assert!(matches!(error, ToolError::WorkspaceDenied { .. }));
+
+    tools.set_autonomous_completion_enabled(false);
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .all(|definition| definition.name != "finish_task")
+    );
+}

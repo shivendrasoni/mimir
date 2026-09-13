@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    budget::{Budget, BudgetPause, BudgetUsage},
+    budget::{Budget, BudgetPause, BudgetUsage, provider_default_token_limit},
     error::{MimirError, Result},
     extensions::{
         ExtensionCommandInfo, ExtensionContextUsage, ExtensionFlagValue, ExtensionHostAction,
@@ -47,6 +47,8 @@ pub struct RuntimeConfig {
     pub thinking_level_map: Option<BTreeMap<ThinkingLevel, Option<String>>>,
     pub system_prompt: String,
     pub budget: Budget,
+    /// Re-resolve the token ceiling from the active provider whenever its model changes.
+    pub provider_aware_token_budget: bool,
     pub provider_timeout: Duration,
 }
 
@@ -76,6 +78,7 @@ impl RuntimeConfig {
             thinking_level_map: None,
             system_prompt: String::new(),
             budget: Budget::default(),
+            provider_aware_token_budget: false,
             provider_timeout: Duration::from_secs(15 * 60),
         }
     }
@@ -304,6 +307,7 @@ pub struct AgentRuntime {
     tools: Arc<ToolRegistry>,
     store: Arc<dyn SessionStore>,
     config: RuntimeConfig,
+    operational_budget: StdMutex<Budget>,
     harness_context: RwLock<String>,
     messages: Mutex<Vec<Message>>,
     steering: Mutex<VecDeque<Message>>,
@@ -451,6 +455,10 @@ impl AgentRuntime {
             normalize_thinking_levels(&config.supported_thinking_levels);
         let thinking_level =
             clamp_thinking_level(config.thinking_level, &supported_thinking_levels);
+        let mut operational_budget = config.budget;
+        if config.provider_aware_token_budget {
+            operational_budget.max_tokens = provider_default_token_limit(&config.provider);
+        }
         Ok(Self {
             selection: RwLock::new(RuntimeSelection {
                 provider,
@@ -463,6 +471,7 @@ impl AgentRuntime {
             tools,
             store,
             config,
+            operational_budget: StdMutex::new(operational_budget),
             harness_context: RwLock::new(String::new()),
             messages: Mutex::new(messages),
             steering: Mutex::new(VecDeque::new()),
@@ -1172,6 +1181,12 @@ impl AgentRuntime {
         selection.thinking_level = thinking_level;
         selection.supported_thinking_levels = supported_thinking_levels;
         selection.thinking_level_map = thinking_level_map;
+        if self.config.provider_aware_token_budget {
+            self.operational_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .max_tokens = provider_default_token_limit(provider_id);
+        }
         *self.service_tier.write().await = None;
         Ok(thinking_level)
     }
@@ -1848,6 +1863,29 @@ impl AgentRuntime {
         self.auto_retry.load(Ordering::Acquire)
     }
 
+    pub async fn set_autonomous_completion_enabled(&self, enabled: bool) {
+        self.tools.set_autonomous_completion_enabled(enabled);
+        if !enabled {
+            self.tools.clear_task_completion().await;
+        }
+    }
+
+    pub async fn clear_task_completion(&self) {
+        self.tools.clear_task_completion().await;
+    }
+
+    pub async fn take_task_completion(&self) -> Option<crate::tools::TaskCompletion> {
+        self.tools.take_task_completion().await
+    }
+
+    #[must_use]
+    pub fn operational_budget(&self) -> Budget {
+        *self
+            .operational_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Overrides the per-provider-request output ceiling for this runtime.
     ///
     /// # Errors
@@ -2204,7 +2242,7 @@ impl AgentRuntime {
         let mut usage = BudgetUsage::default();
 
         loop {
-            if let Err(error) = usage.check(&self.config.budget) {
+            if let Err(error) = usage.check(&self.operational_budget()) {
                 return Err(MimirError::BudgetPaused(error.pause(usage.snapshot())));
             }
             self.ensure_session_integrity("provider request boundary")
@@ -2521,7 +2559,7 @@ impl AgentRuntime {
 
             let mut tool_results = Vec::new();
             for (call_index, call) in tool_calls.iter().cloned().enumerate() {
-                if let Err(error) = usage.check(&self.config.budget) {
+                if let Err(error) = usage.check(&self.operational_budget()) {
                     let pause = error.pause(usage.snapshot());
                     let blocked = self
                         .persist_budget_blocked_tool_results(&tool_calls[call_index..], pause, sink)
@@ -2699,6 +2737,9 @@ impl AgentRuntime {
                 );
                 self.persist_message(tool_result.clone()).await?;
                 tool_results.push(tool_result);
+                if call.name == "finish_task" && is_error {
+                    self.tools.clear_task_completion().await;
+                }
                 sink.emit(RuntimeEvent::ToolFinished {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -2777,6 +2818,29 @@ impl AgentRuntime {
                 tool_results,
             })
             .await;
+            if let Some(completion) = self.tools.task_completion().await {
+                let text = completion.summary;
+                sink.emit(RuntimeEvent::Completed { text: text.clone() })
+                    .await;
+                self.dispatch_extension_event(
+                    LifecycleEvent::TurnEnd {
+                        session_id: session_id.clone(),
+                        turn_index: u64::from(turn),
+                        stop_reason: Some("finish_task".into()),
+                    },
+                    sink,
+                )
+                .await?;
+                self.dispatch_extension_event(
+                    LifecycleEvent::AgentEnd {
+                        session_id: session_id.clone(),
+                        success: true,
+                    },
+                    sink,
+                )
+                .await?;
+                return Ok(text);
+            }
             self.dispatch_extension_event(
                 LifecycleEvent::TurnEnd {
                     session_id: session_id.clone(),
@@ -2975,7 +3039,8 @@ impl AgentRuntime {
                 status: ObservationStatus::Error,
                 summary: format!("tool not executed: budget paused ({pause})"),
                 next_actions: vec![
-                    "Resume with a larger budget or start a new run after reducing context".into(),
+                    "Increase the configured finite budget or select an unlimited override before retrying"
+                        .into(),
                 ],
                 artifacts: Vec::new(),
                 content: String::new(),

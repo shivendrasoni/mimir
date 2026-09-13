@@ -365,6 +365,11 @@ pub trait TuiRuntimeFactory: Send + Sync {
     /// Cancels the currently running user shell command, when one exists.
     fn abort_user_bash(&self) {}
 
+    /// Resolves provider-aware limits for the next autonomous task.
+    fn autonomous_limits_for_provider(&self, _provider: &str) -> AutonomousLimits {
+        AutonomousLimits::default()
+    }
+
     /// Persists an explicit workspace-owner choice for a displayed request.
     async fn record_workspace_permission(
         &self,
@@ -491,9 +496,21 @@ impl EventSink for TuiSink {
             }),
             RuntimeEvent::Completed { text } => Some(StreamEvent::Completed(text)),
             RuntimeEvent::Failed { message } => Some(StreamEvent::Failed(message)),
-            RuntimeEvent::BudgetPaused { pause } => Some(StreamEvent::BudgetPaused(format!(
-                "Budget paused: {pause}. Send another message to continue, or restart with --max-turns <N>."
-            ))),
+            RuntimeEvent::BudgetPaused { pause } => {
+                let override_hint = match pause.kind {
+                    crate::budget::BudgetKind::Turns => "--max-turns unlimited",
+                    crate::budget::BudgetKind::Tokens => "--max-run-tokens unlimited",
+                    crate::budget::BudgetKind::ToolCalls => {
+                        "an unrestricted provider or runtime tool-call policy"
+                    }
+                    crate::budget::BudgetKind::Elapsed => {
+                        "--autonomous-timeout-ms unlimited in autonomous mode"
+                    }
+                };
+                Some(StreamEvent::BudgetPaused(format!(
+                    "Configured budget paused the task: {pause}. Increase the finite limit or use {override_hint}."
+                )))
+            }
             RuntimeEvent::ProviderRequest { .. } => Some(StreamEvent::Activity("Thinking…".into())),
             RuntimeEvent::ToolStarted { name, .. } => {
                 Some(StreamEvent::Activity(tool_activity(&name)))
@@ -967,6 +984,12 @@ pub async fn run_tui_with_autonomous(
                             }
                         }
                     }
+                    let (provider, _, _) = runtime.model_selection().await;
+                    let limits = runtime_factory.autonomous_limits_for_provider(&provider);
+                    autonomous
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_limits(limits);
                     app.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .set_run_active(true);
@@ -976,12 +999,14 @@ pub async fn run_tui_with_autonomous(
                     let learning_workspace = runtime_factory.workspace_root();
                     let message = user_message(&prompt, images, learning_workspace.as_deref());
                     let runtime = runtime.clone();
+                    let runtime_factory = Arc::clone(&runtime_factory);
                     let app_for_run = app.clone();
                     let autonomous = autonomous.clone();
                     let learning_session = session.clone();
                     tokio::spawn(async move {
                         run_tui_prompt_loop(
                             runtime,
+                            runtime_factory,
                             app_for_run,
                             autonomous,
                             message,
@@ -1007,7 +1032,7 @@ pub async fn run_tui_with_autonomous(
                     let result = match dispatch_coordinator_action(
                         &action,
                         &mut runtime,
-                        runtime_factory.as_ref(),
+                        &runtime_factory,
                         &mut runtime_key,
                         &app,
                         &state_root,
@@ -1094,8 +1119,13 @@ async fn run_tui_user_bash(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prompt loop keeps completion, continuation, follow-up, and learning state transitions ordered"
+)]
 async fn run_tui_prompt_loop(
     runtime: Arc<AgentRuntime>,
+    runtime_factory: Arc<dyn TuiRuntimeFactory>,
     app: Arc<Mutex<App>>,
     autonomous: Arc<Mutex<AutonomousState>>,
     message: Message,
@@ -1106,6 +1136,12 @@ async fn run_tui_prompt_loop(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .begin_run(Instant::now());
+    runtime
+        .set_autonomous_completion_enabled(generation.is_some())
+        .await;
+    if generation.is_some() {
+        runtime.clear_task_completion().await;
+    }
     let mut next_messages = vec![message];
     loop {
         let before = runtime.messages_snapshot().await.len();
@@ -1141,6 +1177,12 @@ async fn run_tui_prompt_loop(
                 .set_run_active(false);
             return;
         }
+        let completion = runtime.take_task_completion().await;
+        let (provider, _, _) = runtime.model_selection().await;
+        autonomous
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_limits(runtime_factory.autonomous_limits_for_provider(&provider));
         let (continuation, status) = if let Some(generation) = generation {
             let messages = runtime.messages_snapshot().await;
             let mut state = autonomous
@@ -1151,12 +1193,41 @@ async fn run_tui_prompt_loop(
                     state.record_turn(generation, message.usage);
                 }
             }
-            let continuation = state.next_continuation(generation, Instant::now());
-            let status = continuation.is_none().then(|| state.status(Instant::now()));
+            let continuation = completion
+                .is_none()
+                .then(|| state.next_continuation(generation, Instant::now()))
+                .flatten();
+            let status = (completion.is_none() && continuation.is_none())
+                .then(|| state.status(Instant::now()));
             (continuation, status)
         } else {
             (None, None)
         };
+        if let Some(completion) = completion {
+            let artifact_suffix = if completion.artifacts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · {}",
+                    completion
+                        .artifacts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            app.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_system_message(format!(
+                    "Autonomous task complete: {}{artifact_suffix}",
+                    completion.summary
+                ));
+            app.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_run_active(false);
+            return;
+        }
         if let Some(continuation) = continuation {
             let mut state = app
                 .lock()
@@ -1301,7 +1372,7 @@ fn implementation_prompt(relative_plan: &str, instructions: Option<&str>) -> Str
 async fn dispatch_coordinator_action(
     action: &TuiAction,
     runtime: &mut Arc<AgentRuntime>,
-    runtime_factory: &dyn TuiRuntimeFactory,
+    runtime_factory: &Arc<dyn TuiRuntimeFactory>,
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
@@ -1327,8 +1398,13 @@ async fn dispatch_coordinator_action(
             runtime_factory.set_agent_mode(*mode)?;
             let session = active_session(runtime_key.as_ref())?.to_owned();
             let model = current_model(runtime, runtime_key.as_ref()).await;
-            match build_runtime_with_preferences(runtime_factory, &model, &session, state_root)
-                .await
+            match build_runtime_with_preferences(
+                runtime_factory.as_ref(),
+                &model,
+                &session,
+                state_root,
+            )
+            .await
             {
                 Ok(updated) => {
                     *runtime = updated;
@@ -1372,9 +1448,13 @@ async fn dispatch_coordinator_action(
                     "wait for the active agent or command before implementing".into(),
                 ));
             }
-            let prepared =
-                rebuild_plan_as_auto(runtime, runtime_factory, runtime_key.as_ref(), state_root)
-                    .await?;
+            let prepared = rebuild_plan_as_auto(
+                runtime,
+                runtime_factory.as_ref(),
+                runtime_key.as_ref(),
+                state_root,
+            )
+            .await?;
             app.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_agent_mode(AgentMode::Auto);
@@ -1394,11 +1474,13 @@ async fn dispatch_coordinator_action(
                 state.push_user_submission(&prompt, 0);
             }
             let runtime_for_run = Arc::clone(runtime);
+            let runtime_factory_for_run = Arc::clone(runtime_factory);
             let app_for_run = Arc::clone(app);
             let autonomous_for_run = Arc::clone(autonomous);
             tokio::spawn(async move {
                 run_tui_prompt_loop(
                     runtime_for_run,
+                    runtime_factory_for_run,
                     app_for_run,
                     autonomous_for_run,
                     Message::user(prompt),
@@ -1418,7 +1500,7 @@ async fn dispatch_coordinator_action(
         TuiAction::Resume { session } => {
             resume_tui_session(
                 runtime,
-                runtime_factory,
+                runtime_factory.as_ref(),
                 runtime_key,
                 app,
                 state_root,
@@ -1429,7 +1511,7 @@ async fn dispatch_coordinator_action(
         TuiAction::NewSession { name, prompt } => {
             start_tui_session(
                 runtime,
-                runtime_factory,
+                runtime_factory.as_ref(),
                 runtime_key,
                 app,
                 state_root,
@@ -1441,12 +1523,19 @@ async fn dispatch_coordinator_action(
             update_tui_session_name(runtime_key.as_ref(), state_root, name.as_deref()).await
         }
         TuiAction::Clone => {
-            clone_tui_session(runtime, runtime_factory, runtime_key, app, state_root).await
+            clone_tui_session(
+                runtime,
+                runtime_factory.as_ref(),
+                runtime_key,
+                app,
+                state_root,
+            )
+            .await
         }
         TuiAction::Reload => {
             reload_tui_runtime(
                 runtime,
-                runtime_factory,
+                runtime_factory.as_ref(),
                 runtime_key.as_ref(),
                 app,
                 state_root,
@@ -1473,7 +1562,7 @@ async fn dispatch_coordinator_action(
         TuiAction::ContinueAt { entry_id } => {
             continue_tui_session(
                 runtime,
-                runtime_factory,
+                runtime_factory.as_ref(),
                 runtime_key,
                 app,
                 state_root,
@@ -1485,7 +1574,7 @@ async fn dispatch_coordinator_action(
         TuiAction::ForkAt { entry_id } => {
             fork_tui_session(
                 runtime,
-                runtime_factory,
+                runtime_factory.as_ref(),
                 runtime_key,
                 app,
                 state_root,
@@ -1501,7 +1590,15 @@ async fn dispatch_coordinator_action(
                 .map(Some)
         }
         TuiAction::ImportSession { path } => {
-            import_tui_session(runtime, runtime_factory, runtime_key, app, state_root, path).await
+            import_tui_session(
+                runtime,
+                runtime_factory.as_ref(),
+                runtime_key,
+                app,
+                state_root,
+                path,
+            )
+            .await
         }
         TuiAction::Goal { arguments } => {
             let session = active_session(runtime_key.as_ref())?;
@@ -1572,9 +1669,13 @@ async fn dispatch_coordinator_action(
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 let model = current_model(runtime, runtime_key.as_ref()).await;
-                *runtime =
-                    build_runtime_with_preferences(runtime_factory, &model, &session, state_root)
-                        .await?;
+                *runtime = build_runtime_with_preferences(
+                    runtime_factory.as_ref(),
+                    &model,
+                    &session,
+                    state_root,
+                )
+                .await?;
                 *runtime_key = Some((model, session));
                 refresh_extension_commands(runtime, app).await;
             }
@@ -1639,11 +1740,12 @@ async fn dispatch_coordinator_action(
             if cancel_run {
                 runtime.cancel();
             }
+            let enabled = autonomous
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .enabled();
+            runtime.set_autonomous_completion_enabled(enabled).await;
             if command_mutates(arguments.as_deref()) {
-                let enabled = autonomous
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .enabled();
                 runtime.publish_session_event(serde_json::json!({
                     "type": "autonomous_status",
                     "status": {
@@ -3783,7 +3885,7 @@ mod local_command_tests {
 
     use super::*;
     use crate::{
-        model::{Content, Message, ModelResponse, StopReason},
+        model::{Content, Message, ModelResponse, StopReason, ToolCall},
         provider::FakeProvider,
         runtime::RuntimeConfig,
         session::InMemorySessionStore,
@@ -4307,6 +4409,9 @@ mod local_command_tests {
         }
         run_tui_prompt_loop(
             runtime,
+            Arc::new(TestFactory {
+                state: state.path().to_path_buf(),
+            }),
             app,
             Arc::new(Mutex::new(AutonomousState::default())),
             user_message(
@@ -4340,6 +4445,62 @@ mod local_command_tests {
             .map(Message::text)
             .collect::<Vec<_>>();
         assert!(user_texts.ends_with(&["first".into(), "second".into()]));
+    }
+
+    #[tokio::test]
+    async fn autonomous_prompt_loop_stops_on_finish_task_without_an_extra_request() {
+        let state = TempDir::new().expect("state");
+        let provider = Arc::new(FakeProvider::new(vec![ModelResponse {
+            message: Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "tui-finish".into(),
+                    name: "finish_task".into(),
+                    arguments: json!({"summary": "TUI complete"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            response_id: Some("tui-finish".into()),
+        }]));
+        let runtime = Arc::new(
+            AgentRuntime::resume(
+                provider.clone(),
+                Arc::new(
+                    ToolRegistry::with_default_tools(state.path(), ToolPolicy::default())
+                        .expect("tools"),
+                ),
+                Arc::new(InMemorySessionStore::default()),
+                RuntimeConfig::default_for_model("fake/model"),
+            )
+            .await
+            .expect("runtime"),
+        );
+        let app = Arc::new(Mutex::new(App::new(AppConfig::default())));
+        app.lock().expect("app").set_run_active(true);
+        let mut autonomous = AutonomousState::default();
+        autonomous.enable(Instant::now());
+        let autonomous = Arc::new(Mutex::new(autonomous));
+
+        run_tui_prompt_loop(
+            runtime,
+            Arc::new(TestFactory {
+                state: state.path().to_path_buf(),
+            }),
+            app.clone(),
+            autonomous.clone(),
+            Message::user("complete"),
+            None,
+            "default".into(),
+        )
+        .await;
+
+        assert_eq!(provider.requests().await.len(), 1);
+        assert!(!app.lock().expect("app").run_active());
+        assert_eq!(autonomous.lock().expect("state").turns_used(), 1);
+        assert!(app.lock().expect("app").transcript().iter().any(|entry| {
+            entry
+                .text
+                .contains("Autonomous task complete: TUI complete")
+        }));
     }
 
     #[tokio::test]

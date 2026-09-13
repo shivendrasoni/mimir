@@ -260,10 +260,10 @@ impl RlmChildExecutor for AgentRuntimeChildExecutor {
         let store =
             Arc::new(FileSessionStore::create(&request.session_dir, &request.session_id).await?);
         let budget = Budget {
-            max_turns: self.policy.max_turns,
-            max_tool_calls: self.policy.max_tool_calls,
-            max_tokens: request.max_output_tokens,
-            max_elapsed: self.policy.max_elapsed,
+            max_turns: Some(self.policy.max_turns),
+            max_tool_calls: Some(self.policy.max_tool_calls),
+            max_tokens: Some(request.max_output_tokens),
+            max_elapsed: Some(self.policy.max_elapsed),
             max_context_messages: self.policy.max_context_messages,
             max_context_tokens: u64::from(model.context_window),
             auto_compaction_threshold_percent: 80,
@@ -282,6 +282,7 @@ impl RlmChildExecutor for AgentRuntimeChildExecutor {
                     thinking_level_map: model.thinking_level_map.clone(),
                     system_prompt,
                     budget,
+                    provider_aware_token_budget: false,
                     provider_timeout: self.policy.provider_timeout,
                 },
             )

@@ -25,6 +25,7 @@ use crate::{
         PendingOAuth, RefreshingOAuthProvider, refresh_stored_oauth_if_expired,
         resolve_credential_typed,
     },
+    budget::provider_default_token_limit,
     config::ProviderConfig,
     daemon::{
         AgentMessageDelivery, AgentMessageRequest, ClientRequest, DaemonClient, DaemonConfig,
@@ -52,7 +53,7 @@ use crate::{
         McpToolCallOutput, builtin_mcp_catalog, connect_catalog_client,
     },
     migration::{MigratedRuntimeState, StateMigrator},
-    model::{Content, Message, ModelResponse, Role, StopReason, ThinkingLevel},
+    model::{Content, Message, ModelResponse, Role, StopReason, ThinkingLevel, Usage},
     observation::{ObservedSessionOutput, SessionObservation, SessionObserver},
     orchestration::{
         GoalStore, HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule, ScheduleKind,
@@ -267,31 +268,31 @@ pub struct Cli {
     #[arg(
         long,
         env = "MIMIR_MAX_TURNS",
-        default_value_t = 64,
-        value_parser = parse_positive_u32,
-        help = "Maximum provider turns in one prompt before pausing; send another prompt to continue"
+        value_parser = parse_u32_limit,
+        value_name = "COUNT|unlimited",
+        help = "Maximum provider turns in one task; omitted uses the provider-aware default"
     )]
-    max_turns: u32,
+    max_turns: Option<LimitValue<u32>>,
     #[arg(
         long,
         env = "MIMIR_MAX_RUN_TOKENS",
-        default_value_t = 1_000_000,
-        value_parser = parse_positive_u64,
-        help = "Maximum fresh-input plus output tokens in one prompt before pausing"
+        value_parser = parse_u64_limit,
+        value_name = "TOKENS|unlimited",
+        help = "Maximum fresh-input plus output tokens in one task; omitted uses the provider-aware default"
     )]
-    max_run_tokens: u64,
+    max_run_tokens: Option<LimitValue<u64>>,
     #[arg(long = "socket", visible_alias = "daemon-socket", value_name = "PATH")]
     socket: Option<PathBuf>,
     #[arg(long)]
     autonomous: bool,
-    #[arg(long, value_parser = parse_positive_u32)]
-    autonomous_max_continuations: Option<u32>,
-    #[arg(long, value_parser = parse_positive_u32)]
-    autonomous_max_turns: Option<u32>,
-    #[arg(long, value_parser = parse_positive_u64)]
-    autonomous_max_tokens: Option<u64>,
-    #[arg(long, value_parser = parse_positive_u64)]
-    autonomous_timeout_ms: Option<u64>,
+    #[arg(long, value_parser = parse_u32_limit, value_name = "COUNT|unlimited")]
+    autonomous_max_continuations: Option<LimitValue<u32>>,
+    #[arg(long, value_parser = parse_u32_limit, value_name = "COUNT|unlimited")]
+    autonomous_max_turns: Option<LimitValue<u32>>,
+    #[arg(long, value_parser = parse_u64_limit, value_name = "TOKENS|unlimited")]
+    autonomous_max_tokens: Option<LimitValue<u64>>,
+    #[arg(long, value_parser = parse_u64_limit, value_name = "MILLISECONDS|unlimited")]
+    autonomous_timeout_ms: Option<LimitValue<u64>>,
     #[arg(long, value_name = "COMMAND")]
     autonomous_gate: Vec<String>,
     #[arg(long, value_parser = parse_positive_u32)]
@@ -323,6 +324,29 @@ pub struct Cli {
         allow_hyphen_values = true
     )]
     prompt_segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitValue<T> {
+    Bounded(T),
+    Unlimited,
+}
+
+impl<T: Copy> LimitValue<T> {
+    const fn resolve(self) -> Option<T> {
+        match self {
+            Self::Bounded(value) => Some(value),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AutonomousLimitOverrides {
+    max_continuations: Option<LimitValue<u32>>,
+    max_turns: Option<LimitValue<u32>>,
+    max_tokens: Option<LimitValue<u64>>,
+    timeout_ms: Option<LimitValue<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -360,9 +384,9 @@ struct RuntimeBuildConfig {
     offline: bool,
     verbose: bool,
     provider_timeout_seconds: u64,
-    max_turns: u32,
-    max_run_tokens: u64,
-    autonomous_limits: Option<AutonomousLimits>,
+    max_turns: Option<LimitValue<u32>>,
+    max_run_tokens: Option<LimitValue<u64>>,
+    autonomous_limits: Option<AutonomousLimitOverrides>,
     fake_responses: Vec<String>,
     fake_delay_ms: u64,
     fake_retryable_failures: u32,
@@ -412,7 +436,7 @@ impl RuntimeBuildConfig {
             provider_timeout_seconds: cli.provider_timeout_seconds,
             max_turns: cli.max_turns,
             max_run_tokens: cli.max_run_tokens,
-            autonomous_limits: cli_autonomous_limits(cli),
+            autonomous_limits: cli_autonomous_overrides(cli),
             fake_responses: cli.fake_responses.clone(),
             fake_delay_ms: cli.fake_delay_ms,
             fake_retryable_failures: cli.fake_retryable_failures,
@@ -439,6 +463,20 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     (parsed > 0)
         .then_some(parsed)
         .ok_or_else(|| "must be a positive integer".to_owned())
+}
+
+fn parse_u32_limit(value: &str) -> std::result::Result<LimitValue<u32>, String> {
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(LimitValue::Unlimited);
+    }
+    parse_positive_u32(value).map(LimitValue::Bounded)
+}
+
+fn parse_u64_limit(value: &str) -> std::result::Result<LimitValue<u64>, String> {
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(LimitValue::Unlimited);
+    }
+    parse_positive_u64(value).map(LimitValue::Bounded)
 }
 
 fn resolve_extension_flags(
@@ -491,7 +529,7 @@ fn resolve_extension_flags(
     Ok(resolved)
 }
 
-fn cli_autonomous_limits(cli: &Cli) -> Option<AutonomousLimits> {
+fn cli_autonomous_overrides(cli: &Cli) -> Option<AutonomousLimitOverrides> {
     let enabled = cli.autonomous
         || cli.autonomous_max_continuations.is_some()
         || cli.autonomous_max_turns.is_some()
@@ -500,19 +538,30 @@ fn cli_autonomous_limits(cli: &Cli) -> Option<AutonomousLimits> {
         || !cli.autonomous_gate.is_empty()
         || cli.autonomous_gate_retries.is_some()
         || cli.autonomous_gate_timeout_ms.is_some();
-    enabled.then(|| {
-        let defaults = AutonomousLimits::default();
-        AutonomousLimits {
-            max_continuations: cli
-                .autonomous_max_continuations
-                .unwrap_or(defaults.max_continuations),
-            max_turns: cli.autonomous_max_turns.unwrap_or(defaults.max_turns),
-            max_tokens: cli.autonomous_max_tokens.unwrap_or(defaults.max_tokens),
-            timeout: std::time::Duration::from_millis(cli.autonomous_timeout_ms.unwrap_or_else(
-                || u64::try_from(defaults.timeout.as_millis()).unwrap_or(u64::MAX),
-            )),
-        }
+    enabled.then_some(AutonomousLimitOverrides {
+        max_continuations: cli.autonomous_max_continuations,
+        max_turns: cli.autonomous_max_turns,
+        max_tokens: cli.autonomous_max_tokens,
+        timeout_ms: cli.autonomous_timeout_ms,
     })
+}
+
+fn resolve_autonomous_limits(
+    overrides: AutonomousLimitOverrides,
+    provider: &str,
+) -> AutonomousLimits {
+    AutonomousLimits {
+        max_continuations: overrides.max_continuations.and_then(LimitValue::resolve),
+        max_turns: overrides.max_turns.and_then(LimitValue::resolve),
+        max_tokens: overrides.max_tokens.map_or_else(
+            || provider_default_token_limit(provider),
+            LimitValue::resolve,
+        ),
+        timeout: overrides
+            .timeout_ms
+            .and_then(LimitValue::resolve)
+            .map(std::time::Duration::from_millis),
+    }
 }
 
 fn resolved_cli_provider(cli: &Cli) -> String {
@@ -1398,7 +1447,7 @@ fn validate_process_options(cli: &Cli) -> Result<()> {
 fn validate_run_options(cli: &Cli) -> Result<()> {
     validate_process_options(cli)?;
     if cli.agent_mode == Some(AgentModeArg::Plan)
-        && (cli_autonomous_limits(cli).is_some() || cli.goal.is_some())
+        && (cli_autonomous_overrides(cli).is_some() || cli.goal.is_some())
     {
         return Err(MimirError::Configuration(
             "plan mode cannot run autonomous continuations or create a goal".into(),
@@ -1409,7 +1458,7 @@ fn validate_run_options(cli: &Cli) -> Result<()> {
             "--socket/--daemon-socket is only supported by text/json prompt mode".into(),
         ));
     }
-    if cli.socket.is_some() && cli_autonomous_limits(cli).is_some() {
+    if cli.socket.is_some() && cli_autonomous_overrides(cli).is_some() {
         return Err(MimirError::Configuration(
             "--socket cannot configure autonomous policy on an existing daemon runtime".into(),
         ));
@@ -1467,7 +1516,7 @@ fn validate_run_options(cli: &Cli) -> Result<()> {
             "autonomous gate retry/timeout options require --autonomous-gate".into(),
         ));
     }
-    if cli_autonomous_limits(cli).is_some()
+    if cli_autonomous_overrides(cli).is_some()
         && matches!(cli.output, OutputMode::Rpc | OutputMode::Acp)
     {
         return Err(MimirError::Configuration(
@@ -1866,7 +1915,7 @@ async fn dispatch_run_with_diagnostics(
             session_id: cli.session.clone(),
             started_at: chrono::Utc::now(),
             mimir_version: env!("CARGO_PKG_VERSION").into(),
-            provider,
+            provider: provider.clone(),
             model,
             workspace: "$WORKSPACE".into(),
             configuration: DiagnosticConfiguration {
@@ -1949,6 +1998,10 @@ fn daemon_runtime_error(error: MimirError) -> DaemonError {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "top-level output routing keeps each runtime mode and its lifecycle visible in one match"
+)]
 async fn dispatch_run(
     cli: &Cli,
     runtime: Arc<AgentRuntime>,
@@ -1987,7 +2040,9 @@ async fn dispatch_run(
         }
         (OutputMode::Daemon, _) => unreachable!("daemon mode is routed before runtime dispatch"),
         (mode, Some(prompt)) => {
-            if let Some(limits) = RuntimeBuildConfig::from_cli(cli).autonomous_limits {
+            if let Some(overrides) = RuntimeBuildConfig::from_cli(cli).autonomous_limits {
+                let (provider, _, _) = runtime.model_selection().await;
+                let limits = resolve_autonomous_limits(overrides, &provider);
                 run_once_autonomous(&runtime, prompt, mode, limits, cli).await
             } else {
                 run_once(&runtime, prompt, mode).await
@@ -2029,6 +2084,9 @@ async fn dispatch_run(
             }
             let tui_build = RuntimeBuildConfig::from_cli(cli);
             let tui_bash_runner = build_bash_runner(&tui_build)?;
+            let autonomous_limits = tui_build
+                .autonomous_limits
+                .map(|overrides| resolve_autonomous_limits(overrides, &initial_provider));
             run_tui_with_autonomous(
                 runtime,
                 Arc::new(CliTuiRuntimeFactory {
@@ -2042,7 +2100,7 @@ async fn dispatch_run(
                 state,
                 initial_selection,
                 cli.session.clone(),
-                tui_build.autonomous_limits,
+                autonomous_limits,
             )
             .await
         }
@@ -3953,29 +4011,72 @@ impl RuntimePromptHandler {
             };
             generation
         };
+        runtime.set_autonomous_completion_enabled(true).await;
+        let messages = runtime.messages_snapshot().await;
+        let mut pending_usage = messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role != Role::User)
+            .filter(|message| message.role == Role::Assistant)
+            .fold(Usage::default(), |mut total, message| {
+                total.input_tokens = total
+                    .input_tokens
+                    .saturating_add(message.usage.input_tokens);
+                total.output_tokens = total
+                    .output_tokens
+                    .saturating_add(message.usage.output_tokens);
+                total.cached_tokens = total
+                    .cached_tokens
+                    .saturating_add(message.usage.cached_tokens);
+                total
+            });
         loop {
-            let usage = runtime
-                .messages_snapshot()
-                .await
-                .iter()
-                .rev()
-                .find(|message| message.role == Role::Assistant)
-                .map_or_else(Default::default, |message| message.usage);
+            let (provider, _, _) = runtime.model_selection().await;
+            let completion = runtime.take_task_completion().await;
             let continuation = {
                 let mut states = self.autonomous_states.lock().await;
                 let Some(state) = states.get_mut(session_id) else {
                     return Ok(answer);
                 };
-                state.record_turn(generation, usage);
-                state.next_continuation(generation, std::time::Instant::now())
+                state.set_limits(resolve_autonomous_limits(
+                    self.build.autonomous_limits.unwrap_or_default(),
+                    &provider,
+                ));
+                state.record_turn(generation, pending_usage);
+                completion
+                    .is_none()
+                    .then(|| state.next_continuation(generation, std::time::Instant::now()))
+                    .flatten()
             };
+            if completion.is_some() {
+                return Ok(answer);
+            }
             let Some(continuation) = continuation else {
                 return Ok(answer);
             };
+            let before = runtime.messages_snapshot().await.len();
             answer = runtime
                 .run(&continuation, &StdoutEventSink { enabled: false })
                 .await
                 .map_err(daemon_runtime_error)?;
+            pending_usage = runtime
+                .messages_snapshot()
+                .await
+                .iter()
+                .skip(before)
+                .filter(|message| message.role == Role::Assistant)
+                .fold(Usage::default(), |mut total, message| {
+                    total.input_tokens = total
+                        .input_tokens
+                        .saturating_add(message.usage.input_tokens);
+                    total.output_tokens = total
+                        .output_tokens
+                        .saturating_add(message.usage.output_tokens);
+                    total.cached_tokens = total
+                        .cached_tokens
+                        .saturating_add(message.usage.cached_tokens);
+                    total
+                });
         }
     }
 
@@ -4010,6 +4111,15 @@ impl RuntimePromptHandler {
             )
             .await?;
         Ok((selected, thinking_level))
+    }
+
+    async fn refresh_autonomous_provider_policy(&self, session_id: &str, provider: &str) {
+        if let Some(state) = self.autonomous_states.lock().await.get_mut(session_id) {
+            state.set_limits(resolve_autonomous_limits(
+                self.build.autonomous_limits.unwrap_or_default(),
+                provider,
+            ));
+        }
     }
 
     async fn admit_queued_message(
@@ -4519,6 +4629,11 @@ impl RuntimePromptHandler {
             ));
         }
         let state = states.entry(session_id.into()).or_default();
+        let (provider, _, _) = runtime.model_selection().await;
+        state.set_limits(resolve_autonomous_limits(
+            self.build.autonomous_limits.unwrap_or_default(),
+            &provider,
+        ));
         let now = Instant::now();
         let cancelled = match arguments.trim().to_ascii_lowercase().as_str() {
             "" | "status" => false,
@@ -4541,7 +4656,12 @@ impl RuntimePromptHandler {
             }
         };
         let autonomous_status = state.status(now);
+        let enabled = state.enabled();
         drop(states);
+        runtime.set_autonomous_completion_enabled(enabled).await;
+        if arguments.trim() == "on" {
+            runtime.clear_task_completion().await;
+        }
         if cancelled {
             runtime.cancel();
         }
@@ -4627,7 +4747,9 @@ fn autonomous_status_value(state: Option<&AutonomousState>) -> Value {
             "maxContinuations": limits.max_continuations,
             "maxTurns": limits.max_turns,
             "maxTokens": limits.max_tokens,
-            "timeoutMs": u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX)
+            "timeoutMs": limits.timeout.map(|timeout| {
+                u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+            })
         },
         "gates": {
             "configuredCount": state.quality_gate_count()
@@ -4764,6 +4886,10 @@ impl TuiRuntimeFactory for CliTuiRuntimeFactory {
 
     fn workspace_root(&self) -> Option<PathBuf> {
         std::fs::canonicalize(&self.build.workspace).ok()
+    }
+
+    fn autonomous_limits_for_provider(&self, provider: &str) -> AutonomousLimits {
+        resolve_autonomous_limits(self.build.autonomous_limits.unwrap_or_default(), provider)
     }
 
     fn agent_mode(&self) -> AgentMode {
@@ -5069,6 +5195,16 @@ impl PromptHandler for RuntimePromptHandler {
                 Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
             )
             .await?;
+            if self
+                .autonomous_states
+                .lock()
+                .await
+                .get(&request.session_id)
+                .is_some_and(AutonomousState::enabled)
+            {
+                runtime.set_autonomous_completion_enabled(true).await;
+                runtime.clear_task_completion().await;
+            }
             let mut answer = runtime
                 .run(&request.prompt, &StdoutEventSink { enabled: false })
                 .await
@@ -5115,6 +5251,16 @@ impl PromptHandler for RuntimePromptHandler {
                 Some(crate::daemon::turn_ops::RecoveredDelivery::NextTurn),
             )
             .await?;
+            if self
+                .autonomous_states
+                .lock()
+                .await
+                .get(&request.session_id)
+                .is_some_and(AutonomousState::enabled)
+            {
+                runtime.set_autonomous_completion_enabled(true).await;
+                runtime.clear_task_completion().await;
+            }
             let mut answer = runtime
                 .run_batch_messages(&[message], &StdoutEventSink { enabled: false })
                 .await
@@ -5286,7 +5432,16 @@ impl PromptHandler for RuntimePromptHandler {
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
         let autonomous = {
             let states = self.autonomous_states.lock().await;
-            autonomous_status_value(states.get(session_id))
+            if let Some(state) = states.get(session_id) {
+                autonomous_status_value(Some(state))
+            } else {
+                let mut state = AutonomousState::default();
+                state.set_limits(resolve_autonomous_limits(
+                    self.build.autonomous_limits.unwrap_or_default(),
+                    &provider,
+                ));
+                autonomous_status_value(Some(&state))
+            }
         };
         let queued_count = steering.len().saturating_add(follow_ups.len());
         Ok(Some(json!({
@@ -5584,6 +5739,8 @@ impl PromptHandler for RuntimePromptHandler {
                     .select_runtime_model(runtime.as_ref(), provider, model)
                     .await
                     .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                self.refresh_autonomous_provider_policy(session_id, provider)
+                    .await;
                 serde_json::to_value(selected)?
             }
             "cycle_model" => {
@@ -5636,6 +5793,8 @@ impl PromptHandler for RuntimePromptHandler {
                         .select_runtime_model(runtime.as_ref(), &target.provider, &target.model_id)
                         .await
                         .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+                    self.refresh_autonomous_provider_policy(session_id, &target.provider)
+                        .await;
                     if let Some(requested) = target.thinking_level {
                         thinking_level = runtime
                             .set_thinking_level(requested)
@@ -7370,8 +7529,12 @@ async fn build_runtime_for_session(
     config.supported_thinking_levels = supported_thinking_levels;
     config.thinking_level_map = thinking_level_map;
     config.provider_timeout = std::time::Duration::from_secs(build.provider_timeout_seconds);
-    config.budget.max_turns = build.max_turns;
-    config.budget.max_tokens = build.max_run_tokens;
+    config.budget.max_turns = build.max_turns.and_then(LimitValue::resolve);
+    config.budget.max_tokens = build.max_run_tokens.map_or_else(
+        || provider_default_token_limit(&build.provider),
+        LimitValue::resolve,
+    );
+    config.provider_aware_token_budget = build.max_run_tokens.is_none();
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -7399,10 +7562,12 @@ async fn build_runtime_for_session(
             .map(str::to_owned),
     );
     config.system_prompt = system_parts.join("\n\n");
-    if let Some(limits) = build.autonomous_limits {
+    if let Some(overrides) = build.autonomous_limits {
+        let limits = resolve_autonomous_limits(overrides, &build.provider);
         config.budget.max_turns = limits.max_turns;
         config.budget.max_tokens = limits.max_tokens;
         config.budget.max_elapsed = limits.timeout;
+        config.provider_aware_token_budget = overrides.max_tokens.is_none();
     }
     let store: Arc<dyn SessionStore> = file_store.map_or_else(
         || Arc::new(InMemorySessionStore::default()) as Arc<dyn SessionStore>,
@@ -7555,6 +7720,8 @@ async fn run_once_autonomous(
     cli: &Cli,
 ) -> Result<()> {
     let gates = AutonomousGateRunner::from_cli(cli)?;
+    runtime.set_autonomous_completion_enabled(true).await;
+    runtime.clear_task_completion().await;
     let mut autonomous = AutonomousState::default();
     autonomous.set_limits(limits);
     autonomous.enable(std::time::Instant::now());
@@ -7571,9 +7738,17 @@ async fn run_once_autonomous(
                 autonomous.record_turn(generation, message.usage);
             }
         }
-        if let Some(gates) = &gates {
+        let completion = runtime.take_task_completion().await;
+        let (provider, _, _) = runtime.model_selection().await;
+        autonomous.set_limits(resolve_autonomous_limits(
+            cli_autonomous_overrides(cli).unwrap_or_default(),
+            &provider,
+        ));
+        if completion.is_some()
+            && let Some(gates) = &gates
+        {
             match gates.run().await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {}
                 Err(report) if gate_failures >= gates.retry_limit => {
                     return Err(MimirError::Tool(format!(
                         "autonomous quality gates failed after {} attempt(s):\n{report}",
@@ -7595,6 +7770,16 @@ async fn run_once_autonomous(
                     continue;
                 }
             }
+        }
+        if let Some(completion) = completion {
+            if mode == OutputMode::Json {
+                emit_rpc_value(&json!({
+                    "type": "autonomous_task_completed",
+                    "summary": completion.summary,
+                    "artifacts": completion.artifacts,
+                }));
+            }
+            return Ok(());
         }
         let Some(continuation) =
             autonomous.next_continuation(generation, std::time::Instant::now())
@@ -9879,30 +10064,32 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
 
 #[cfg(test)]
 mod tui_model_selection_tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
     use crate::{
         auth::{AuthStore, OAuthCredential},
-        budget::{BudgetKind, BudgetPause, BudgetSnapshot},
+        budget::{BudgetKind, BudgetPause, BudgetSnapshot, provider_default_token_limit},
         daemon::{DaemonError, PromptHandler, PublicDaemonCommand},
         diagnostics::{DiagnosticOutcome, diagnostics_root, list_runs, load_bundle},
         error::MimirError,
-        model::{Message, ThinkingLevel},
+        model::{Content, Message, ModelResponse, StopReason, ThinkingLevel, ToolCall},
+        provider::FakeProvider,
         refinement::HarnessScope,
-        runtime::QueueMode,
+        runtime::{AgentRuntime, QueueMode, RuntimeConfig},
         session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
-        tools::AgentMode,
+        tools::{AgentMode, ToolPolicy, ToolRegistry},
     };
     use clap::Parser;
     use serde_json::json;
 
     use super::{
-        Cli, Command, ConfigCommand, OutputMode, PackageCommand, RuntimeBuildConfig,
-        RuntimePromptHandler, ScheduleCommand, UpdateAction, activate_single_stored_provider,
-        build_runtime_for_session, daemon_runtime_error, parse_recovered_goal_create,
-        parse_recovered_refine_args, resolve_extension_flags, resolve_runtime_thinking_level,
-        resolve_tui_model_selection, run_self_update, runtime_model_definition,
-        send_public_command, tui_model_options, validate_run_options,
+        AutonomousLimitOverrides, Cli, Command, ConfigCommand, LimitValue, OutputMode,
+        PackageCommand, RuntimeBuildConfig, RuntimePromptHandler, ScheduleCommand, UpdateAction,
+        activate_single_stored_provider, autonomous_status_value, build_runtime_for_session,
+        daemon_runtime_error, parse_recovered_goal_create, parse_recovered_refine_args,
+        resolve_autonomous_limits, resolve_extension_flags, resolve_runtime_thinking_level,
+        resolve_tui_model_selection, run_once_autonomous, run_self_update,
+        runtime_model_definition, send_public_command, tui_model_options, validate_run_options,
     };
 
     #[test]
@@ -9993,28 +10180,143 @@ mod tui_model_selection_tests {
     }
 
     #[test]
-    fn normal_turn_budget_is_practical_configurable_and_positive() {
+    fn operational_budget_defaults_are_provider_aware_configurable_and_positive() {
         let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
-        assert_eq!(defaults.max_turns, 64);
-        assert_eq!(defaults.max_run_tokens, 1_000_000);
-        assert_eq!(RuntimeBuildConfig::from_cli(&defaults).max_turns, 64);
+        assert_eq!(defaults.max_turns, None);
+        assert_eq!(defaults.max_run_tokens, None);
+        assert_eq!(provider_default_token_limit("anthropic"), None);
+        assert_eq!(provider_default_token_limit("openai-codex"), None);
+        assert_eq!(provider_default_token_limit("minimax"), Some(1_000_000));
+        assert_eq!(provider_default_token_limit("kimi"), Some(1_000_000));
+        assert_eq!(provider_default_token_limit("fireworks"), Some(1_000_000));
         assert_eq!(
-            RuntimeBuildConfig::from_cli(&defaults).max_run_tokens,
-            1_000_000
+            provider_default_token_limit("anthropic-compatible"),
+            Some(1_000_000)
         );
+        assert_eq!(provider_default_token_limit("gateway"), Some(1_000_000));
+        assert_eq!(provider_default_token_limit("custom"), Some(1_000_000));
+
+        let official = resolve_autonomous_limits(AutonomousLimitOverrides::default(), "anthropic");
+        assert_eq!(official, crate::tui::AutonomousLimits::default());
+        let metered = resolve_autonomous_limits(AutonomousLimitOverrides::default(), "fireworks");
+        assert_eq!(metered.max_tokens, Some(1_000_000));
+        let mut state = crate::tui::AutonomousState::default();
+        state.set_limits(official);
+        let status = autonomous_status_value(Some(&state));
+        assert!(status["limits"]["maxContinuations"].is_null());
+        assert!(status["limits"]["maxTurns"].is_null());
+        assert!(status["limits"]["maxTokens"].is_null());
+        assert!(status["limits"]["timeoutMs"].is_null());
 
         let overridden =
             Cli::try_parse_from(["mimir", "--max-turns", "128", "--max-run-tokens", "2000000"])
                 .expect("budget override");
-        assert_eq!(overridden.max_turns, 128);
-        assert_eq!(overridden.max_run_tokens, 2_000_000);
-        assert_eq!(RuntimeBuildConfig::from_cli(&overridden).max_turns, 128);
+        assert_eq!(overridden.max_turns, Some(LimitValue::Bounded(128)));
         assert_eq!(
-            RuntimeBuildConfig::from_cli(&overridden).max_run_tokens,
-            2_000_000
+            overridden.max_run_tokens,
+            Some(LimitValue::Bounded(2_000_000))
         );
+        let unlimited = Cli::try_parse_from([
+            "mimir",
+            "--max-turns",
+            "unlimited",
+            "--max-run-tokens",
+            "UNLIMITED",
+        ])
+        .expect("unlimited budget override");
+        assert_eq!(unlimited.max_turns, Some(LimitValue::Unlimited));
+        assert_eq!(unlimited.max_run_tokens, Some(LimitValue::Unlimited));
         assert!(Cli::try_parse_from(["mimir", "--max-turns", "0"]).is_err());
         assert!(Cli::try_parse_from(["mimir", "--max-run-tokens", "0"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noninteractive_finish_task_runs_quality_gates_and_retries_failures() {
+        fn finish_response(id: &str) -> ModelResponse {
+            ModelResponse {
+                message: Message::assistant(
+                    vec![Content::ToolCall(ToolCall {
+                        id: id.into(),
+                        name: "finish_task".into(),
+                        arguments: json!({"summary": "validated"}),
+                    })],
+                    StopReason::ToolUse,
+                ),
+                response_id: Some(id.into()),
+            }
+        }
+
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let success_cli = Cli::try_parse_from([
+            "mimir",
+            "--workspace",
+            workspace.path().to_str().expect("workspace"),
+            "--allow-process",
+            "--allowed-programs",
+            "/usr/bin/true",
+            "--autonomous-gate",
+            "/usr/bin/true",
+        ])
+        .expect("success CLI");
+        let success_runtime = AgentRuntime::resume(
+            Arc::new(FakeProvider::new(vec![finish_response("finish-success")])),
+            Arc::new(
+                ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default())
+                    .expect("tools"),
+            ),
+            Arc::new(crate::session::InMemorySessionStore::default()),
+            RuntimeConfig::default_for_model("fake-model"),
+        )
+        .await
+        .expect("runtime");
+        run_once_autonomous(
+            &success_runtime,
+            "implement",
+            OutputMode::Text,
+            crate::tui::AutonomousLimits::default(),
+            &success_cli,
+        )
+        .await
+        .expect("passing gates accept completion");
+
+        let failure_cli = Cli::try_parse_from([
+            "mimir",
+            "--workspace",
+            workspace.path().to_str().expect("workspace"),
+            "--allow-process",
+            "--allowed-programs",
+            "/usr/bin/false",
+            "--autonomous-gate",
+            "/usr/bin/false",
+            "--autonomous-gate-retries",
+            "1",
+        ])
+        .expect("failure CLI");
+        let failure_runtime = AgentRuntime::resume(
+            Arc::new(FakeProvider::new(vec![
+                finish_response("finish-failure-1"),
+                finish_response("finish-failure-2"),
+            ])),
+            Arc::new(
+                ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default())
+                    .expect("tools"),
+            ),
+            Arc::new(crate::session::InMemorySessionStore::default()),
+            RuntimeConfig::default_for_model("fake-model"),
+        )
+        .await
+        .expect("runtime");
+        let error = run_once_autonomous(
+            &failure_runtime,
+            "implement",
+            OutputMode::Text,
+            crate::tui::AutonomousLimits::default(),
+            &failure_cli,
+        )
+        .await
+        .expect_err("failing gates reject repeated completion");
+        assert!(error.to_string().contains("quality gates failed"));
     }
 
     #[test]
@@ -10368,8 +10670,8 @@ mod tui_model_selection_tests {
             offline: false,
             verbose: false,
             provider_timeout_seconds: 900,
-            max_turns: 64,
-            max_run_tokens: 1_000_000,
+            max_turns: None,
+            max_run_tokens: None,
             autonomous_limits: None,
             fake_responses: Vec::new(),
             fake_delay_ms: 0,
@@ -10587,6 +10889,10 @@ mod tui_model_selection_tests {
         config.workspace = workspace.path().into();
         config.state_dir = state.path().into();
         config.fake_responses = vec!["initial".into(), "one".into(), "two".into(), "final".into()];
+        config.autonomous_limits = Some(AutonomousLimitOverrides {
+            max_continuations: Some(LimitValue::Bounded(3)),
+            ..AutonomousLimitOverrides::default()
+        });
         let handler = RuntimePromptHandler::new(config, state.path().into());
         let runtime = handler.runtime("headless").await.expect("runtime");
         handler
@@ -10620,6 +10926,66 @@ mod tui_model_selection_tests {
             assert_eq!(summary.outcome, DiagnosticOutcome::Completed);
             assert_eq!(summary.provider_requests, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_autonomous_loop_accepts_a_persisted_finish_task_without_an_extra_request() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let state = tempfile::TempDir::new().expect("state");
+        let mut config = build("fake", "fake-model");
+        config.workspace = workspace.path().into();
+        config.state_dir = state.path().into();
+        config.fake_responses = vec!["unused".into()];
+        let handler = RuntimePromptHandler::new(config, state.path().into());
+        let provider = Arc::new(FakeProvider::new(vec![ModelResponse {
+            message: Message::assistant(
+                vec![Content::ToolCall(ToolCall {
+                    id: "daemon-finish".into(),
+                    name: "finish_task".into(),
+                    arguments: json!({"summary": "daemon complete"}),
+                })],
+                StopReason::ToolUse,
+            ),
+            response_id: Some("daemon-finish".into()),
+        }]));
+        let runtime = Arc::new(
+            AgentRuntime::resume(
+                provider.clone(),
+                Arc::new(
+                    ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default())
+                        .expect("tools"),
+                ),
+                Arc::new(crate::session::InMemorySessionStore::default()),
+                RuntimeConfig::default_for_model("fake-model"),
+            )
+            .await
+            .expect("runtime"),
+        );
+        handler
+            .runtimes
+            .lock()
+            .await
+            .insert("finish-daemon".into(), runtime.clone());
+        handler
+            .execute_recovered_autonomous("finish-daemon", runtime.as_ref(), "on")
+            .await
+            .expect("autonomous on");
+
+        let answer = handler
+            .handle_prompt(crate::daemon::PromptRequest {
+                lease_id: uuid::Uuid::new_v4(),
+                session_id: "finish-daemon".into(),
+                prompt: "complete".into(),
+            })
+            .await
+            .expect("headless prompt");
+
+        assert_eq!(answer, "daemon complete");
+        assert_eq!(provider.requests().await.len(), 1);
+        let states = handler.autonomous_states.lock().await;
+        let autonomous = states.get("finish-daemon").expect("state");
+        assert_eq!(autonomous.turns_used(), 1);
+        assert_eq!(autonomous.continuations_used(), 0);
     }
 
     #[test]

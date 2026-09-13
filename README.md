@@ -1,11 +1,11 @@
-# Mimir — a bounded RLM runtime in Rust
+# Mimir — a durable RLM runtime in Rust
 
-Mimir is a standalone, bounded agentic runtime written in safe Rust. Its core is a **Recursive Language Model (RLM) runtime**: an agent can programmatically start model-backed child agents, observe them, and cancel or remove them while their work remains durable and scoped to the parent session.
+Mimir is a standalone agentic runtime written in safe Rust. Its core is a **Recursive Language Model (RLM) runtime**: an agent can programmatically start model-backed child agents, observe them, and cancel or remove them while their work remains durable and scoped to the parent session.
 
 The RLM runtime is built for long-running, inspectable work:
 
 - **Recursive execution:** `spawn_agent` starts a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
-- **Bounded by design:** recursion depth, child count and concurrency, prompt and state size, duration, output tokens, and authenticated model discovery are all limited by the runtime.
+- **Safe long-running execution:** top-level operational budgets are provider-aware, while recursion depth, child count and concurrency, prompt and state size, tool output, and authenticated model discovery remain bounded.
 - **Durable session state:** child sessions and namespaced RLM extension state persist under Mimir's state root, so orchestration can survive an interrupted terminal session.
 - **Continual Harness:** `/refine` turns evidence into small, scoped updates to supplemental prompts, memories, existing-code skills, or reusable subagent specifications. `/learn` manages observe-only project learning, verified canaries, redacted contribution, and signed fleet packs. Neither path rewrites the base system prompt or trains model weights.
 
@@ -18,7 +18,7 @@ It does not require Node.js. Python 3 is optional and is started only when the e
 Download the latest release from [GitHub Releases](https://github.com/shivendrasoni/mimir/releases/latest). On Linux x86_64:
 
 ```bash
-version=v0.9.0
+version=v0.10.0
 curl -fL "https://github.com/shivendrasoni/mimir/releases/latest/download/mimir-${version}-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mimir.tar.gz
 tar -xzf /tmp/mimir.tar.gz -C /tmp
 mkdir -p "$HOME/.local/bin"

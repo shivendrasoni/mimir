@@ -8,25 +8,14 @@ use crate::{
     model::Usage,
 };
 
-pub const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT: &str = "No human input is available in autonomous mode. Continue working until the configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If blocked, preserve host-observable evidence and keep looking for safe progress while budget remains.";
+pub const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT: &str = "No human input is available in autonomous mode. Continue working until the task is genuinely complete. When the work is complete and validated, call finish_task with a concise summary and any workspace-relative artifacts. If you were asking the user a question, make a reasonable assumption and verify it. If blocked, preserve host-observable evidence and keep looking for safe progress while budget remains.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutonomousLimits {
-    pub max_continuations: u32,
-    pub max_turns: u32,
-    pub max_tokens: u64,
-    pub timeout: Duration,
-}
-
-impl Default for AutonomousLimits {
-    fn default() -> Self {
-        Self {
-            max_continuations: 3,
-            max_turns: 12,
-            max_tokens: 80_000,
-            timeout: Duration::from_secs(30 * 60),
-        }
-    }
+    pub max_continuations: Option<u32>,
+    pub max_turns: Option<u32>,
+    pub max_tokens: Option<u64>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,10 +138,11 @@ impl AutonomousState {
         if !self.enabled {
             return None;
         }
-        if self.started_at.is_none() {
-            self.started_at = Some(now);
-        }
         self.generation = self.generation.wrapping_add(1);
+        self.continuations_used = 0;
+        self.turns_used = 0;
+        self.tokens_used = 0;
+        self.started_at = Some(now);
         Some(self.generation)
     }
 
@@ -175,19 +165,32 @@ impl AutonomousState {
 
     #[must_use]
     pub fn limit_reason(&self, now: Instant) -> Option<AutonomousLimitReason> {
-        if self.continuations_used >= self.limits.max_continuations {
+        if self
+            .limits
+            .max_continuations
+            .is_some_and(|limit| self.continuations_used >= limit)
+        {
             return Some(AutonomousLimitReason::MaxContinuations);
         }
-        if self.turns_used >= self.limits.max_turns {
+        if self
+            .limits
+            .max_turns
+            .is_some_and(|limit| self.turns_used >= limit)
+        {
             return Some(AutonomousLimitReason::MaxTurns);
         }
-        if self.tokens_used >= self.limits.max_tokens {
+        if self
+            .limits
+            .max_tokens
+            .is_some_and(|limit| self.tokens_used >= limit)
+        {
             return Some(AutonomousLimitReason::MaxTokens);
         }
-        if self
-            .started_at
-            .is_some_and(|started| now.saturating_duration_since(started) >= self.limits.timeout)
-        {
+        if self.started_at.is_some_and(|started| {
+            self.limits
+                .timeout
+                .is_some_and(|limit| now.saturating_duration_since(started) >= limit)
+        }) {
             return Some(AutonomousLimitReason::Timeout);
         }
         None
@@ -202,11 +205,11 @@ impl AutonomousState {
         format!(
             "Autonomous {state}: {}/{} continuations, {}/{} turns, {}/{} tokens ({limit}); quality gates: {}",
             self.continuations_used,
-            self.limits.max_continuations,
+            display_limit(self.limits.max_continuations),
             self.turns_used,
-            self.limits.max_turns,
+            display_limit(self.limits.max_turns),
             self.tokens_used,
-            self.limits.max_tokens,
+            display_limit(self.limits.max_tokens),
             if self.quality_gates.is_empty() {
                 "disabled"
             } else {
@@ -255,6 +258,10 @@ impl AutonomousState {
     }
 }
 
+fn display_limit<T: std::fmt::Display>(limit: Option<T>) -> String {
+    limit.map_or_else(|| "unlimited".into(), |value| value.to_string())
+}
+
 pub(super) fn apply_autonomous_command(
     state: &mut AutonomousState,
     arguments: Option<&str>,
@@ -288,9 +295,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limits_stop_continuations_and_count_only_new_tokens() {
+    fn explicit_limits_stop_continuations_and_count_only_new_tokens() {
         let now = Instant::now();
         let mut state = AutonomousState::default();
+        state.set_limits(AutonomousLimits {
+            max_continuations: Some(3),
+            max_tokens: Some(80_000),
+            ..AutonomousLimits::default()
+        });
         state.enable(now);
         let generation = state.begin_run(now).expect("enabled");
         state.record_turn(
@@ -301,7 +313,7 @@ mod tests {
                 cached_tokens: 50_000,
             },
         );
-        for _ in 0..state.limits.max_continuations {
+        for _ in 0..state.limits.max_continuations.expect("bounded") {
             assert!(state.next_continuation(generation, now).is_some());
         }
         assert_eq!(
@@ -309,6 +321,27 @@ mod tests {
             Some(AutonomousLimitReason::MaxContinuations)
         );
         assert!(state.status(now).contains("15/80000 tokens"));
+    }
+
+    #[test]
+    fn default_limits_are_unrestricted() {
+        let now = Instant::now();
+        let mut state = AutonomousState::default();
+        state.enable(now);
+        let generation = state.begin_run(now).expect("enabled");
+        for _ in 0..100 {
+            state.record_turn(
+                generation,
+                Usage {
+                    input_tokens: 10_000,
+                    output_tokens: 1_000,
+                    cached_tokens: 0,
+                },
+            );
+            assert!(state.next_continuation(generation, now).is_some());
+        }
+        assert_eq!(state.limit_reason(now), None);
+        assert!(state.status(now).contains("/unlimited"));
     }
 
     #[test]
@@ -320,6 +353,31 @@ mod tests {
         state.cancel_current();
         assert!(state.next_continuation(generation, now).is_none());
         assert!(state.begin_run(now).is_some());
+    }
+
+    #[test]
+    fn each_independent_user_task_starts_fresh_aggregate_accounting() {
+        let now = Instant::now();
+        let mut state = AutonomousState::default();
+        state.enable(now);
+        let first = state.begin_run(now).expect("enabled");
+        state.record_turn(
+            first,
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_tokens: 0,
+            },
+        );
+        assert!(state.next_continuation(first, now).is_some());
+        assert_eq!(state.turns_used(), 1);
+        assert_eq!(state.continuations_used(), 1);
+
+        let second = state.begin_run(now).expect("next task");
+        assert_ne!(first, second);
+        assert_eq!(state.turns_used(), 0);
+        assert_eq!(state.continuations_used(), 0);
+        assert_eq!(state.tokens_used(), 0);
     }
 
     #[test]

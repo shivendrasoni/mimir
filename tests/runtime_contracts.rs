@@ -112,6 +112,60 @@ async fn plan_question_stops_cleanly_with_a_persisted_tool_result() {
     );
 }
 
+#[tokio::test]
+async fn finish_task_stops_after_persisting_its_successful_tool_result() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "done").expect("artifact");
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::ToolCall(ToolCall {
+            id: "finish-1".into(),
+            name: "finish_task".into(),
+            arguments: json!({
+                "summary": "implementation complete",
+                "artifacts": ["artifact.txt"]
+            }),
+        })],
+        StopReason::ToolUse,
+        4,
+    )]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default())
+                .expect("tools"),
+        ),
+        store.clone(),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+    runtime.set_autonomous_completion_enabled(true).await;
+
+    let answer = runtime
+        .run("finish the task", &VecEventSink::default())
+        .await
+        .expect("finish_task ends the run");
+
+    assert_eq!(answer, "implementation complete");
+    assert_eq!(provider.requests().await.len(), 1);
+    let loaded = store.load().await.expect("stored result");
+    assert!(loaded.records.iter().any(|record| {
+        matches!(
+            &record.payload,
+            SessionPayload::Message(message)
+                if message.role == mimir::model::Role::Tool
+                    && message.content.iter().any(|content| matches!(
+                        content,
+                        Content::ToolResult(result)
+                            if result.content.contains("autonomous task marked complete")
+                    ))
+        )
+    }));
+    let completion = runtime.take_task_completion().await.expect("completion");
+    assert_eq!(completion.artifacts, [PathBuf::from("artifact.txt")]);
+}
+
 fn agent_message_prompt(index: usize) -> String {
     format!(
         "Agent-to-agent message received.\nSource: agent_message\nFrom: active source, session source, client mimir-rpc\nTo: active target, session target\nMessage id: agentmsg_{index}\n\nmessage {index}"
@@ -800,6 +854,50 @@ async fn fake_provider_drives_tool_result_and_final_response_through_persistence
 }
 
 #[tokio::test]
+async fn unlimited_operational_turn_and_tool_budgets_cross_the_former_boundaries() {
+    let root = TempDir::new().expect("tempdir");
+    let mut responses = (0..65)
+        .map(|index| {
+            response(
+                vec![Content::ToolCall(ToolCall {
+                    id: format!("list-{index}"),
+                    name: "list_files".into(),
+                    arguments: json!({"path": "."}),
+                })],
+                StopReason::ToolUse,
+                2,
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(response(
+        vec![Content::Text {
+            text: "finished".into(),
+        }],
+        StopReason::Stop,
+        2,
+    ));
+    let provider = Arc::new(FakeProvider::new(responses));
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+
+    let answer = runtime
+        .run("continue beyond old ceilings", &VecEventSink::default())
+        .await
+        .expect("unlimited turn and tool budgets");
+
+    assert_eq!(answer, "finished");
+    assert_eq!(provider.requests().await.len(), 66);
+}
+
+#[tokio::test]
 async fn unapproved_workspace_write_emits_permission_request_without_mutating() {
     let root = TempDir::new().expect("tempdir");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -885,7 +983,7 @@ async fn budget_interruption_persists_results_for_every_assistant_tool_call() {
         store.clone(),
         RuntimeConfig {
             budget: Budget {
-                max_tool_calls: 1,
+                max_tool_calls: Some(1),
                 ..Budget::default()
             },
             provider_timeout: Duration::from_secs(1),
@@ -1492,7 +1590,7 @@ async fn budget_pause_persists_synthetic_results_for_every_pending_tool_call() {
         store.clone(),
         RuntimeConfig {
             budget: Budget {
-                max_turns: 1,
+                max_turns: Some(1),
                 ..Budget::default()
             },
             ..RuntimeConfig::default_for_model("fake-model")
@@ -1573,7 +1671,7 @@ async fn cached_replay_across_seven_large_tool_turns_does_not_pause_at_one_milli
         Arc::new(InMemorySessionStore::default()),
         RuntimeConfig {
             budget: Budget {
-                max_tokens: 1_000_000,
+                max_tokens: Some(1_000_000),
                 ..Budget::default()
             },
             ..RuntimeConfig::default_for_model("fake-model")
@@ -2285,4 +2383,77 @@ async fn manual_compaction_failure_keeps_the_active_transcript_unchanged() {
             .iter()
             .all(|record| !matches!(record.payload, SessionPayload::Compaction { .. }))
     );
+}
+
+#[tokio::test]
+async fn provider_aware_token_budget_tracks_model_provider_switches() {
+    let root = TempDir::new().expect("tempdir");
+    let runtime = AgentRuntime::resume(
+        Arc::new(FakeProvider::new(Vec::new())),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig {
+            provider: "anthropic".into(),
+            provider_aware_token_budget: true,
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+
+    assert_eq!(runtime.operational_budget().max_tokens, None);
+    runtime
+        .select_model(
+            Arc::new(FakeProvider::new(Vec::new())),
+            "minimax",
+            "fake-model",
+            vec![ThinkingLevel::Off],
+            None,
+        )
+        .await
+        .expect("metered provider");
+    assert_eq!(runtime.operational_budget().max_tokens, Some(1_000_000));
+    runtime
+        .select_model(
+            Arc::new(FakeProvider::new(Vec::new())),
+            "openai-codex",
+            "fake-model",
+            vec![ThinkingLevel::Off],
+            None,
+        )
+        .await
+        .expect("unrestricted provider");
+    assert_eq!(runtime.operational_budget().max_tokens, None);
+
+    let fixed = AgentRuntime::resume(
+        Arc::new(FakeProvider::new(Vec::new())),
+        Arc::new(
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("tools"),
+        ),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig {
+            provider: "anthropic".into(),
+            budget: Budget {
+                max_tokens: Some(123),
+                ..Budget::default()
+            },
+            provider_aware_token_budget: false,
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("fixed runtime");
+    fixed
+        .select_model(
+            Arc::new(FakeProvider::new(Vec::new())),
+            "openai-codex",
+            "fake-model",
+            vec![ThinkingLevel::Off],
+            None,
+        )
+        .await
+        .expect("provider switch");
+    assert_eq!(fixed.operational_budget().max_tokens, Some(123));
 }

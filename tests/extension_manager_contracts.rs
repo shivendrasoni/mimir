@@ -219,6 +219,7 @@ async fn agent_runtime_dispatches_lifecycle_and_surfaces_extension_ui() {
         thinking_level_map: None,
         system_prompt: String::new(),
         budget: Budget::default(),
+        provider_aware_token_budget: false,
         provider_timeout: std::time::Duration::from_secs(2),
     };
     let runtime = AgentRuntime::resume(

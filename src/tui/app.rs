@@ -9,7 +9,7 @@ use crate::{
     orchestration::HeartbeatManagementAction,
     resources::{CustomTheme, PromptTemplate, Skill, expand_prompt_template},
     runtime::QueueMode,
-    tools::{AgentMode, ApprovalDecision, PermissionRequest},
+    tools::{AgentMode, ApprovalDecision, ClarifyingQuestion, PermissionRequest},
 };
 use uuid::Uuid;
 
@@ -39,6 +39,7 @@ const BUILTIN_COMPLETIONS: &[&str] = &[
     "/help",
     "/hotkeys",
     "/import",
+    "/implement",
     "/login",
     "/logout",
     "/logs",
@@ -196,6 +197,11 @@ pub enum Overlay {
         request: PermissionRequest,
         selected: usize,
     },
+    Clarification {
+        request: ClarifyingQuestion,
+        selected: usize,
+        input: String,
+    },
     Selector(SelectorOverlay),
 }
 
@@ -232,6 +238,7 @@ pub enum StreamEvent {
     Completed(String),
     Failed(String),
     BudgetPaused(String),
+    UserInputRequested(ClarifyingQuestion),
     ExtensionUi {
         extension: String,
         request: crate::extensions::UiRequest,
@@ -617,6 +624,14 @@ impl App {
         self.overlay = Overlay::WorkspacePermission {
             request,
             selected: 0,
+        };
+    }
+
+    pub fn open_clarification(&mut self, request: ClarifyingQuestion) {
+        self.overlay = Overlay::Clarification {
+            request,
+            selected: 0,
+            input: String::new(),
         };
     }
 
@@ -1080,6 +1095,7 @@ impl App {
                 "Prompt templates…".into(),
                 "Skills…".into(),
                 "Scoped models…".into(),
+                format!("Agent mode: {}", self.preferences.agent_mode.as_str()),
                 format!("OpenAI Fast: {}", on_off(self.preferences.fast_mode)),
                 format!("Fullscreen: {}", on_off(self.preferences.fullscreen)),
                 format!("Auto-compact: {}", on_off(self.preferences.auto_compaction)),
@@ -1244,6 +1260,7 @@ impl App {
                     text: message,
                 });
             }
+            StreamEvent::UserInputRequested(request) => self.open_clarification(request),
             StreamEvent::ExtensionUi { extension, request } => {
                 self.transcript.push(TranscriptEntry {
                     role: TranscriptRole::System,
@@ -1364,6 +1381,10 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keyboard dispatch keeps all mutually exclusive overlay interactions explicit"
+    )]
     pub fn apply_key(&mut self, event: KeyEvent) {
         if let Some(action) = self
             .bindings
@@ -1404,17 +1425,55 @@ impl App {
             _ => {}
         }
 
+        match (&mut self.overlay, &event.code) {
+            (
+                Overlay::Clarification {
+                    request,
+                    selected,
+                    input,
+                },
+                KeyCode::Backspace,
+            ) if *selected == request.options.len() => {
+                input.pop();
+                return;
+            }
+            (
+                Overlay::Clarification {
+                    request,
+                    selected,
+                    input,
+                },
+                KeyCode::Char(ch),
+            ) if !event.ctrl && !event.alt => {
+                *selected = request.options.len();
+                input.push(*ch);
+                return;
+            }
+            _ => {}
+        }
+
         match (&self.overlay, &event.code) {
-            (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Up) => {
+            (
+                Overlay::Selector(_)
+                | Overlay::WorkspacePermission { .. }
+                | Overlay::Clarification { .. },
+                KeyCode::Up,
+            ) => {
                 self.apply_action(Action::SelectPrev);
             }
-            (Overlay::Selector(_) | Overlay::WorkspacePermission { .. }, KeyCode::Down) => {
+            (
+                Overlay::Selector(_)
+                | Overlay::WorkspacePermission { .. }
+                | Overlay::Clarification { .. },
+                KeyCode::Down,
+            ) => {
                 self.apply_action(Action::SelectNext);
             }
             (
                 Overlay::Selector(_)
                 | Overlay::Confirm { .. }
-                | Overlay::WorkspacePermission { .. },
+                | Overlay::WorkspacePermission { .. }
+                | Overlay::Clarification { .. },
                 KeyCode::Enter,
             ) => {
                 self.apply_action(Action::Confirm);
@@ -1427,7 +1486,8 @@ impl App {
                 | Overlay::Logout { .. }
                 | Overlay::McpLogin { .. }
                 | Overlay::Confirm { .. }
-                | Overlay::WorkspacePermission { .. },
+                | Overlay::WorkspacePermission { .. }
+                | Overlay::Clarification { .. },
                 KeyCode::Esc,
             ) => {
                 self.apply_action(Action::CloseOverlay);
@@ -1503,10 +1563,11 @@ impl App {
         if let Some(rest) = trimmed.strip_prefix('/') {
             let split = rest.find(char::is_whitespace).unwrap_or(rest.len());
             let name = &rest[..split];
-            if self
-                .extension_commands
-                .iter()
-                .any(|command| command == name)
+            if self.preferences.agent_mode != AgentMode::Plan
+                && self
+                    .extension_commands
+                    .iter()
+                    .any(|command| command == name)
             {
                 self.pending_tui_action = Some(TuiAction::ExtensionCommand {
                     name: name.to_owned(),
@@ -1517,6 +1578,13 @@ impl App {
         }
         if let Some(command) = parse_slash_command(&trimmed) {
             self.handle_slash_command(command);
+            return;
+        }
+        if self.preferences.agent_mode == AgentMode::Plan
+            && trimmed.eq_ignore_ascii_case("implement")
+            && self.pending_images.is_empty()
+        {
+            self.pending_tui_action = Some(TuiAction::ImplementPlan { instructions: None });
             return;
         }
         self.submitted_images = std::mem::take(&mut self.pending_images);
@@ -1558,10 +1626,13 @@ impl App {
                     self.pending_tui_action = Some(TuiAction::SetAgentMode(mode));
                 } else {
                     self.push_system_message(format!(
-                        "Mode: {}. Default asks before model-issued shell commands; auto runs shell commands and workspace edits immediately.",
+                        "Mode: {}. Plan permits inspection, clarification, and the plan artifact only; default asks before model-issued shell commands; auto runs shell commands and workspace edits immediately.",
                         self.preferences.agent_mode.as_str()
                     ));
                 }
+            }
+            SlashCommand::Implement { instructions } => {
+                self.pending_tui_action = Some(TuiAction::ImplementPlan { instructions });
             }
             SlashCommand::Session { .. } => {
                 self.pending_tui_action = Some(TuiAction::ShowSessionInfo);
@@ -1731,7 +1802,8 @@ impl App {
             | Overlay::Hotkeys
             | Overlay::Selector(_)
             | Overlay::Confirm { .. }
-            | Overlay::WorkspacePermission { .. } => {}
+            | Overlay::WorkspacePermission { .. }
+            | Overlay::Clarification { .. } => {}
         }
     }
 
@@ -1756,6 +1828,24 @@ impl App {
                 decision,
             });
             self.overlay = Overlay::None;
+            return;
+        }
+        if let Overlay::Clarification {
+            request,
+            selected,
+            input,
+        } = &self.overlay
+        {
+            let answer = if *selected < request.options.len() {
+                request.options[*selected].label.clone()
+            } else {
+                input.trim().to_owned()
+            };
+            if !answer.is_empty() {
+                self.history.push(answer.clone());
+                self.pending_submission = Some(answer);
+                self.overlay = Overlay::None;
+            }
             return;
         }
         let Overlay::Selector(selector) = &self.overlay else {
@@ -1902,22 +1992,31 @@ impl App {
         }
         match selected {
             6 => {
+                self.preferences.agent_mode = match self.preferences.agent_mode {
+                    AgentMode::Default => AgentMode::Plan,
+                    AgentMode::Plan => AgentMode::Auto,
+                    AgentMode::Auto => AgentMode::Default,
+                };
+                self.pending_tui_action =
+                    Some(TuiAction::SetAgentMode(self.preferences.agent_mode));
+            }
+            7 => {
                 self.preferences.fast_mode = !self.preferences.fast_mode;
                 self.pending_tui_action = Some(TuiAction::ToggleFast);
             }
-            7 => {
+            8 => {
                 self.preferences.fullscreen = !self.preferences.fullscreen;
                 self.pending_tui_action = Some(TuiAction::Fullscreen {
                     enabled: Some(self.preferences.fullscreen),
                 });
             }
-            8 => {
+            9 => {
                 self.preferences.auto_compaction = !self.preferences.auto_compaction;
                 self.pending_tui_action = Some(TuiAction::SetAutoCompaction {
                     enabled: self.preferences.auto_compaction,
                 });
             }
-            9 => {
+            10 => {
                 self.preferences.steering_mode = match self.preferences.steering_mode {
                     QueueMode::All => QueueMode::OneAtATime,
                     QueueMode::OneAtATime => QueueMode::All,
@@ -1926,16 +2025,16 @@ impl App {
                     mode: self.preferences.steering_mode,
                 });
             }
-            10 => self.preferences.show_images = !self.preferences.show_images,
-            11 => self.preferences.auto_resize_images = !self.preferences.auto_resize_images,
-            12 => self.preferences.block_images = !self.preferences.block_images,
-            13 => {
+            11 => self.preferences.show_images = !self.preferences.show_images,
+            12 => self.preferences.auto_resize_images = !self.preferences.auto_resize_images,
+            13 => self.preferences.block_images = !self.preferences.block_images,
+            14 => {
                 self.preferences.follow_up_mode = match self.preferences.follow_up_mode {
                     QueueMode::All => QueueMode::OneAtATime,
                     QueueMode::OneAtATime => QueueMode::All,
                 };
             }
-            14 => {
+            15 => {
                 self.preferences.autocomplete_max_visible =
                     if self.preferences.autocomplete_max_visible >= 20 {
                         3
@@ -1943,21 +2042,21 @@ impl App {
                         self.preferences.autocomplete_max_visible.saturating_add(1)
                     };
             }
-            15 => self.preferences.tree_filter_mode = self.preferences.tree_filter_mode.next(),
-            16 => {
+            16 => self.preferences.tree_filter_mode = self.preferences.tree_filter_mode.next(),
+            17 => {
                 self.preferences.show_hardware_cursor = !self.preferences.show_hardware_cursor;
             }
-            17 => {
+            18 => {
                 self.preferences.editor_padding_x =
                     self.preferences.editor_padding_x.saturating_add(1) % 9;
             }
-            18 => {
+            19 => {
                 self.preferences.show_terminal_progress = !self.preferences.show_terminal_progress;
             }
-            19 => self.preferences.show_warnings = !self.preferences.show_warnings,
+            20 => self.preferences.show_warnings = !self.preferences.show_warnings,
             _ => {}
         }
-        if (10..=19).contains(&selected) {
+        if (11..=20).contains(&selected) {
             self.pending_tui_action = Some(TuiAction::PersistSettings);
         }
         false
@@ -1966,6 +2065,18 @@ impl App {
     fn move_selection(&mut self, delta: isize) {
         if let Overlay::WorkspacePermission { selected, .. } = &mut self.overlay {
             *selected = ((*selected).cast_signed() + delta).rem_euclid(3) as usize;
+            return;
+        }
+        if let Overlay::Clarification {
+            request, selected, ..
+        } = &mut self.overlay
+        {
+            let last = request.options.len();
+            if delta.is_negative() {
+                *selected = selected.saturating_sub(delta.unsigned_abs());
+            } else {
+                *selected = selected.saturating_add(delta.unsigned_abs()).min(last);
+            }
             return;
         }
         let Overlay::Selector(selector) = &mut self.overlay else {

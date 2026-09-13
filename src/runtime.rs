@@ -29,7 +29,9 @@ use crate::{
     session::{SessionPayload, SessionRecord, SessionStore},
     session_integrity,
     skills::{SkillInvocationError, SkillRuntime},
-    tools::{ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry},
+    tools::{
+        ClarifyingQuestion, ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry,
+    },
 };
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
@@ -141,6 +143,9 @@ pub enum RuntimeEvent {
     PermissionRequested {
         request: PermissionRequest,
     },
+    UserInputRequested {
+        request: ClarifyingQuestion,
+    },
     ToolUpdated {
         id: String,
         name: String,
@@ -204,6 +209,7 @@ impl RuntimeEvent {
             Self::TurnCompleted { .. } => "turn_completed",
             Self::ToolStarted { .. } => "tool_started",
             Self::PermissionRequested { .. } => "permission_requested",
+            Self::UserInputRequested { .. } => "user_input_requested",
             Self::ToolUpdated { .. } => "tool_updated",
             Self::ToolFinished { .. } => "tool_finished",
             Self::TextDelta { .. } => "text_delta",
@@ -521,6 +527,47 @@ impl AgentRuntime {
         *self.extension_session_id.write().await = session_id.to_owned();
         self.extension_session_started
             .store(false, Ordering::Release);
+    }
+
+    /// Returns the unresolved plan-mode clarification, if this runtime has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool persistence error when the private plan state cannot be read.
+    pub async fn pending_plan_question(&self) -> Result<Option<ClarifyingQuestion>> {
+        self.tools
+            .pending_plan_question()
+            .await
+            .map_err(|error| MimirError::Tool(error.to_string()))
+    }
+
+    /// Returns the validated plan artifact bound to this runtime's plan context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool policy or I/O error when the artifact is missing, unsafe, or unreadable.
+    pub async fn plan_artifact(&self) -> Result<Option<std::path::PathBuf>> {
+        self.tools
+            .plan_artifact()
+            .await
+            .map_err(|error| MimirError::Tool(error.to_string()))
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &std::path::Path {
+        self.tools.workspace_root()
+    }
+
+    /// Marks the current plan as handed to an implementation-mode runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool persistence error when no plan is bound or state cannot be written.
+    pub async fn mark_plan_handed_off(&self) -> Result<()> {
+        self.tools
+            .mark_plan_handed_off()
+            .await
+            .map_err(|error| MimirError::Tool(error.to_string()))
     }
 
     /// Replaces the immutable skill catalog used to expand explicit invocations.
@@ -1925,6 +1972,10 @@ impl AgentRuntime {
         source: RuntimeEventSource,
         sink: &dyn EventSink,
     ) -> Result<String> {
+        self.tools
+            .clear_pending_plan_question()
+            .await
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
         let active_skill_context = self
             .skill_context_for_messages(messages)
             .map_err(|error| skill_invocation_error(&error))?;
@@ -2568,8 +2619,23 @@ impl AgentRuntime {
                     })
                     .await;
                 }
+                let requested_input = match &execution {
+                    Err(crate::tools::ToolError::UserInputRequired { request }) => {
+                        Some(request.clone())
+                    }
+                    _ => None,
+                };
                 let observation = match execution {
                     Ok(observation) => observation,
+                    Err(crate::tools::ToolError::UserInputRequired { request }) => {
+                        ToolObservation {
+                            status: ObservationStatus::Warning,
+                            summary: "waiting for user input".into(),
+                            next_actions: vec!["Choose an option or provide another answer".into()],
+                            artifacts: Vec::new(),
+                            content: serde_json::to_string(&request)?,
+                        }
+                    }
                     Err(error) => ToolObservation {
                         status: ObservationStatus::Error,
                         summary: error.to_string(),
@@ -2650,6 +2716,61 @@ impl AgentRuntime {
                     sink,
                 )
                 .await?;
+                if let Some(request) = requested_input {
+                    for remaining in tool_calls.iter().skip(call_index + 1) {
+                        let skipped = ToolObservation {
+                            status: ObservationStatus::Warning,
+                            summary: "tool deferred while waiting for user input".into(),
+                            next_actions: vec!["Retry after the user answers".into()],
+                            artifacts: Vec::new(),
+                            content: String::new(),
+                        };
+                        let result = Message::tool_result(
+                            &remaining.id,
+                            &remaining.name,
+                            serde_json::to_string(&skipped)?,
+                            false,
+                        );
+                        self.persist_message(result.clone()).await?;
+                        tool_results.push(result);
+                        sink.emit(RuntimeEvent::ToolFinished {
+                            id: remaining.id.clone(),
+                            name: remaining.name.clone(),
+                            observation: skipped,
+                        })
+                        .await;
+                    }
+                    sink.emit(RuntimeEvent::TurnCompleted {
+                        message: assistant_message.clone(),
+                        tool_results: tool_results.clone(),
+                    })
+                    .await;
+                    sink.emit(RuntimeEvent::UserInputRequested {
+                        request: request.clone(),
+                    })
+                    .await;
+                    let text = request.formatted();
+                    sink.emit(RuntimeEvent::Completed { text: text.clone() })
+                        .await;
+                    self.dispatch_extension_event(
+                        LifecycleEvent::TurnEnd {
+                            session_id: session_id.clone(),
+                            turn_index: u64::from(turn),
+                            stop_reason: Some("user_input".into()),
+                        },
+                        sink,
+                    )
+                    .await?;
+                    self.dispatch_extension_event(
+                        LifecycleEvent::AgentEnd {
+                            session_id: session_id.clone(),
+                            success: true,
+                        },
+                        sink,
+                    )
+                    .await?;
+                    return Ok(text);
+                }
             }
             sink.emit(RuntimeEvent::TurnCompleted {
                 message: assistant_message,

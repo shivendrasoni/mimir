@@ -39,9 +39,9 @@ use crate::{
     error::{MimirError, Result},
     extensions::{
         AgentRuntimeChildExecutor, AuthStoreModelCatalog, AuthenticatedModelCatalog, Capability,
-        CatalogEntry, ExtensionCatalog, ExtensionManager, ExtensionManifest,
-        ExtensionPackageManager, FlagKind, HostLimits, HostRequest, JsonLineExtensionHost,
-        ManifestSource, ResourceDiscoveryReason, RlmChildRuntimePolicy,
+        CatalogEntry, DiscoveredResourcePaths, ExtensionCatalog, ExtensionManager,
+        ExtensionManifest, ExtensionPackageManager, FlagKind, HostLimits, HostRequest,
+        JsonLineExtensionHost, ManifestSource, ResourceDiscoveryReason, RlmChildRuntimePolicy,
         RlmChildToolRegistryFactory, RlmExecutionRequest, RlmLimits, RlmModel, RlmProviderFactory,
         RlmRuntime, RlmRuntimeLimits, RlmStore, RuntimeLimits,
     },
@@ -80,8 +80,8 @@ use crate::{
     },
     skills::SkillRuntime,
     tools::{
-        AgentMode, BashResult, BashRunner, ObservationStatus, ToolPolicy, ToolRegistry,
-        WorkspaceApprovalStore,
+        AgentMode, BashResult, BashRunner, ObservationStatus, PlanContextStore, ToolPolicy,
+        ToolRegistry, WorkspaceApprovalStore,
     },
     tui::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
@@ -124,6 +124,7 @@ enum ThinkingArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AgentModeArg {
     Default,
+    Plan,
     Auto,
 }
 
@@ -131,6 +132,7 @@ impl From<AgentModeArg> for AgentMode {
     fn from(value: AgentModeArg) -> Self {
         match value {
             AgentModeArg::Default => Self::Default,
+            AgentModeArg::Plan => Self::Plan,
             AgentModeArg::Auto => Self::Auto,
         }
     }
@@ -140,6 +142,7 @@ impl From<AgentMode> for AgentModeArg {
     fn from(value: AgentMode) -> Self {
         match value {
             AgentMode::Default => Self::Default,
+            AgentMode::Plan => Self::Plan,
             AgentMode::Auto => Self::Auto,
         }
     }
@@ -203,7 +206,7 @@ pub struct Cli {
     #[arg(
         long = "agent-mode",
         value_enum,
-        help = "Command permission mode: default asks before shell commands; auto runs them immediately"
+        help = "Agent mode: default asks before writes, plan permits only inspection and one plan artifact, auto runs immediately"
     )]
     agent_mode: Option<AgentModeArg>,
     #[arg(long, value_delimiter = ',')]
@@ -1139,6 +1142,9 @@ impl EventSink for LegacyRpcEventSink {
             RuntimeEvent::PermissionRequested { request } => vec![json!({
                 "type": "workspace_permission_required", "request": request
             })],
+            RuntimeEvent::UserInputRequested { request } => vec![json!({
+                "type": "user_input_requested", "request": request
+            })],
             RuntimeEvent::TextDelta { text } => {
                 let partial = {
                     let mut partial = self.partial_text.lock().await;
@@ -1317,8 +1323,19 @@ fn validate_process_options(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "run option validation keeps cross-flag policy conflicts in one auditable boundary"
+)]
 fn validate_run_options(cli: &Cli) -> Result<()> {
     validate_process_options(cli)?;
+    if cli.agent_mode == Some(AgentModeArg::Plan)
+        && (cli_autonomous_limits(cli).is_some() || cli.goal.is_some())
+    {
+        return Err(MimirError::Configuration(
+            "plan mode cannot run autonomous continuations or create a goal".into(),
+        ));
+    }
     if cli.socket.is_some() && matches!(cli.output, OutputMode::Rpc | OutputMode::Acp) {
         return Err(MimirError::Configuration(
             "--socket/--daemon-socket is only supported by text/json prompt mode".into(),
@@ -4710,6 +4727,9 @@ fn resolve_tui_model_selection(
 ) -> Result<(String, String)> {
     let registry = ProviderRegistry::builtin();
     if let Some((provider, model)) = selection.split_once('/') {
+        if provider == "fake" && fallback_provider == "fake" && !model.trim().is_empty() {
+            return Ok((provider.into(), model.into()));
+        }
         let definition = registry.get(provider).ok_or_else(|| {
             MimirError::Configuration(format!("unknown model provider: {provider}"))
         })?;
@@ -6741,7 +6761,8 @@ fn build_bash_runner(build: &RuntimeBuildConfig) -> Result<Arc<BashRunner>> {
         MimirError::Configuration(format!("workspace is inaccessible: {error}"))
     })?;
     let policy = ToolPolicy {
-        allow_process: build.allow_process || build.agent_mode == AgentMode::Auto,
+        allow_process: !build.agent_mode.is_plan()
+            && (build.allow_process || build.agent_mode == AgentMode::Auto),
         allow_any_program: build.agent_mode == AgentMode::Auto,
         agent_mode: build.agent_mode,
         allowed_programs: Some(build.allowed_programs.clone()),
@@ -6875,7 +6896,11 @@ async fn build_runtime_for_session(
     let (effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
     let build = &effective_build;
-    let extensions = load_runtime_extensions(build, &workspace, &state).await?;
+    let extensions = if build.agent_mode.is_plan() {
+        Vec::new()
+    } else {
+        load_runtime_extensions(build, &workspace, &state).await?
+    };
     let extension_manager = ExtensionManager::load_shared(
         extensions.clone(),
         &workspace,
@@ -6883,9 +6908,13 @@ async fn build_runtime_for_session(
         RuntimeLimits::default(),
     )
     .await?;
-    let discovered_resources = extension_manager
-        .discover_resources(ResourceDiscoveryReason::Startup)
-        .await?;
+    let discovered_resources = if build.agent_mode.is_plan() {
+        DiscoveredResourcePaths::default()
+    } else {
+        extension_manager
+            .discover_resources(ResourceDiscoveryReason::Startup)
+            .await?
+    };
     let mut resource_build = build.clone();
     resource_build
         .skill_paths
@@ -6941,21 +6970,41 @@ async fn build_runtime_for_session(
         &build.provider,
         &build.model,
     )?;
-    let process_tools_authorized = build.allow_process;
+    if build.agent_mode.is_plan() && extension_provider_selected {
+        return Err(MimirError::Configuration(
+            "plan mode supports native providers only".into(),
+        ));
+    }
+    let process_tools_authorized = build.allow_process && !build.agent_mode.is_plan();
+    let plan_context = if build.agent_mode.is_plan() {
+        let context = Arc::new(
+            PlanContextStore::new(&workspace, &state, session)
+                .map_err(|error| MimirError::Tool(error.to_string()))?,
+        );
+        context
+            .prepare()
+            .await
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+        Some(context)
+    } else {
+        None
+    };
     let policy = ToolPolicy {
-        allow_process: build.allow_process,
-        allow_shell: true,
+        allow_write: !build.agent_mode.is_plan(),
+        allow_process: process_tools_authorized,
+        allow_shell: !build.agent_mode.is_plan(),
         agent_mode: build.agent_mode,
         allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
             WorkspaceApprovalStore::new(&workspace)
                 .map_err(|error| MimirError::Tool(error.to_string()))?,
         )),
+        plan_context,
         ..ToolPolicy::default()
     };
     let mut tool_registry = ToolRegistry::with_default_tools(&workspace, policy.clone())
         .map_err(|error| MimirError::Tool(error.to_string()))?;
-    if build.no_builtin_tools {
+    if build.no_builtin_tools && !build.agent_mode.is_plan() {
         let _ = tool_registry.retain_named(&BTreeSet::new());
     }
     if process_tools_authorized && !build.no_builtin_tools {
@@ -6963,13 +7012,15 @@ async fn build_runtime_for_session(
             .register_ipython_kernel(&workspace, &state, session, policy.clone())
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
-    tool_registry
-        .register_extension_manager(&extension_manager)
-        .map_err(|error| MimirError::Tool(error.to_string()))?;
-    tool_registry
-        .register_extension_tools(extensions, &workspace)
-        .map_err(|error| MimirError::Tool(error.to_string()))?;
-    if !build.offline {
+    if !build.agent_mode.is_plan() {
+        tool_registry
+            .register_extension_manager(&extension_manager)
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+        tool_registry
+            .register_extension_tools(extensions, &workspace)
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+    }
+    if !build.offline && !build.agent_mode.is_plan() {
         let mcp_report = tool_registry
             .register_mcp_servers(&state)
             .await
@@ -6993,7 +7044,9 @@ async fn build_runtime_for_session(
             activation.blocked_model_providers().len()
         );
     }
-    if let Some(allowed) = &build.tool_allowlist {
+    if let Some(allowed) = &build.tool_allowlist
+        && !build.agent_mode.is_plan()
+    {
         let _ = tool_registry.retain_named(allowed);
     }
     let file_store = if build.no_session {
@@ -7007,7 +7060,7 @@ async fn build_runtime_for_session(
         max_depth: load_tui_rlm_max_depth(&state, session).await?,
         ..RlmRuntimeLimits::default()
     };
-    if rlm_limits.max_depth > 0 && file_store.is_some() {
+    if rlm_limits.max_depth > 0 && file_store.is_some() && !build.agent_mode.is_plan() {
         // Every child starts from the fully assembled core/extension/MCP registry.
         // The child factory adds a session-scoped RLM runtime only while another
         // level remains below the configured recursion bound.
@@ -7056,7 +7109,9 @@ async fn build_runtime_for_session(
             .register_rlm_runtime(rlm_runtime)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
-    if let Some(allowed) = &build.tool_allowlist {
+    if let Some(allowed) = &build.tool_allowlist
+        && !build.agent_mode.is_plan()
+    {
         let missing = tool_registry.retain_named(allowed);
         if !missing.is_empty() {
             return Err(MimirError::Configuration(format!(
@@ -9578,7 +9633,7 @@ mod tui_model_selection_tests {
         build_runtime_for_session, daemon_runtime_error, parse_recovered_goal_create,
         parse_recovered_refine_args, resolve_extension_flags, resolve_runtime_thinking_level,
         resolve_tui_model_selection, run_self_update, runtime_model_definition,
-        send_public_command, tui_model_options,
+        send_public_command, tui_model_options, validate_run_options,
     };
 
     #[test]
@@ -9645,6 +9700,23 @@ mod tui_model_selection_tests {
             RuntimeBuildConfig::from_cli(&auto).agent_mode,
             AgentMode::Auto
         );
+
+        let plan = Cli::try_parse_from(["mimir", "--agent-mode", "plan"]).expect("plan agent mode");
+        assert_eq!(
+            RuntimeBuildConfig::from_cli(&plan).agent_mode,
+            AgentMode::Plan
+        );
+
+        let plan_autonomous = Cli::try_parse_from([
+            "mimir",
+            "--agent-mode",
+            "plan",
+            "--autonomous",
+            "--print",
+            "inspect",
+        ])
+        .expect("parse plan autonomous conflict");
+        assert!(validate_run_options(&plan_autonomous).is_err());
 
         let output = Cli::try_parse_from(["mimir", "--mode", "json"])
             .expect("output mode compatibility alias");
@@ -9888,6 +9960,15 @@ mod tui_model_selection_tests {
         let options = tui_model_options("openai", "gpt-5-mini");
         assert!(options.iter().any(|value| value.starts_with("anthropic/")));
         assert!(options.iter().any(|value| value.starts_with("google/")));
+    }
+
+    #[test]
+    fn fake_tui_model_can_rebuild_for_runtime_mode_changes() {
+        assert_eq!(
+            resolve_tui_model_selection("fake/gpt-5-mini", "fake").expect("fake selection"),
+            ("fake".into(), "gpt-5-mini".into())
+        );
+        assert!(resolve_tui_model_selection("fake/gpt-5-mini", "openai").is_err());
     }
 
     #[tokio::test]

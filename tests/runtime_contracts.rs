@@ -16,7 +16,10 @@ use mimir::{
     provider::{FakeProvider, Provider, ProviderError, ProviderEvent, ProviderEventSink},
     runtime::{AgentRuntime, QueueMode, RetryPolicy, RuntimeConfig, RuntimeEvent, VecEventSink},
     session::{InMemorySessionStore, LoadedSession, SessionPayload, SessionRecord, SessionStore},
-    tools::{DestructiveAction, ToolPolicy, ToolRegistry, WorkspaceApprovalStore},
+    tools::{
+        AgentMode, DestructiveAction, PlanContextStore, ToolPolicy, ToolRegistry,
+        WorkspaceApprovalStore,
+    },
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -33,6 +36,80 @@ fn response(content: Vec<Content>, stop_reason: StopReason, tokens: u64) -> Mode
         message,
         response_id: Some("fake-response".into()),
     }
+}
+
+#[tokio::test]
+async fn plan_question_stops_cleanly_with_a_persisted_tool_result() {
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let context = Arc::new(
+        PlanContextStore::new(workspace.path(), state.path(), "runtime-question").expect("context"),
+    );
+    context.prepare().await.expect("prepare");
+    let provider = Arc::new(FakeProvider::new(vec![response(
+        vec![Content::ToolCall(ToolCall {
+            id: "ask-1".into(),
+            name: "ask_user".into(),
+            arguments: json!({
+                "id":"surface",
+                "header":"Surface",
+                "question":"Where should this ship?",
+                "options":[
+                    {"label":"TUI", "description":"Interactive first."},
+                    {"label":"Everywhere", "description":"Larger scope."}
+                ]
+            }),
+        })],
+        StopReason::ToolUse,
+        4,
+    )]));
+    let tools = Arc::new(
+        ToolRegistry::with_default_tools(
+            workspace.path(),
+            ToolPolicy {
+                agent_mode: AgentMode::Plan,
+                plan_context: Some(Arc::clone(&context)),
+                ..ToolPolicy::default()
+            },
+        )
+        .expect("tools"),
+    );
+    let runtime = AgentRuntime::resume(
+        provider,
+        tools,
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+    let events = VecEventSink::default();
+    let answer = runtime
+        .run("plan the change", &events)
+        .await
+        .expect("question pauses cleanly");
+    assert!(answer.contains("Where should this ship?"));
+    assert!(events.events().await.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::UserInputRequested { request } if request.id == "surface"
+    )));
+    let messages = runtime.messages_snapshot().await;
+    assert!(messages.iter().any(|message| {
+        message.role == mimir::model::Role::Tool && message.content.iter().any(|content| {
+            matches!(
+                content,
+                Content::ToolResult(result) if result.tool_call_id == "ask-1" && !result.is_error
+            )
+        })
+    }));
+    assert_eq!(
+        runtime
+            .pending_plan_question()
+            .await
+            .expect("pending")
+            .expect("question")
+            .id,
+        "surface"
+    );
 }
 
 fn agent_message_prompt(index: usize) -> String {

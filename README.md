@@ -65,6 +65,9 @@ mimir
 # Auto mode lets the agent run Bash commands and workspace edits without prompts
 mimir --agent-mode auto
 
+# Plan mode inspects and clarifies, then writes one reviewable plan artifact
+mimir --agent-mode plan
+
 # Allow a longer agentic tool loop for one prompt (default: 64 provider turns)
 mimir --max-turns 128
 mimir --max-run-tokens 2000000
@@ -78,9 +81,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"health"}' | mimir --provider fa
 
 The model has a workspace-rooted `bash` tool. In `default` mode every model-issued shell command
 requires confirmation, while `/mode auto` runs shell commands and workspace edits immediately.
-Use `/mode default` to return to confirmation. Long-running servers should be backgrounded with
-stdout and stderr redirected to a workspace log. Direct TUI commands use `!command` (or
-`!!command` to exclude the result from model context); auto mode runs those without an allowlist.
+Use `/mode default` to return to confirmation.
+
+`/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and
+`write_plan`. It can inspect the repository, pause for a structured clarification, and create or
+revise one session-bound Markdown file under `plans/`; direct shell commands, extensions, MCP,
+IPython, child agents, and autonomous continuations are disabled. Plan mode supports native model
+providers only. When the plan is ready, enter standalone `implement` or
+`/implement [additional instructions]`. Mimir validates the artifact, switches to auto mode, and
+starts implementation from the accepted plan. The plan is never committed or pushed automatically.
+
+Long-running servers should be backgrounded with stdout and stderr redirected to a workspace log.
+Direct TUI commands use `!command` (or `!!command` to exclude the result from model context); auto
+mode runs those without an allowlist.
 
 The narrower argument-vector `run_process` tool remains opt-in and requires an exact program
 allowlist:

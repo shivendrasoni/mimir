@@ -23,6 +23,9 @@ pub enum SlashCommand {
     Mode {
         mode: Option<AgentMode>,
     },
+    Implement {
+        instructions: Option<String>,
+    },
     Session {
         session: Option<String>,
     },
@@ -117,6 +120,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "logout" => Some(SlashCommand::Logout { provider: argument }),
         "model" => Some(SlashCommand::Model { model: argument }),
         "mode" => Some(parse_agent_mode(arguments)),
+        "implement" => Some(SlashCommand::Implement {
+            instructions: argument,
+        }),
         "session" => Some(if arguments.is_empty() {
             SlashCommand::Session { session: None }
         } else {
@@ -207,7 +213,8 @@ pub(super) fn builtin_command_usage(command: &str) -> Option<&'static str> {
         "logout" => Some("/logout [provider]"),
         "mcp" => Some("/mcp [list|login <name>|logout <name>]"),
         "model" => Some("/model [provider/model]"),
-        "mode" => Some("/mode [default|auto]"),
+        "mode" => Some("/mode [default|plan|auto]"),
+        "implement" => Some("/implement [additional instructions]"),
         "name" | "rename" => Some("/name [name]"),
         "refine" => Some("/refine [instructions|rollback <refinement-id>]"),
         "resume" => Some("/resume [session]"),
@@ -226,7 +233,7 @@ fn parse_agent_mode(arguments: &str) -> SlashCommand {
     }
     AgentMode::parse(arguments).map_or_else(
         || SlashCommand::Invalid {
-            message: "Usage: /mode [default|auto]".into(),
+            message: "Usage: /mode [default|plan|auto]".into(),
         },
         |mode| SlashCommand::Mode { mode: Some(mode) },
     )

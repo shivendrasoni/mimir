@@ -147,18 +147,17 @@ async fn provider_safe_aliases_are_registered_and_child_snapshots_are_non_recurs
         .into_iter()
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
-    // Each provider-safe alias dispatches the corresponding dotted reference
-    // host operation: rlm.run, rlm.find_models, rlm.list_subagents,
-    // rlm.delete_subagent, and rlm.cancel_subagent.
-    for (name, reference_operation) in [
-        ("rlm_run", "rlm.run"),
-        ("rlm_find_models", "rlm.find_models"),
-        ("rlm_list_subagents", "rlm.list_subagents"),
-        ("rlm_delete_subagent", "rlm.delete_subagent"),
-        ("rlm_cancel_subagent", "rlm.cancel_subagent"),
+    assert!(!names.iter().any(|name| name == "rlm_run"));
+    // Every provider-safe tool name is registered for the parent and excluded
+    // from a child runtime at the recursion boundary.
+    for name in [
+        "spawn_agent",
+        "rlm_find_models",
+        "rlm_list_subagents",
+        "rlm_delete_subagent",
+        "rlm_cancel_subagent",
     ] {
         assert!(names.iter().any(|candidate| candidate == name));
-        assert_eq!(name, reference_operation.replacen('.', "_", 1));
         assert!(
             child_snapshot
                 .definitions()
@@ -185,11 +184,11 @@ async fn tool_payloads_match_reference_admission_and_management_shapes() {
 
     let admitted = registry
         .execute(
-            "rlm_run",
+            "spawn_agent",
             json!({
                 "prompt": "Review provider parity",
                 "kwargs": {"name": "provider-review", "model": "openai/gpt-5-mini"},
-                "cellSourceCode": "await rlm.run('Review provider parity')"
+                "cellSourceCode": "await agent.spawn('Review provider parity')"
             }),
         )
         .await
@@ -231,7 +230,7 @@ async fn agent_runtime_exposes_a_bounded_view_of_registered_rlm_children() {
     let (registry, _runtime) = registry(&state, &workspace).await;
     registry
         .execute(
-            "rlm_run",
+            "spawn_agent",
             json!({"prompt": "Review context reporting", "kwargs": {"name": "context-child"}}),
         )
         .await
@@ -264,7 +263,7 @@ async fn tool_inputs_reject_unknown_fields_before_admission() {
     let (registry, runtime) = registry(&state, &workspace).await;
 
     let error = registry
-        .execute("rlm_run", json!({"prompt": "bad", "temperature": 0.8}))
+        .execute("spawn_agent", json!({"prompt": "bad", "temperature": 0.8}))
         .await
         .expect_err("unknown input must fail");
     assert!(error.to_string().contains("unknown field"));
@@ -279,17 +278,17 @@ async fn run_accepts_multiline_text_but_rejects_unsafe_controls() {
 
     registry
         .execute(
-            "rlm_run",
+            "spawn_agent",
             json!({
                 "prompt": "Review:\n\t- provider parity\r\n\t- cancellation",
-                "cellSourceCode": "await rlm.run(\n\t'Review provider parity'\n)"
+                "cellSourceCode": "await agent.spawn(\n\t'Review provider parity'\n)"
             }),
         )
         .await
         .expect("multiline prompt and spawn code should be admitted");
 
     let error = registry
-        .execute("rlm_run", json!({"prompt": "unsafe\u{0000}prompt"}))
+        .execute("spawn_agent", json!({"prompt": "unsafe\u{0000}prompt"}))
         .await
         .expect_err("unsafe controls must still fail");
     assert!(
@@ -332,7 +331,10 @@ async fn tool_registry_owns_runtime_and_cancels_children_when_parent_is_dropped(
     drop(runtime);
 
     registry
-        .execute("rlm_run", json!({"prompt": "Wait for parent cancellation"}))
+        .execute(
+            "spawn_agent",
+            json!({"prompt": "Wait for parent cancellation"}),
+        )
         .await
         .expect("admit child");
     tokio::time::timeout(Duration::from_secs(1), started.notified())

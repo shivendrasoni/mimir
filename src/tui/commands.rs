@@ -238,6 +238,60 @@ pub(super) fn builtin_command_usage(command: &str) -> Option<&'static str> {
     }
 }
 
+#[must_use]
+pub(super) fn builtin_command_description(command: &str) -> Option<&'static str> {
+    match command
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "autonomous" => Some("Run toward a goal with bounded continuations"),
+        "btw" | "side" => Some("Ask a side question without changing the main turn"),
+        "changelog" => Some("Show what changed in this Mimir build"),
+        "clear" | "new" => Some("Start a fresh conversation"),
+        "clone" => Some("Copy this session into a new session"),
+        "compact" => Some("Compact the current conversation context"),
+        "context" | "usage" => Some("Show current context usage"),
+        "copy" => Some("Copy the last assistant message"),
+        "effort" | "thinking" => Some("Choose the model's reasoning effort"),
+        "export" => Some("Export this session to JSONL"),
+        "fast" => Some("Toggle fast mode"),
+        "fork" => Some("Fork from an earlier user message"),
+        "fullscreen" => Some("Toggle the alternate-screen layout"),
+        "goal" => Some("Create or manage a durable goal"),
+        "heartbeat" => Some("Schedule recurring work for this session"),
+        "heartbeats" => Some("List recurring session work"),
+        "help" => Some("Show commands and usage"),
+        "hotkeys" => Some("Show keyboard shortcuts"),
+        "import" => Some("Replace this session from a JSONL export"),
+        "implement" => Some("Leave plan mode and implement the plan"),
+        "learn" | "learning" => Some("Inspect or manage continual learning"),
+        "login" => Some("Connect a model provider"),
+        "logout" => Some("Remove provider credentials"),
+        "logs" => Some("Show local diagnostic log information"),
+        "mcp" => Some("List or authenticate MCP servers"),
+        "model" => Some("Choose the active model"),
+        "mode" => Some("Switch between default, plan, and auto modes"),
+        "name" | "rename" => Some("Name the current session"),
+        "quit" => Some("Exit Mimir"),
+        "refine" => Some("Refine or roll back harness guidance"),
+        "reload" => Some("Reload runtime resources and extensions"),
+        "resume" => Some("Resume another session"),
+        "rlm-max-depth" => Some("Set recursive language-model depth"),
+        "scoped-models" => Some("Choose models used by quick switching"),
+        "session" => Some("Show current session information"),
+        "sessions" => Some("Browse or switch sessions"),
+        "settings" => Some("Open interactive settings"),
+        "share" => Some("Create a local share preview"),
+        "system-prompt" => Some("Show the effective system prompt"),
+        "theme" => Some("Choose the terminal theme"),
+        "traces" | "trace" => Some("Inspect local trace status"),
+        "tree" => Some("Browse the current session tree"),
+        "update" => Some("Check local update status"),
+        _ => None,
+    }
+}
+
 fn parse_agent_mode(arguments: &str) -> SlashCommand {
     if arguments.is_empty() {
         return SlashCommand::Mode { mode: None };

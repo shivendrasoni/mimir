@@ -585,7 +585,7 @@ fn extended_reference_commands_emit_actions_and_render_hotkeys() {
     );
     assert!(rendered.contains("Keyboard shortcuts"));
     assert!(rendered.contains("Ctrl+V attach image"));
-    assert!(rendered.contains("Ctrl+C cancel · twice exit"));
+    assert!(rendered.contains("Ctrl+C clear/cancel · twice exit"));
     assert!(rendered.contains("Ctrl+D quit"));
 }
 
@@ -1195,6 +1195,155 @@ fn display_preferences_drive_autocomplete_followups_images_progress_and_layout()
         },
     );
     assert!(rendered.contains("   ❯ /"));
+}
+
+#[test]
+fn slash_opens_ranked_autocomplete_and_typing_filters_it_live() {
+    let mut app = App::new(AppConfig::default());
+
+    app.apply_key(KeyEvent::plain(KeyCode::Char('/')));
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector)
+            if selector.kind == OverlayKind::Autocomplete
+                && selector.options.first().is_some_and(|command| command == "/help")
+    ));
+    let ranked = app.render(
+        TerminalSize {
+            width: 100,
+            height: 24,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+    assert!(ranked.contains("/help"));
+    assert!(ranked.contains("Show commands and usage"));
+
+    for character in "mo".chars() {
+        app.apply_key(KeyEvent::plain(KeyCode::Char(character)));
+    }
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector)
+            if selector.kind == OverlayKind::Autocomplete
+                && selector.options == ["/mode", "/model"]
+    ));
+
+    app.apply_key(KeyEvent::plain(KeyCode::Esc));
+    app.set_prompt("/model");
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    app.apply_key(KeyEvent::plain(KeyCode::Esc));
+    app.apply_key(KeyEvent::plain(KeyCode::Char('/')));
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector)
+            if selector.options.first().is_some_and(|command| command == "/model")
+    ));
+}
+
+#[test]
+fn at_sign_opens_workspace_path_picker_and_filters_it_live() {
+    let mut app = App::new(AppConfig::default());
+    app.set_workspace_paths(vec![
+        "README.md".into(),
+        "src/".into(),
+        "src/lib.rs".into(),
+        "src/tui/".into(),
+        "src/tui/app.rs".into(),
+    ]);
+
+    app.apply_key(KeyEvent::plain(KeyCode::Char('@')));
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector)
+            if selector.kind == OverlayKind::PathAutocomplete
+                && selector.options.first().is_some_and(|path| path == "src/")
+    ));
+
+    for character in "src/tu".chars() {
+        app.apply_key(KeyEvent::plain(KeyCode::Char(character)));
+    }
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector)
+            if selector.kind == OverlayKind::PathAutocomplete
+                && selector.options == ["src/tui/", "src/tui/app.rs"]
+    ));
+
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 24,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+    assert!(rendered.contains("Workspace paths"));
+    assert!(rendered.contains("Folder"));
+    assert!(rendered.contains("File"));
+}
+
+#[test]
+fn workspace_picker_inserts_a_reference_at_the_active_cursor() {
+    let mut app = App::new(AppConfig::default());
+    app.set_workspace_paths(vec!["src/runtime.rs".into()]);
+
+    for character in "Review @sr please".chars() {
+        app.apply_key(KeyEvent::plain(KeyCode::Char(character)));
+    }
+    for _ in 0.." please".chars().count() {
+        app.apply_key(KeyEvent::plain(KeyCode::Left));
+    }
+    app.apply_key(KeyEvent::plain(KeyCode::Char('c')));
+    assert!(matches!(
+        app.overlay(),
+        Overlay::Selector(selector) if selector.kind == OverlayKind::PathAutocomplete
+    ));
+
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(app.prompt(), "Review @src/runtime.rs please");
+}
+
+#[test]
+fn workspace_picker_braces_paths_that_contain_spaces() {
+    let mut app = App::new(AppConfig::default());
+    app.set_workspace_paths(vec!["docs/design notes.md".into()]);
+
+    app.apply_key(KeyEvent::plain(KeyCode::Char('@')));
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+
+    assert_eq!(app.prompt(), "@{docs/design notes.md} ");
+}
+
+#[test]
+fn composer_can_be_cleared_without_changing_active_run_state() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("draft follow-up");
+    app.set_run_active(true);
+
+    assert!(app.clear_composer());
+    assert!(app.prompt().is_empty());
+    assert!(app.run_active());
+    assert!(!app.clear_composer());
+}
+
+#[test]
+fn fresh_renderer_shows_the_mimir_startup_logo_and_version() {
+    let app = App::new(AppConfig::default());
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 16,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+
+    assert!(rendered.contains("▄████▄"));
+    assert!(rendered.contains(concat!("Mimir v", env!("CARGO_PKG_VERSION"))));
 }
 
 #[test]

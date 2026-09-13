@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{BTreeSet, VecDeque},
     fmt::Write as _,
     sync::LazyLock,
@@ -15,7 +16,9 @@ use uuid::Uuid;
 
 use super::{
     Action, InputBinding, KeyCode, KeyEvent, RenderOptions, SlashCommand, TerminalSize, TuiAction,
-    commands::builtin_command_usage, parse_slash_command, render::render,
+    commands::{builtin_command_description, builtin_command_usage},
+    parse_slash_command,
+    render::render,
 };
 
 static EMPTY_MODELS: LazyLock<BTreeSet<String>> = LazyLock::new(BTreeSet::new);
@@ -64,6 +67,16 @@ const BUILTIN_COMPLETIONS: &[&str] = &[
     "/traces",
     "/tree",
     "/update",
+];
+const POPULAR_COMPLETIONS: &[&str] = &[
+    "/help",
+    "/model",
+    "/new",
+    "/resume",
+    "/effort",
+    "/mode",
+    "/settings",
+    "/quit",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +171,7 @@ pub enum OverlayKind {
     HeartbeatActionSelector,
     Settings,
     Autocomplete,
+    PathAutocomplete,
     ScopedModelsSelector,
     ThemeSelector,
     PromptTemplateSelector,
@@ -409,7 +423,8 @@ pub struct App {
     tree_entries: Vec<Uuid>,
     heartbeat_entries: Vec<(Uuid, String, bool)>,
     heartbeat_target: Option<(Uuid, String, bool)>,
-    extension_commands: Vec<String>,
+    extension_commands: Vec<(String, Option<String>)>,
+    workspace_paths: Vec<String>,
     follow_ups: VecDeque<QueuedPrompt>,
     resource_snapshot: TuiResourceSnapshot,
     preferences: AppPreferenceState,
@@ -447,6 +462,7 @@ impl App {
             heartbeat_entries: Vec::new(),
             heartbeat_target: None,
             extension_commands: Vec::new(),
+            workspace_paths: Vec::new(),
             follow_ups: VecDeque::new(),
             resource_snapshot: TuiResourceSnapshot::default(),
             preferences: AppPreferenceState::default(),
@@ -498,6 +514,28 @@ impl App {
     pub fn set_prompt(&mut self, text: impl Into<String>) {
         self.prompt = text.into();
         self.cursor_chars = self.prompt.chars().count();
+    }
+
+    /// Clears the draft composer before an interrupt is sent to active work.
+    ///
+    /// Returns whether any text or image attachment was removed.
+    pub fn clear_composer(&mut self) -> bool {
+        let had_content = !self.prompt.is_empty() || !self.pending_images.is_empty();
+        self.prompt.clear();
+        self.cursor_chars = 0;
+        self.history_index = None;
+        self.history_draft = None;
+        self.pending_images.clear();
+        if matches!(
+            &self.overlay,
+            Overlay::Selector(SelectorOverlay {
+                kind: OverlayKind::Autocomplete | OverlayKind::PathAutocomplete,
+                ..
+            })
+        ) {
+            self.overlay = Overlay::None;
+        }
+        had_content
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -568,9 +606,22 @@ impl App {
         });
     }
 
-    fn open_autocomplete(&mut self) {
+    fn refresh_autocomplete(&mut self) {
+        if let Some((_, _, query)) = active_path_mention(&self.prompt, self.cursor_chars) {
+            self.refresh_path_autocomplete(&query);
+            return;
+        }
         let prefix = self.prompt.trim().to_ascii_lowercase();
         if !prefix.starts_with('/') || prefix.chars().any(char::is_whitespace) {
+            if matches!(
+                self.overlay,
+                Overlay::Selector(SelectorOverlay {
+                    kind: OverlayKind::Autocomplete | OverlayKind::PathAutocomplete,
+                    ..
+                })
+            ) {
+                self.overlay = Overlay::None;
+            }
             return;
         }
         let mut options = BUILTIN_COMPLETIONS
@@ -579,7 +630,7 @@ impl App {
             .chain(
                 self.extension_commands
                     .iter()
-                    .map(|command| format!("/{command}")),
+                    .map(|(command, _)| format!("/{command}")),
             )
             .chain(
                 self.resource_snapshot
@@ -597,14 +648,122 @@ impl App {
             .collect::<Vec<_>>();
         options.sort();
         options.dedup();
-        options.truncate(usize::from(self.preferences.autocomplete_max_visible));
-        if !options.is_empty() {
-            self.overlay = Overlay::Selector(SelectorOverlay {
-                title: "Autocomplete".into(),
-                kind: OverlayKind::Autocomplete,
-                options,
-                selected: 0,
+        if prefix == "/" {
+            options.sort_by_key(|option| {
+                (
+                    Reverse(self.command_usage_count(option)),
+                    POPULAR_COMPLETIONS
+                        .iter()
+                        .position(|popular| popular == option)
+                        .unwrap_or(POPULAR_COMPLETIONS.len()),
+                    option.clone(),
+                )
             });
+        } else {
+            options.sort();
+        }
+        options.truncate(usize::from(self.preferences.autocomplete_max_visible));
+        if options.is_empty() {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let selected = match &self.overlay {
+            Overlay::Selector(selector) if selector.kind == OverlayKind::Autocomplete => {
+                selector.selected.min(options.len().saturating_sub(1))
+            }
+            _ => 0,
+        };
+        self.overlay = Overlay::Selector(SelectorOverlay {
+            title: "Slash commands".into(),
+            kind: OverlayKind::Autocomplete,
+            options,
+            selected,
+        });
+    }
+
+    fn refresh_path_autocomplete(&mut self, query: &str) {
+        let query = query.to_ascii_lowercase();
+        let mut options = self
+            .workspace_paths
+            .iter()
+            .filter(|path| path_match_score(path, &query).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        options.sort_by_key(|path| {
+            (
+                path_match_score(path, &query).unwrap_or(usize::MAX),
+                !path.ends_with('/'),
+                path.matches('/').count(),
+                path.to_ascii_lowercase(),
+            )
+        });
+        options.truncate(usize::from(self.preferences.autocomplete_max_visible));
+        if options.is_empty() {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let selected = match &self.overlay {
+            Overlay::Selector(selector) if selector.kind == OverlayKind::PathAutocomplete => {
+                selector.selected.min(options.len().saturating_sub(1))
+            }
+            _ => 0,
+        };
+        self.overlay = Overlay::Selector(SelectorOverlay {
+            title: "Workspace paths".into(),
+            kind: OverlayKind::PathAutocomplete,
+            options,
+            selected,
+        });
+    }
+
+    fn command_usage_count(&self, command: &str) -> usize {
+        self.history
+            .iter()
+            .filter(|entry| {
+                let name_end = entry.find(char::is_whitespace).unwrap_or(entry.len());
+                entry[..name_end].eq_ignore_ascii_case(command)
+            })
+            .count()
+    }
+
+    pub(crate) fn autocomplete_description(&self, command: &str) -> String {
+        if let Some(description) = builtin_command_description(command) {
+            return description.into();
+        }
+        let name = command.trim_start_matches('/');
+        if let Some((_, description)) = self
+            .extension_commands
+            .iter()
+            .find(|(value, _)| value == name)
+        {
+            return description
+                .clone()
+                .unwrap_or_else(|| "Extension command".into());
+        }
+        if let Some(template) = self
+            .resource_snapshot
+            .prompt_templates
+            .iter()
+            .find(|template| template.name.eq_ignore_ascii_case(name))
+        {
+            return template.description.clone();
+        }
+        if let Some(skill) = name.strip_prefix("skill:").and_then(|skill_name| {
+            self.resource_snapshot
+                .skills
+                .iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(skill_name))
+        }) {
+            return skill.description.clone();
+        }
+        "Command".into()
+    }
+
+    pub(crate) fn path_autocomplete_description(path: &str) -> &'static str {
+        if path.ends_with('/') {
+            "Folder"
+        } else {
+            "File"
         }
     }
 
@@ -872,6 +1031,23 @@ impl App {
     }
 
     pub fn set_extension_commands(&mut self, commands: Vec<String>) {
+        self.extension_commands = commands
+            .into_iter()
+            .map(|command| (command, None))
+            .collect();
+    }
+
+    pub fn set_workspace_paths(&mut self, mut paths: Vec<String>) {
+        paths.retain(|path| !path.is_empty());
+        paths.sort();
+        paths.dedup();
+        self.workspace_paths = paths;
+    }
+
+    pub(crate) fn set_extension_command_descriptors(
+        &mut self,
+        commands: Vec<(String, Option<String>)>,
+    ) {
         self.extension_commands = commands;
     }
 
@@ -1054,12 +1230,14 @@ impl App {
             }),
             OverlayKind::ResumeSelector => self.session_selector_overlay("Resume session", kind),
             OverlayKind::ThemeSelector => self.theme_selector_overlay(),
-            OverlayKind::Autocomplete => Overlay::Selector(SelectorOverlay {
-                title: "Autocomplete".into(),
-                kind,
-                options: Vec::new(),
-                selected: 0,
-            }),
+            OverlayKind::Autocomplete | OverlayKind::PathAutocomplete => {
+                Overlay::Selector(SelectorOverlay {
+                    title: "Autocomplete".into(),
+                    kind,
+                    options: Vec::new(),
+                    selected: 0,
+                })
+            }
             OverlayKind::PromptTemplateSelector => Overlay::Selector(SelectorOverlay {
                 title: "Prompt templates".into(),
                 kind,
@@ -1453,6 +1631,38 @@ impl App {
             _ => {}
         }
 
+        let autocomplete_active = matches!(
+            &self.overlay,
+            Overlay::Selector(SelectorOverlay {
+                kind: OverlayKind::Autocomplete | OverlayKind::PathAutocomplete,
+                ..
+            })
+        );
+        if autocomplete_active {
+            match event.code {
+                KeyCode::Enter => self.confirm_autocomplete(),
+                KeyCode::Esc => self.overlay = Overlay::None,
+                KeyCode::Up => self.apply_action(Action::SelectPrev),
+                KeyCode::Down | KeyCode::Tab => self.apply_action(Action::SelectNext),
+                KeyCode::Left => self.apply_action(Action::CursorLeft),
+                KeyCode::Right => self.apply_action(Action::CursorRight),
+                KeyCode::Backspace => {
+                    self.apply_action(Action::Backspace);
+                    self.refresh_autocomplete();
+                }
+                KeyCode::Delete => {
+                    self.apply_action(Action::DeleteForward);
+                    self.refresh_autocomplete();
+                }
+                KeyCode::Char(ch) if !event.ctrl && !event.alt => {
+                    self.insert_char(ch);
+                    self.refresh_autocomplete();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match (&self.overlay, &event.code) {
             (
                 Overlay::Selector(_)
@@ -1501,9 +1711,10 @@ impl App {
             (Overlay::None, KeyCode::Right) => self.apply_action(Action::CursorRight),
             (Overlay::None, KeyCode::Backspace) => self.apply_action(Action::Backspace),
             (Overlay::None, KeyCode::Delete) => self.apply_action(Action::DeleteForward),
-            (Overlay::None, KeyCode::Tab) => self.open_autocomplete(),
+            (Overlay::None, KeyCode::Tab) => self.refresh_autocomplete(),
             (Overlay::None, KeyCode::Char(ch)) if !event.ctrl && !event.alt => {
                 self.insert_char(*ch);
+                self.refresh_autocomplete();
             }
             _ => {}
         }
@@ -1568,7 +1779,7 @@ impl App {
                 && self
                     .extension_commands
                     .iter()
-                    .any(|command| command == name)
+                    .any(|(command, _)| command == name)
             {
                 self.pending_tui_action = Some(TuiAction::ExtensionCommand {
                     name: name.to_owned(),
@@ -1934,6 +2145,11 @@ impl App {
                     self.set_prompt(format!("{command} "));
                 }
             }
+            OverlayKind::PathAutocomplete => {
+                if let Some(path) = selection {
+                    self.insert_workspace_path(&path);
+                }
+            }
             OverlayKind::Settings => {
                 if self.confirm_settings(selector.selected) {
                     return;
@@ -1942,6 +2158,62 @@ impl App {
             OverlayKind::Help | OverlayKind::Hotkeys | OverlayKind::Login => {}
         }
         self.overlay = Overlay::None;
+    }
+
+    fn confirm_autocomplete(&mut self) {
+        let (kind, selection) = match &self.overlay {
+            Overlay::Selector(selector)
+                if matches!(
+                    selector.kind,
+                    OverlayKind::Autocomplete | OverlayKind::PathAutocomplete
+                ) =>
+            {
+                (
+                    selector.kind,
+                    selector.options.get(selector.selected).cloned(),
+                )
+            }
+            _ => return,
+        };
+        let Some(selection) = selection else {
+            self.overlay = Overlay::None;
+            return;
+        };
+        if kind == OverlayKind::Autocomplete && self.prompt.trim().eq_ignore_ascii_case(&selection)
+        {
+            self.overlay = Overlay::None;
+            self.submit_prompt();
+            return;
+        }
+        match kind {
+            OverlayKind::Autocomplete => self.set_prompt(format!("{selection} ")),
+            OverlayKind::PathAutocomplete => self.insert_workspace_path(&selection),
+            _ => {}
+        }
+        self.overlay = Overlay::None;
+    }
+
+    fn insert_workspace_path(&mut self, path: &str) {
+        let Some((start, end, _)) = active_path_mention(&self.prompt, self.cursor_chars) else {
+            return;
+        };
+        let mention = if path.chars().any(char::is_whitespace) {
+            format!("@{{{path}}}")
+        } else {
+            format!("@{path}")
+        };
+        let start_byte = byte_index(&self.prompt, start);
+        let end_byte = byte_index(&self.prompt, end);
+        self.prompt.replace_range(start_byte..end_byte, &mention);
+        self.cursor_chars = start.saturating_add(mention.chars().count());
+        if self
+            .prompt
+            .chars()
+            .nth(self.cursor_chars)
+            .is_none_or(|character| !character.is_whitespace())
+        {
+            self.insert_text(" ");
+        }
     }
 
     fn confirm_heartbeat_selector(&mut self, target: Option<(Uuid, String, bool)>) -> bool {
@@ -2190,6 +2462,46 @@ fn humanize_tool_name(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn active_path_mention(prompt: &str, cursor_chars: usize) -> Option<(usize, usize, String)> {
+    let characters = prompt.chars().collect::<Vec<_>>();
+    let cursor = cursor_chars.min(characters.len());
+    let mut start = cursor;
+    while start > 0 && !characters[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    if characters.get(start) != Some(&'@') {
+        return None;
+    }
+    let query = characters[start + 1..cursor].iter().collect::<String>();
+    if query.starts_with('{') || query.contains('}') {
+        return None;
+    }
+    let mut end = cursor;
+    while end < characters.len() && !characters[end].is_whitespace() {
+        end += 1;
+    }
+    Some((start, end, query))
+}
+
+fn path_match_score(path: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let path = path.to_ascii_lowercase();
+    if path.starts_with(query) {
+        return Some(0);
+    }
+    if path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(query))
+    {
+        return Some(1);
+    }
+    path.contains(query).then_some(2)
 }
 
 fn compact_thinking(text: &str) -> Option<String> {

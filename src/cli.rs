@@ -10851,10 +10851,10 @@ mod rlm_recursive_tool_tests {
             depth_one_tools
                 .definitions()
                 .iter()
-                .any(|definition| definition.name == "rlm_run")
+                .any(|definition| definition.name == "spawn_agent")
         );
         let admission = depth_one_tools
-            .execute("rlm_run", serde_json::json!({"prompt": "grandchild"}))
+            .execute("spawn_agent", serde_json::json!({"prompt": "grandchild"}))
             .await
             .expect("depth-two admission");
         let admission: serde_json::Value =

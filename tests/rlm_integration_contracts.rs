@@ -99,7 +99,7 @@ fn execution_request(session_dir: &std::path::Path) -> RlmExecutionRequest {
         parent_node_id: Some("parent-node".into()),
         depth: 1,
         prompt: "Inspect the migration".into(),
-        spawn_code: Some("await rlm.run(...)".into()),
+        spawn_code: Some("await agent.spawn(...)".into()),
         model: openai_model(),
         max_output_tokens: 64,
     }
@@ -304,11 +304,11 @@ async fn host_operations_match_reference_payloads_and_reject_unsupported_kwargs(
 
     let handle = host
         .handle(
-            "rlm.run",
+            "agent.spawn",
             json!({
                 "prompt": "Review auth",
                 "kwargs": {"name": "auth-reviewer"},
-                "cellSourceCode": "await rlm.run('Review auth')"
+                "cellSourceCode": "await agent.spawn('Review auth')"
             }),
         )
         .await
@@ -330,12 +330,26 @@ async fn host_operations_match_reference_payloads_and_reject_unsupported_kwargs(
 
     let invalid = host
         .handle(
-            "rlm.run",
+            "agent.spawn",
             json!({"prompt": "bad", "kwargs": {"temperature": 1}}),
         )
         .await
         .expect_err("unknown kwargs");
-    assert!(invalid.to_string().contains("unsupported rlm.run kwargs"));
+    assert!(
+        invalid
+            .to_string()
+            .contains("unsupported agent.spawn kwargs")
+    );
+
+    let removed = host
+        .handle("rlm.run", json!({"prompt": "legacy alias"}))
+        .await
+        .expect_err("removed operation must not be accepted");
+    assert!(
+        removed
+            .to_string()
+            .contains("unsupported RLM host operation 'rlm.run'")
+    );
 
     let target = handle["rlm_child_id"].as_str().expect("child id");
     let deleted = host

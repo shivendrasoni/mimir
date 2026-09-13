@@ -931,7 +931,7 @@ fn acp_tool_kind(name: &str) -> &'static str {
         "move" | "move_file" => "move",
         "search" | "list_files" => "search",
         "ipython" | "bash" | "run_process" | "execute" => "execute",
-        "rlm_run" | "rlm_spawn" | "rlm_wait" => "think",
+        "spawn_agent" | "rlm_spawn" | "rlm_wait" => "think",
         "fetch" => "fetch",
         _ => "other",
     }

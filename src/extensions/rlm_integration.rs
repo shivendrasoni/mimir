@@ -333,7 +333,7 @@ impl EventSink for RlmUsageSink {
 }
 
 /// Typed host bridge for the Python RLM operations used by the reference
-/// harness. `run` remains admission-only; child answers stay in their session
+/// harness. `spawn` remains admission-only; child answers stay in their session
 /// transcript and shared artifacts.
 pub struct RlmHostOperations {
     runtime: Arc<RlmRuntime>,
@@ -351,7 +351,7 @@ impl RlmHostOperations {
 
     pub async fn handle(&self, operation: &str, payload: Value) -> Result<Value> {
         match operation {
-            "rlm.run" => self.run(payload).await,
+            "agent.spawn" => self.spawn(payload).await,
             "rlm.find_models" => self.find_models(payload).await,
             "rlm.list_subagents" => self.list_subagents().await,
             "rlm.delete_subagent" => self.delete_subagent(payload).await,
@@ -362,13 +362,13 @@ impl RlmHostOperations {
         }
     }
 
-    async fn run(&self, payload: Value) -> Result<Value> {
-        let payload = require_object("rlm.run", &payload)?;
-        let prompt = required_string(payload, "prompt", "rlm.run")?;
+    async fn spawn(&self, payload: Value) -> Result<Value> {
+        let payload = require_object("agent.spawn", &payload)?;
+        let prompt = required_string(payload, "prompt", "agent.spawn")?;
         let kwargs = match payload.get("kwargs") {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(kwargs)) => kwargs.clone(),
-            Some(_) => return Err(configuration("rlm.run kwargs must be an object")),
+            Some(_) => return Err(configuration("agent.spawn kwargs must be an object")),
         };
         let allowed = BTreeSet::from(["model", "name"]);
         let unsupported = kwargs
@@ -378,13 +378,13 @@ impl RlmHostOperations {
             .collect::<Vec<_>>();
         if !unsupported.is_empty() {
             return Err(configuration(format!(
-                "unsupported rlm.run kwargs: {}",
+                "unsupported agent.spawn kwargs: {}",
                 unsupported.join(", ")
             )));
         }
-        let name = optional_string(&kwargs, "name", "rlm.run")?;
-        let model = optional_string(&kwargs, "model", "rlm.run")?;
-        let spawn_code = optional_string(payload, "cellSourceCode", "rlm.run")?;
+        let name = optional_string(&kwargs, "name", "agent.spawn")?;
+        let model = optional_string(&kwargs, "model", "agent.spawn")?;
+        let spawn_code = optional_string(payload, "cellSourceCode", "agent.spawn")?;
         let handle = self
             .runtime
             .run(RlmRunRequest {

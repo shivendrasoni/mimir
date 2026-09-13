@@ -47,6 +47,7 @@ use super::{
     TreeFilterMode, TuiAction, TuiResourceSnapshot, UiRequest,
     autonomous::apply_autonomous_command,
     clipboard::{copy_last_assistant_message, read_image as read_clipboard_image},
+    path_picker::{discover_workspace_paths, workspace_reference_context},
     side_question::ask_side_question,
 };
 
@@ -74,8 +75,16 @@ const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CtrlCAction {
-    Cancel,
+    FirstPress,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCPrimaryAction {
+    ClearComposer,
+    CancelBash,
+    CancelRun,
+    None,
 }
 
 fn ctrl_c_action(last_press: &mut Option<Instant>, now: Instant) -> CtrlCAction {
@@ -87,7 +96,19 @@ fn ctrl_c_action(last_press: &mut Option<Instant>, now: Instant) -> CtrlCAction 
         CtrlCAction::Exit
     } else {
         *last_press = Some(now);
-        CtrlCAction::Cancel
+        CtrlCAction::FirstPress
+    }
+}
+
+fn ctrl_c_primary_action(app: &mut App, runtime_running: bool) -> CtrlCPrimaryAction {
+    if app.clear_composer() {
+        CtrlCPrimaryAction::ClearComposer
+    } else if app.bash_active() {
+        CtrlCPrimaryAction::CancelBash
+    } else if runtime_running || app.run_active() {
+        CtrlCPrimaryAction::CancelRun
+    } else {
+        CtrlCPrimaryAction::None
     }
 }
 
@@ -768,18 +789,22 @@ pub async fn run_tui_with_autonomous(
                     if ctrl_c_action(&mut last_ctrl_c_press, Instant::now()) == CtrlCAction::Exit {
                         return Ok(());
                     }
-                    let bash_active = app
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .bash_active();
-                    if bash_active {
-                        runtime_factory.abort_user_bash();
-                    } else {
-                        runtime.cancel();
-                        autonomous
+                    let primary_action = {
+                        let mut state = app
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .cancel_current();
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ctrl_c_primary_action(&mut state, runtime.is_running())
+                    };
+                    match primary_action {
+                        CtrlCPrimaryAction::ClearComposer | CtrlCPrimaryAction::None => {}
+                        CtrlCPrimaryAction::CancelBash => runtime_factory.abort_user_bash(),
+                        CtrlCPrimaryAction::CancelRun => {
+                            runtime.cancel();
+                            autonomous
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .cancel_current();
+                        }
                     }
                 }
                 continue;
@@ -793,10 +818,18 @@ pub async fn run_tui_with_autonomous(
                 return Ok(());
             }
             if let Some(key) = convert_key(key) {
+                let refreshed_workspace_paths = matches!(key.code, KeyCode::Char('@'))
+                    .then(|| runtime_factory.workspace_root())
+                    .flatten()
+                    .as_deref()
+                    .map(discover_workspace_paths);
                 let (prompt, images, ui_request, tui_action, selected_model, selected_session) = {
                     let mut state = app
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(paths) = refreshed_workspace_paths {
+                        state.set_workspace_paths(paths);
+                    }
                     state.apply_key(key);
                     let prompt = state.pending_submission();
                     if prompt.is_some() {
@@ -940,11 +973,11 @@ pub async fn run_tui_with_autonomous(
                     app.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push_user_submission(&prompt, images.len());
-                    let message = user_message(&prompt, images);
+                    let learning_workspace = runtime_factory.workspace_root();
+                    let message = user_message(&prompt, images, learning_workspace.as_deref());
                     let runtime = runtime.clone();
                     let app_for_run = app.clone();
                     let autonomous = autonomous.clone();
-                    let learning_workspace = runtime_factory.workspace_root();
                     let learning_session = session.clone();
                     tokio::spawn(async move {
                         run_tui_prompt_loop(
@@ -1140,7 +1173,9 @@ async fn run_tui_prompt_loop(
         if !follow_ups.is_empty() {
             next_messages = follow_ups
                 .into_iter()
-                .map(|(prompt, images)| user_message(&prompt, images))
+                .map(|(prompt, images)| {
+                    user_message(&prompt, images, learning_workspace.as_deref())
+                })
                 .collect();
             continue;
         }
@@ -1167,12 +1202,19 @@ async fn run_tui_prompt_loop(
     }
 }
 
-fn user_message(prompt: &str, images: Vec<super::ImageAttachment>) -> Message {
-    let mut content = Vec::with_capacity(images.len().saturating_add(1));
+fn user_message(
+    prompt: &str,
+    images: Vec<super::ImageAttachment>,
+    workspace: Option<&Path>,
+) -> Message {
+    let mut content = Vec::with_capacity(images.len().saturating_add(2));
     if !prompt.trim().is_empty() {
         content.push(Content::Text {
             text: prompt.trim().to_owned(),
         });
+    }
+    if let Some(context) = workspace.and_then(|root| workspace_reference_context(prompt, root)) {
+        content.push(Content::Text { text: context });
     }
     content.extend(images.into_iter().map(|image| Content::Image {
         data: image.data,
@@ -1914,14 +1956,14 @@ async fn refresh_extension_commands(runtime: &AgentRuntime, app: &Arc<Mutex<App>
         manager
             .commands()
             .into_iter()
-            .map(|command| command.name)
+            .map(|command| (command.name, command.description))
             .collect()
     } else {
         Vec::new()
     };
     app.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_extension_commands(commands);
+        .set_extension_command_descriptors(commands);
 }
 
 fn active_session(runtime_key: Option<&(String, String)>) -> Result<&str> {
@@ -3963,7 +4005,10 @@ mod local_command_tests {
         let started = Instant::now();
         let mut last_press = None;
 
-        assert_eq!(ctrl_c_action(&mut last_press, started), CtrlCAction::Cancel);
+        assert_eq!(
+            ctrl_c_action(&mut last_press, started),
+            CtrlCAction::FirstPress
+        );
         assert_eq!(
             ctrl_c_action(&mut last_press, started + Duration::from_millis(900)),
             CtrlCAction::Exit
@@ -3975,10 +4020,31 @@ mod local_command_tests {
         let started = Instant::now();
         let mut last_press = None;
 
-        assert_eq!(ctrl_c_action(&mut last_press, started), CtrlCAction::Cancel);
+        assert_eq!(
+            ctrl_c_action(&mut last_press, started),
+            CtrlCAction::FirstPress
+        );
         assert_eq!(
             ctrl_c_action(&mut last_press, started + Duration::from_millis(1_001)),
-            CtrlCAction::Cancel
+            CtrlCAction::FirstPress
+        );
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_composer_before_cancelling_active_work() {
+        let mut app = App::new(AppConfig::default());
+        app.set_prompt("keep the active run alive");
+        app.set_run_active(true);
+
+        assert_eq!(
+            ctrl_c_primary_action(&mut app, true),
+            CtrlCPrimaryAction::ClearComposer
+        );
+        assert!(app.prompt().is_empty());
+        assert!(app.run_active());
+        assert_eq!(
+            ctrl_c_primary_action(&mut app, true),
+            CtrlCPrimaryAction::CancelRun
         );
     }
 
@@ -4048,6 +4114,29 @@ mod local_command_tests {
             })
         );
         assert_eq!(parse_user_bash_submission("explain !"), None);
+    }
+
+    #[test]
+    fn user_messages_carry_validated_workspace_references_to_the_model() {
+        let workspace = TempDir::new().expect("workspace");
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/lib.rs"), "pub fn run() {}").expect("source");
+
+        let message = user_message(
+            "Review @src/lib.rs and @src/ but ignore @../outside",
+            Vec::new(),
+            Some(workspace.path()),
+        );
+        let text = message.text();
+        let context = match message.content.get(1) {
+            Some(Content::Text { text }) => text,
+            other => panic!("expected workspace reference context, got {other:?}"),
+        };
+
+        assert!(text.starts_with("Review @src/lib.rs and @src/"));
+        assert!(context.contains(r#""path":"src/lib.rs","kind":"file""#));
+        assert!(context.contains(r#""path":"src","kind":"folder""#));
+        assert!(!context.contains("outside"));
     }
 
     #[tokio::test]
@@ -4227,6 +4316,7 @@ mod local_command_tests {
                     mime_type: "image/png".into(),
                     byte_size: 5,
                 }],
+                None,
             ),
             None,
             "default".into(),

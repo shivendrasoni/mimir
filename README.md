@@ -4,7 +4,7 @@ Mimir is a standalone, bounded agentic runtime written in safe Rust. Its core is
 
 The RLM runtime is built for long-running, inspectable work:
 
-- **Recursive execution:** `rlm_run` admits a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
+- **Recursive execution:** `spawn_agent` starts a child agent immediately; the parent can list, cancel, or delete it with `rlm_list_subagents`, `rlm_cancel_subagent`, and `rlm_delete_subagent`.
 - **Bounded by design:** recursion depth, child count and concurrency, prompt and state size, duration, output tokens, and authenticated model discovery are all limited by the runtime.
 - **Durable session state:** child sessions and namespaced RLM extension state persist under Mimir's state root, so orchestration can survive an interrupted terminal session.
 - **Continual Harness:** `/refine` turns evidence into small, scoped updates to supplemental prompts, memories, existing-code skills, or reusable subagent specifications. `/learn` manages observe-only project learning, verified canaries, redacted contribution, and signed fleet packs. Neither path rewrites the base system prompt or trains model weights.
@@ -82,6 +82,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"health"}' | mimir --provider fa
 The model has a workspace-rooted `bash` tool. In `default` mode every model-issued shell command
 requires confirmation, while `/mode auto` runs shell commands and workspace edits immediately.
 Use `/mode default` to return to confirmation.
+
+Inside the TUI, type `@` anywhere in the composer to pick a file or folder from the active
+workspace. Continue typing to filter, use Up/Down or Tab to select, and press Enter to insert the
+workspace-relative reference. Referenced paths are validated against the workspace and are made
+explicit to the model; folders are inspected selectively instead of being injected wholesale.
 
 `/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and
 `write_plan`. It can inspect the repository, pause for a structured clarification, and create or

@@ -195,7 +195,7 @@ async fn run_returns_immediately_then_persists_completion_and_session_linkage() 
             name: Some("review-worker".into()),
             model: None,
             parent_node_id: Some("node-1".into()),
-            spawn_code: Some("rlm.run(...)".into()),
+            spawn_code: Some("agent.spawn(...)".into()),
             max_output_tokens: Some(32),
         })
         .await

@@ -5,6 +5,7 @@ mod clipboard;
 mod commands;
 mod driver;
 mod input;
+mod path_picker;
 mod render;
 mod side_question;
 mod term;

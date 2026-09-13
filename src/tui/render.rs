@@ -70,13 +70,18 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     }
     let rule = "─".repeat(size.width.min(120));
     let mut lines = vec![
-        "◆ Mimir".into(),
+        format!("   ▄████▄      Mimir v{}", env!("CARGO_PKG_VERSION")),
         format!(
-            "  {}  ·  {} effort  ·  {} session",
-            app.selected_model().unwrap_or("select a model"),
+            "  █ ◈  ◈ █     {}",
+            app.selected_model().unwrap_or("select a model")
+        ),
+        format!(
+            "  █  ▄▄  █     {} effort · {} session",
             app.selected_effort().as_str(),
             app.selected_session().unwrap_or("default")
         ),
+        "   █▄██▄█".into(),
+        "    ▀  ▀".into(),
         rule.clone(),
         String::new(),
     ];
@@ -100,7 +105,7 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
         lines.push(format!("● {active}"));
     }
 
-    append_overlay(app, &mut lines);
+    append_overlay(app, &mut lines, size.width);
 
     let mut composer = Vec::new();
     if let Some(activity) = app.current_activity() {
@@ -127,7 +132,7 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     }
     composer.push(rule);
     composer.push(format!(
-        "{} · {} · mode:{} · /help  ·  ctrl+v attach image  ·  ctrl+c cancel · twice exit",
+        "{} · {} · mode:{} · /help · @ paths · ctrl+v image · ctrl+c clear/cancel · twice exit",
         app.selected_model().unwrap_or("model unset"),
         app.selected_effort().as_str(),
         app.agent_mode().as_str()
@@ -295,7 +300,7 @@ fn human_bytes(bytes: usize) -> String {
     clippy::too_many_lines,
     reason = "overlay rendering exhaustively maps each mutually exclusive TUI surface"
 )]
-fn append_overlay(app: &App, lines: &mut Vec<String>) {
+fn append_overlay(app: &App, lines: &mut Vec<String>, width: usize) {
     match app.overlay() {
         Overlay::None => {}
         Overlay::Help => {
@@ -321,7 +326,7 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
             lines.push("Enter submit/confirm · Esc close overlay or quit".into());
             lines.push("Up/Down history or selector · Left/Right move cursor".into());
             lines.push(
-                "Backspace/Delete edit · Ctrl+V attach image · Ctrl+C cancel · twice exit · Ctrl+D quit"
+                "Backspace/Delete edit · @ workspace paths · Ctrl+V attach image · Ctrl+C clear/cancel · twice exit · Ctrl+D quit"
                     .into(),
             );
         }
@@ -408,6 +413,13 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
         Overlay::Selector(selector) => {
             lines.push(String::new());
             lines.push(selector.title.clone());
+            let command_width = selector
+                .options
+                .iter()
+                .map(|option| option.chars().count())
+                .max()
+                .unwrap_or_default()
+                .min(32);
             for (index, option) in selector.options.iter().enumerate() {
                 let marker = if index == selector.selected { '>' } else { ' ' };
                 if selector.kind == super::OverlayKind::ScopedModelsSelector {
@@ -417,12 +429,38 @@ fn append_overlay(app: &App, lines: &mut Vec<String>) {
                         "[ ]"
                     };
                     lines.push(format!("{marker} {checked} {option}"));
+                } else if selector.kind == super::OverlayKind::Autocomplete {
+                    let description = app.autocomplete_description(option);
+                    let description = truncate_with_ellipsis(
+                        &description,
+                        width.saturating_sub(command_width.saturating_add(5)),
+                    );
+                    lines.push(format!("{marker} {option:command_width$}  {description}"));
+                } else if selector.kind == super::OverlayKind::PathAutocomplete {
+                    let description = App::path_autocomplete_description(option);
+                    lines.push(format!("{marker} {option:command_width$}  {description}"));
                 } else {
                     lines.push(format!("{marker} {option}"));
                 }
             }
         }
     }
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".into();
+    }
+    let mut truncated = normalized.chars().take(max_chars - 1).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {

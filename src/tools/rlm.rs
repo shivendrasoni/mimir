@@ -13,7 +13,7 @@ use super::{
     ObservationStatus, Tool, ToolError, ToolObservation, ToolRegistry, object_schema, parse_input,
 };
 
-const RUN: &str = "rlm_run";
+const SPAWN_AGENT: &str = "spawn_agent";
 const FIND_MODELS: &str = "rlm_find_models";
 const LIST_SUBAGENTS: &str = "rlm_list_subagents";
 const DELETE_SUBAGENT: &str = "rlm_delete_subagent";
@@ -22,7 +22,7 @@ const CANCEL_SUBAGENT: &str = "rlm_cancel_subagent";
 pub(super) fn is_reserved(name: &str) -> bool {
     matches!(
         name,
-        RUN | FIND_MODELS | LIST_SUBAGENTS | DELETE_SUBAGENT | CANCEL_SUBAGENT
+        SPAWN_AGENT | FIND_MODELS | LIST_SUBAGENTS | DELETE_SUBAGENT | CANCEL_SUBAGENT
     )
 }
 
@@ -32,7 +32,7 @@ pub(super) fn register(
 ) -> Result<(), ToolError> {
     let operations = Arc::new(RlmHostOperations::new(runtime, None));
     let tools = [
-        RlmTool::new(Operation::Run, Arc::clone(&operations)),
+        RlmTool::new(Operation::SpawnAgent, Arc::clone(&operations)),
         RlmTool::new(Operation::FindModels, Arc::clone(&operations)),
         RlmTool::new(Operation::ListSubagents, Arc::clone(&operations)),
         RlmTool::new(Operation::DeleteSubagent, Arc::clone(&operations)),
@@ -60,7 +60,7 @@ pub(super) fn register(
 
 #[derive(Debug, Clone, Copy)]
 enum Operation {
-    Run,
+    SpawnAgent,
     FindModels,
     ListSubagents,
     DeleteSubagent,
@@ -70,7 +70,7 @@ enum Operation {
 impl Operation {
     const fn name(self) -> &'static str {
         match self {
-            Self::Run => RUN,
+            Self::SpawnAgent => SPAWN_AGENT,
             Self::FindModels => FIND_MODELS,
             Self::ListSubagents => LIST_SUBAGENTS,
             Self::DeleteSubagent => DELETE_SUBAGENT,
@@ -80,7 +80,7 @@ impl Operation {
 
     const fn description(self) -> &'static str {
         match self {
-            Self::Run => {
+            Self::SpawnAgent => {
                 "Start a bounded recursive child agent. Admission returns immediately; inspect progress with rlm_list_subagents."
             }
             Self::FindModels => "Search models whose providers are currently authenticated.",
@@ -94,7 +94,7 @@ impl Operation {
 
     const fn host_operation(self) -> &'static str {
         match self {
-            Self::Run => "rlm.run",
+            Self::SpawnAgent => "agent.spawn",
             Self::FindModels => "rlm.find_models",
             Self::ListSubagents => "rlm.list_subagents",
             Self::DeleteSubagent => "rlm.delete_subagent",
@@ -104,7 +104,7 @@ impl Operation {
 
     fn parameters(self) -> Value {
         match self {
-            Self::Run => object_schema(
+            Self::SpawnAgent => object_schema(
                 &json!({
                     "prompt": {"type": "string", "minLength": 1},
                     "kwargs": {
@@ -151,17 +151,17 @@ impl RlmTool {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunInput {
+struct SpawnAgentInput {
     prompt: String,
     #[serde(default)]
-    kwargs: RunKwargs,
+    kwargs: SpawnAgentKwargs,
     #[serde(default, rename = "cellSourceCode")]
     cell_source_code: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunKwargs {
+struct SpawnAgentKwargs {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -222,8 +222,8 @@ impl Tool for RlmTool {
 
 fn normalize_input(operation: Operation, input: Value) -> Result<Value, ToolError> {
     match operation {
-        Operation::Run => {
-            let input: RunInput = parse_input(RUN, input)?;
+        Operation::SpawnAgent => {
+            let input: SpawnAgentInput = parse_input(SPAWN_AGENT, input)?;
             Ok(json!({
                 "prompt": input.prompt,
                 "kwargs": {
@@ -254,9 +254,9 @@ fn normalize_input(operation: Operation, input: Value) -> Result<Value, ToolErro
 
 fn success_summary(operation: Operation, output: &Value) -> String {
     match operation {
-        Operation::Run => output.get("name").and_then(Value::as_str).map_or_else(
-            || "RLM child admitted".into(),
-            |name| format!("RLM child '{name}' admitted"),
+        Operation::SpawnAgent => output.get("name").and_then(Value::as_str).map_or_else(
+            || "child agent spawned".into(),
+            |name| format!("child agent '{name}' spawned"),
         ),
         Operation::FindModels => {
             let count = output

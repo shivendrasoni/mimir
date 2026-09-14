@@ -29,6 +29,9 @@ pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1_024;
 pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1_024;
 const MAX_SKILL_FILE_BYTES: u64 =
     (MAX_SKILL_BODY_BYTES + MAX_SKILL_DESCRIPTION_BYTES + 8 * 1_024) as u64;
+const MAX_SHARED_SKILL_BODY_BYTES: usize = 128 * 1_024;
+const MAX_SHARED_SKILL_FILE_BYTES: u64 =
+    (MAX_SHARED_SKILL_BODY_BYTES + MAX_SKILL_DESCRIPTION_BYTES + 8 * 1_024) as u64;
 const MAX_MIGRATED_SKILLS: usize = 512;
 const MAX_RESOURCE_FILES: usize = 512;
 const MAX_RESOURCE_ROOTS: usize = 64;
@@ -132,7 +135,7 @@ pub struct CustomTheme {
 pub struct ResourceLoaderOptions {
     /// Lowest-precedence bundled/global resource directory.
     pub global_dir: Option<PathBuf>,
-    /// User resource directory, normally `~/.mimir/agent`.
+    /// User resource directory, normally `~/.agents`.
     pub user_dir: Option<PathBuf>,
     /// Local package roots containing `package.json` Mimir/Pi manifests.
     pub package_paths: Vec<PathBuf>,
@@ -177,6 +180,28 @@ pub struct Resources {
     pub prompt_templates: Vec<PromptTemplate>,
     pub themes: Vec<CustomTheme>,
     pub package_manifests: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum SkillSourcePolicy {
+    Strict,
+    SharedUser,
+}
+
+impl SkillSourcePolicy {
+    const fn max_body_bytes(self) -> usize {
+        match self {
+            Self::Strict => MAX_SKILL_BODY_BYTES,
+            Self::SharedUser => MAX_SHARED_SKILL_BODY_BYTES,
+        }
+    }
+
+    const fn max_file_bytes(self) -> u64 {
+        match self {
+            Self::Strict => MAX_SKILL_FILE_BYTES,
+            Self::SharedUser => MAX_SHARED_SKILL_FILE_BYTES,
+        }
+    }
 }
 
 pub struct ResourceLoader {
@@ -261,6 +286,7 @@ impl ResourceLoader {
         if let Some(global) = self.options.global_dir.as_deref() {
             self.load_config_root(
                 global,
+                SkillSourcePolicy::Strict,
                 &mut skills,
                 &mut prompts,
                 &mut themes,
@@ -292,6 +318,7 @@ impl ResourceLoader {
         if let Some(user) = self.options.user_dir.as_deref() {
             self.load_config_root(
                 user,
+                SkillSourcePolicy::SharedUser,
                 &mut skills,
                 &mut prompts,
                 &mut themes,
@@ -324,10 +351,12 @@ impl ResourceLoader {
                     &directory.join(".agents/skills"),
                     &self.boundary,
                     &mut skills,
+                    SkillSourcePolicy::Strict,
                 )?;
             }
             self.load_config_root(
                 &directory.join(MIMIR_CONFIG_DIR),
+                SkillSourcePolicy::Strict,
                 &mut skills,
                 &mut prompts,
                 &mut themes,
@@ -424,6 +453,7 @@ impl ResourceLoader {
     fn load_config_root(
         &self,
         root: &Path,
+        skill_policy: SkillSourcePolicy,
         skills: &mut BTreeMap<String, Skill>,
         prompts: &mut BTreeMap<String, PromptTemplate>,
         themes: &mut BTreeMap<String, CustomTheme>,
@@ -437,7 +467,7 @@ impl ResourceLoader {
         }
         let root = canonical_directory(root, "resource root")?;
         if self.options.discover_skills {
-            Self::load_skill_path(&root.join("skills"), &root, skills)?;
+            Self::load_skill_path(&root.join("skills"), &root, skills, skill_policy)?;
         }
         if self.options.discover_prompt_templates {
             Self::load_prompt_path(&root.join("prompts"), &root, prompts)?;
@@ -473,7 +503,7 @@ impl ResourceLoader {
     ) -> Result<(), ResourceError> {
         let path = self.resolve_explicit_path(path)?;
         let root = explicit_allowed_root(&path)?;
-        Self::load_skill_path(&path, &root, skills)
+        Self::load_skill_path(&path, &root, skills, SkillSourcePolicy::Strict)
     }
 
     fn load_explicit_prompt(
@@ -530,25 +560,38 @@ impl ResourceLoader {
         path: &Path,
         root: &Path,
         skills: &mut BTreeMap<String, Skill>,
+        policy: SkillSourcePolicy,
     ) -> Result<(), ResourceError> {
         if !path.exists() {
             return Ok(());
         }
         let mut files = if path.is_file() {
-            vec![path.to_path_buf()]
+            vec![(path.to_path_buf(), root.to_path_buf())]
         } else if path.join("SKILL.md").is_file() {
-            vec![path.join("SKILL.md")]
+            vec![(path.join("SKILL.md"), root.to_path_buf())]
         } else {
-            sorted_entries(path)?
-                .into_iter()
-                .map(|entry| entry.join("SKILL.md"))
-                .filter(|file| file.is_file())
-                .collect()
+            let mut files = Vec::new();
+            for entry in sorted_entries(path)? {
+                let file = entry.join("SKILL.md");
+                if !file.is_file() {
+                    continue;
+                }
+                let allowed_root = if matches!(policy, SkillSourcePolicy::SharedUser)
+                    && std::fs::symlink_metadata(&entry)?.file_type().is_symlink()
+                {
+                    canonical_directory(&entry, "linked user skill")?
+                } else {
+                    root.to_path_buf()
+                };
+                files.push((file, allowed_root));
+            }
+            files
         };
-        files.sort();
-        for file in files {
-            let file = checked_resource_file(&file, root, MAX_SKILL_FILE_BYTES, "skill")?;
-            let skill = parse_skill(&file)?;
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        for (file, allowed_root) in files {
+            let file =
+                checked_resource_file(&file, &allowed_root, policy.max_file_bytes(), "skill")?;
+            let skill = parse_skill(&file, policy)?;
             skills.insert(skill.name.clone(), skill);
             ensure_catalog_bound(skills.len(), "skill")?;
             ensure_catalog_bytes(skills.values().map(|skill| skill.body.len()), "skill")?;
@@ -641,7 +684,12 @@ impl ResourceLoader {
         ensure_manifest_entry_bound(&theme_paths, "themes")?;
         if self.options.discover_skills {
             for entry in skill_paths {
-                Self::load_skill_path(&checked_package_entry(&package, &entry)?, &package, skills)?;
+                Self::load_skill_path(
+                    &checked_package_entry(&package, &entry)?,
+                    &package,
+                    skills,
+                    SkillSourcePolicy::Strict,
+                )?;
             }
         }
         if self.options.discover_prompt_templates {
@@ -1111,11 +1159,12 @@ struct MigratedSkillMetadata {
     description: Option<String>,
 }
 
-fn parse_skill(path: &std::path::Path) -> Result<Skill, ResourceError> {
-    if std::fs::metadata(path)?.len() > MAX_SKILL_FILE_BYTES {
+fn parse_skill(path: &std::path::Path, policy: SkillSourcePolicy) -> Result<Skill, ResourceError> {
+    let max_file_bytes = policy.max_file_bytes();
+    if std::fs::metadata(path)?.len() > max_file_bytes {
         return Err(skill_error(
             path,
-            &format!("skill file exceeds {MAX_SKILL_FILE_BYTES} bytes"),
+            &format!("skill file exceeds {max_file_bytes} bytes"),
         ));
     }
     let raw_content = std::fs::read_to_string(path)?;
@@ -1136,10 +1185,14 @@ fn parse_skill(path: &std::path::Path) -> Result<Skill, ResourceError> {
         .and_then(std::path::Path::file_name)
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
-    if metadata.name != expected {
+    if matches!(policy, SkillSourcePolicy::Strict) && metadata.name != expected {
         return Err(skill_error(path, "name must match the skill directory"));
     }
-    validate_skill_name(path, &metadata.name)?;
+    validate_skill_name(
+        path,
+        &metadata.name,
+        matches!(policy, SkillSourcePolicy::SharedUser),
+    )?;
     if metadata.description.trim().is_empty() {
         return Err(skill_error(path, "description must not be blank"));
     }
@@ -1153,10 +1206,11 @@ fn parse_skill(path: &std::path::Path) -> Result<Skill, ResourceError> {
     if body.is_empty() {
         return Err(skill_error(path, "instructions must not be blank"));
     }
-    if body.len() > MAX_SKILL_BODY_BYTES {
+    let max_body_bytes = policy.max_body_bytes();
+    if body.len() > max_body_bytes {
         return Err(skill_error(
             path,
-            &format!("instructions exceed {MAX_SKILL_BODY_BYTES} bytes"),
+            &format!("instructions exceed {max_body_bytes} bytes"),
         ));
     }
     Ok(Skill {
@@ -1195,7 +1249,7 @@ fn parse_migrated_skill(path: &std::path::Path) -> Result<Skill, ResourceError> 
     if metadata.name != expected {
         return Err(skill_error(path, "name must match the skill directory"));
     }
-    validate_skill_name(path, &metadata.name)?;
+    validate_skill_name(path, &metadata.name, false)?;
     let description = metadata
         .description
         .unwrap_or_else(|| format!("Migrated legacy skill {}", metadata.name));
@@ -1217,26 +1271,43 @@ fn parse_migrated_skill(path: &std::path::Path) -> Result<Skill, ResourceError> 
     })
 }
 
-fn validate_skill_name(path: &std::path::Path, name: &str) -> Result<(), ResourceError> {
+fn validate_skill_name(
+    path: &std::path::Path,
+    name: &str,
+    allow_namespace: bool,
+) -> Result<(), ResourceError> {
     if name.is_empty() || name.len() > MAX_SKILL_NAME_BYTES {
         return Err(skill_error(
             path,
             &format!("name must contain 1 to {MAX_SKILL_NAME_BYTES} bytes"),
         ));
     }
-    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
-        return Err(skill_error(
-            path,
-            "name must not start or end with a hyphen or contain consecutive hyphens",
-        ));
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
+    if !allow_namespace && name.contains(':') {
         return Err(skill_error(
             path,
             "name may contain only lowercase ASCII letters, digits, and hyphens",
+        ));
+    }
+    if name.split(':').any(|segment| {
+        segment.is_empty()
+            || segment.starts_with('-')
+            || segment.ends_with('-')
+            || segment.contains("--")
+    }) {
+        return Err(skill_error(
+            path,
+            "name segments must not be empty, start or end with a hyphen, or contain consecutive hyphens",
+        ));
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || byte == b'-'
+            || (allow_namespace && byte == b':')
+    }) {
+        return Err(skill_error(
+            path,
+            "name may contain only lowercase ASCII letters, digits, hyphens, and namespace separators",
         ));
     }
     Ok(())

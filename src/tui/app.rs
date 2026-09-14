@@ -851,6 +851,10 @@ impl App {
         self.run_active = active;
     }
 
+    pub(crate) fn clear_current_activity(&mut self) {
+        self.current_activity = None;
+    }
+
     #[must_use]
     pub const fn bash_active(&self) -> bool {
         self.bash_active

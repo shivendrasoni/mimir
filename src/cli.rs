@@ -1612,7 +1612,7 @@ async fn load_runtime_resources(
     package_paths.dedup();
     let user_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|path| path.join(".mimir/agent"));
+        .map(|path| path.join(".agents"));
     let options = ResourceLoaderOptions {
         user_dir,
         package_paths,

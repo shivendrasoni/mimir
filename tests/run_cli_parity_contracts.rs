@@ -609,6 +609,70 @@ fn no_skills_disables_discovered_skill_resources() {
 }
 
 #[test]
+fn user_skills_are_discovered_from_the_shared_agents_directory() {
+    let home = TempDir::new().expect("home");
+    let workspace = TempDir::new().expect("workspace");
+    let state = TempDir::new().expect("state");
+    let shared = home.path().join(".agents/skills/shared");
+    fs::create_dir_all(&shared).expect("shared skill directory");
+    fs::write(
+        shared.join("SKILL.md"),
+        "---\nname: shared\ndescription: Shared user skill\n---\nUse the shared skill.\n",
+    )
+    .expect("shared skill");
+    let legacy = home.path().join(".mimir/agent/skills/legacy");
+    fs::create_dir_all(&legacy).expect("legacy skill directory");
+    fs::write(
+        legacy.join("SKILL.md"),
+        "---\nname: legacy\ndescription: Legacy user skill\n---\nUse the legacy skill.\n",
+    )
+    .expect("legacy skill");
+
+    let shared_run = binary()
+        .env("HOME", home.path())
+        .args([
+            "--provider",
+            "fake",
+            "--workspace",
+            workspace.path().to_str().expect("workspace"),
+            "--state-dir",
+            state.path().to_str().expect("state"),
+            "--no-session",
+            "--fake-response",
+            "shared loaded",
+            "--print",
+            "/skill:shared focus",
+        ])
+        .output()
+        .expect("shared skill run");
+    assert!(
+        shared_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shared_run.stderr)
+    );
+
+    let legacy_run = binary()
+        .env("HOME", home.path())
+        .args([
+            "--provider",
+            "fake",
+            "--workspace",
+            workspace.path().to_str().expect("workspace"),
+            "--state-dir",
+            state.path().to_str().expect("state"),
+            "--no-session",
+            "--fake-response",
+            "unused",
+            "--print",
+            "/skill:legacy focus",
+        ])
+        .output()
+        .expect("legacy skill run");
+    assert!(!legacy_run.status.success());
+    assert!(String::from_utf8_lossy(&legacy_run.stderr).contains("unknown skill `legacy`"));
+}
+
+#[test]
 fn startup_goal_creates_a_new_root_with_the_requested_budget() {
     let workspace = TempDir::new().expect("workspace");
     let state = workspace.path().join("state");

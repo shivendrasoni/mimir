@@ -1029,6 +1029,15 @@ pub async fn run_tui_with_autonomous(
                         .push_system_message(message);
                 }
                 if let Some(action) = tui_action {
+                    let compacting = matches!(action, TuiAction::Compact { .. });
+                    if compacting {
+                        begin_compaction_feedback(
+                            &mut app
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                        render_frame(&app, &mut frame_cache)?;
+                    }
                     let result = match dispatch_coordinator_action(
                         &action,
                         &mut runtime,
@@ -1050,9 +1059,13 @@ pub async fn run_tui_with_autonomous(
                         Ok(message) => message,
                         Err(error) => format!("command failed: {error}"),
                     };
-                    app.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push_system_message(message);
+                    let mut state = app
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if compacting {
+                        finish_compaction_feedback(&mut state);
+                    }
+                    state.push_system_message(message);
                 }
             }
         }
@@ -1076,6 +1089,15 @@ fn parse_user_bash_submission(prompt: &str) -> Option<UserBashSubmission> {
         command: command.trim().into(),
         exclude_from_context: false,
     })
+}
+
+fn begin_compaction_feedback(app: &mut App) {
+    app.push_system_message("Compaction started");
+    app.apply_stream_event(StreamEvent::Activity("Compacting context…".into()));
+}
+
+fn finish_compaction_feedback(app: &mut App) {
+    app.clear_current_activity();
 }
 
 async fn run_tui_user_bash(
@@ -4148,6 +4170,34 @@ mod local_command_tests {
             ctrl_c_primary_action(&mut app, true),
             CtrlCPrimaryAction::CancelRun
         );
+    }
+
+    #[test]
+    fn compaction_feedback_is_visible_until_the_command_finishes() {
+        let mut app = App::new(AppConfig::default());
+
+        begin_compaction_feedback(&mut app);
+
+        assert_eq!(
+            app.transcript().last().map(|entry| entry.text.as_str()),
+            Some("Compaction started")
+        );
+        assert_eq!(app.current_activity(), Some("Compacting context…"));
+        let rendered = app.render(
+            TerminalSize {
+                width: 80,
+                height: 24,
+            },
+            RenderOptions {
+                capabilities: TerminalCapabilities::plain(),
+            },
+        );
+        assert!(rendered.contains("Compaction started"));
+        assert!(rendered.contains("✦ Compacting context…"));
+
+        finish_compaction_feedback(&mut app);
+
+        assert_eq!(app.current_activity(), None);
     }
 
     #[test]

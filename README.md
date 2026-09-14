@@ -11,6 +11,8 @@ The RLM runtime is built for long-running, inspectable work:
 
 Around that RLM foundation, Mimir provides provider adaptation, model/tool execution, workspace tools, context and skill loading, goals, schedules, TUI/CLI/JSON/JSON-RPC operation, auth and OAuth login, daemon IPC, extension hosting, state migration helpers, and deterministic offline testing.
 
+User-level skills are discovered from the cross-harness `~/.agents/skills/` directory. Project-specific skills remain discoverable from `.agents/skills/` at each workspace level; an explicit `--skill <PATH>` still has highest precedence.
+
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
 ## Install

@@ -178,6 +178,45 @@ fn loader_discovers_every_scope_deterministically_with_nearest_and_explicit_wins
 
 #[cfg(unix)]
 #[test]
+fn shared_user_root_accepts_linked_and_namespaced_skills() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = TempDir::new().expect("workspace");
+    let user = TempDir::new().expect("user");
+    let registry = TempDir::new().expect("registry");
+    write_skill(
+        registry.path(),
+        "source",
+        "platform-core:review",
+        "shared namespaced skill",
+    );
+    let skills = user.path().join("skills");
+    std::fs::create_dir_all(&skills).expect("user skills root");
+    symlink(
+        registry.path().join("source"),
+        skills.join("platform-core-review"),
+    )
+    .expect("linked user skill");
+
+    let resources = ResourceLoader::with_options(
+        workspace.path(),
+        workspace.path(),
+        ResourceLoaderOptions {
+            user_dir: Some(user.path().into()),
+            ..ResourceLoaderOptions::default()
+        },
+    )
+    .expect("loader")
+    .load()
+    .expect("shared user resources");
+
+    assert_eq!(resources.skills.len(), 1);
+    assert_eq!(resources.skills[0].name, "platform-core:review");
+    assert_eq!(resources.skills[0].description, "shared namespaced skill");
+}
+
+#[cfg(unix)]
+#[test]
 fn explicit_symlinks_and_package_manifest_escapes_fail_closed_without_file_contents() {
     use std::os::unix::fs::symlink;
 

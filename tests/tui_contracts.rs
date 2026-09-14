@@ -1544,6 +1544,61 @@ fn renderer_is_resize_safe_and_has_plaintext_fallback() {
 }
 
 #[test]
+fn assistant_markdown_keeps_blocks_and_removes_literal_formatting_markers() {
+    let mut app = App::new(AppConfig::default());
+    app.apply_stream_event(StreamEvent::Completed(
+        "It worked end-to-end.\n\n## What worked\n\n1. **Client built successfully** with `record_encounter`\n2. Opened the [scorecard](https://example.com/result)\n\n> The score is expected.\n\n```rust\nlet score = 0;\n```"
+            .into(),
+    ));
+
+    let plain = app.render(
+        TerminalSize {
+            width: 100,
+            height: 28,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::plain(),
+        },
+    );
+
+    assert!(plain.contains("● It worked end-to-end."));
+    assert!(plain.contains("  What worked"), "{plain:?}");
+    assert!(plain.contains("  1. Client built successfully with record_encounter"));
+    assert!(plain.contains("  2. Opened the scorecard (https://example.com/result)"));
+    assert!(plain.contains("  │ The score is expected."));
+    assert!(plain.contains("  ┌─ rust"));
+    assert!(plain.contains("  │ let score = 0;"));
+    for marker in ["##", "**", "`record_encounter`", "```"] {
+        assert!(!plain.contains(marker), "rendered literal marker: {marker}");
+    }
+}
+
+#[test]
+fn rich_assistant_markdown_uses_bold_and_link_terminal_styles() {
+    let mut app = App::new(AppConfig::default());
+    app.apply_stream_event(StreamEvent::Completed(
+        "## Result\n\n**Safe change** in `src/tui/render.rs`".into(),
+    ));
+
+    let rendered = app.render(
+        TerminalSize {
+            width: 100,
+            height: 18,
+        },
+        RenderOptions {
+            capabilities: TerminalCapabilities::rich_ansi(),
+        },
+    );
+
+    assert!(
+        rendered.contains("\u{1b}[1;38;2;203;213;225mResult\u{1b}[0m"),
+        "{rendered:?}"
+    );
+    assert!(rendered.contains("\u{1b}[1;38;2;203;213;225mSafe change\u{1b}[0m"));
+    assert!(rendered.contains("\u{1b}[38;2;96;165;250msrc/tui/render.rs\u{1b}[0m"));
+}
+
+#[test]
 fn login_overlay_masks_api_keys_and_emits_a_typed_request() {
     let mut app = App::new(AppConfig::default());
     for character in "/login openai".chars() {

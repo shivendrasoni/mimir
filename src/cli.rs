@@ -7090,6 +7090,7 @@ impl RlmProviderFactory for CliRlmProviderFactory {
 
 struct CliRlmChildToolFactory {
     base_tools: Arc<ToolRegistry>,
+    skills: SkillRuntime,
     providers: Arc<dyn RlmProviderFactory>,
     catalog: Arc<dyn AuthenticatedModelCatalog>,
     state: PathBuf,
@@ -7121,6 +7122,7 @@ impl RlmChildToolRegistryFactory for CliRlmChildToolFactory {
                     Arc::clone(&self.base_tools),
                     self.policy.clone(),
                 )
+                .with_skill_runtime(self.skills.clone())
                 .with_child_tool_factory(Arc::clone(&self) as Arc<dyn RlmChildToolRegistryFactory>),
             );
             let parent_session_path = request
@@ -7397,6 +7399,21 @@ async fn build_runtime_for_session(
     };
     let mut tool_registry = ToolRegistry::with_default_tools(&workspace, policy.clone())
         .map_err(|error| MimirError::Tool(error.to_string()))?;
+    let resources = load_runtime_resources(&resource_build, &state, &workspace).await?;
+    let mut skills = if build.no_skills {
+        Vec::new()
+    } else {
+        load_migrated_skills(&state)
+            .map_err(|error| MimirError::Configuration(error.to_string()))?
+    };
+    skills.extend(resources.skills.clone());
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    let skill_runtime = SkillRuntime::new(skills);
+    if !build.no_skills {
+        tool_registry
+            .register_skill_search(&skill_runtime)
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+    }
     if !build.no_builtin_tools && !build.agent_mode.is_plan() {
         tool_registry
             .register_remember_tool(&state, session)
@@ -7475,6 +7492,7 @@ async fn build_runtime_for_session(
         let child_tool_factory: Arc<dyn RlmChildToolRegistryFactory> =
             Arc::new(CliRlmChildToolFactory {
                 base_tools: Arc::clone(&child_tools),
+                skills: skill_runtime.clone(),
                 providers: Arc::clone(&provider_factory),
                 catalog: Arc::clone(&catalog),
                 state: state.clone(),
@@ -7485,6 +7503,7 @@ async fn build_runtime_for_session(
             });
         let child_executor = Arc::new(
             AgentRuntimeChildExecutor::new(provider_factory, child_tools, child_policy)
+                .with_skill_runtime(skill_runtime.clone())
                 .with_child_tool_factory(child_tool_factory),
         );
         let parent_session_path = file_store.as_ref().and_then(|store| store.path().to_str());
@@ -7519,15 +7538,6 @@ async fn build_runtime_for_session(
         }
     }
     let tools = Arc::new(tool_registry);
-    let resources = load_runtime_resources(&resource_build, &state, &workspace).await?;
-    let mut skills = if build.no_skills {
-        Vec::new()
-    } else {
-        load_migrated_skills(&state)
-            .map_err(|error| MimirError::Configuration(error.to_string()))?
-    };
-    skills.extend(resources.skills);
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
     let mut config = RuntimeConfig::default_for_model(&build.model);
     config.provider.clone_from(&build.provider);
     config.thinking_level = thinking_level;
@@ -7586,7 +7596,7 @@ async fn build_runtime_for_session(
             if build.no_session { "memory" } else { session },
             build.offline,
             resources.context_files.len(),
-            skills.len(),
+            skill_runtime.command_names().len(),
             tools.definitions().len()
         );
     }
@@ -7604,7 +7614,7 @@ async fn build_runtime_for_session(
     if service_tier.is_some() {
         runtime.set_service_tier(service_tier).await?;
     }
-    runtime.attach_skill_runtime(SkillRuntime::new(skills));
+    runtime.attach_skill_runtime(skill_runtime);
     runtime
         .attach_extension_manager(extension_manager, session)
         .await;
@@ -11239,6 +11249,7 @@ mod rlm_recursive_tool_tests {
         );
         let factory = Arc::new(CliRlmChildToolFactory {
             base_tools,
+            skills: crate::skills::SkillRuntime::default(),
             providers: Arc::new(StaticProviderFactory),
             catalog: Arc::new(StaticCatalog),
             state: PathBuf::from(state.path()),

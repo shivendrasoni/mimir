@@ -33,6 +33,7 @@ use crate::{
     },
     runtime::{AgentRuntime, EventSink, RuntimeConfig, RuntimeEvent},
     session::FileSessionStore,
+    skills::SkillRuntime,
     tools::ToolRegistry,
 };
 
@@ -215,6 +216,7 @@ pub struct AgentRuntimeChildExecutor {
     providers: Arc<dyn RlmProviderFactory>,
     tools: Arc<ToolRegistry>,
     child_tools: Option<Arc<dyn RlmChildToolRegistryFactory>>,
+    skills: SkillRuntime,
     policy: RlmChildRuntimePolicy,
 }
 
@@ -229,8 +231,15 @@ impl AgentRuntimeChildExecutor {
             providers,
             tools,
             child_tools: None,
+            skills: SkillRuntime::default(),
             policy,
         }
+    }
+
+    #[must_use]
+    pub fn with_skill_runtime(mut self, skills: SkillRuntime) -> Self {
+        self.skills = skills;
+        self
     }
 
     #[must_use]
@@ -288,6 +297,7 @@ impl RlmChildExecutor for AgentRuntimeChildExecutor {
             )
             .await?,
         );
+        runtime.attach_skill_runtime(self.skills.clone());
         let max_output_tokens = u32::try_from(request.max_output_tokens).map_err(|_| {
             configuration("RLM output token limit exceeds the provider protocol limit")
         })?;

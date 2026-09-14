@@ -10,6 +10,7 @@ mod path_policy;
 mod plan;
 mod process;
 mod rlm;
+mod skill;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -175,6 +176,7 @@ trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    skill_search_registered: bool,
     rlm_runtime: Option<Arc<crate::extensions::RlmRuntime>>,
     workspace_root: Arc<PathBuf>,
     agent_mode: AgentMode,
@@ -192,6 +194,7 @@ impl ToolRegistry {
         let paths = WorkspacePathPolicy::new(root)?;
         let mut registry = Self {
             tools: BTreeMap::new(),
+            skill_search_registered: false,
             rlm_runtime: None,
             workspace_root: Arc::new(paths.root().to_owned()),
             agent_mode: policy.agent_mode,
@@ -371,16 +374,19 @@ impl ToolRegistry {
     /// kernel under the child's own session identity.
     #[must_use]
     pub fn fork_for_child_runtime(&self) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| {
+                !rlm::is_reserved(name)
+                    && !matches!(name.as_str(), "ipython" | "finish_task" | "remember")
+            })
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect::<BTreeMap<_, _>>();
         Self {
-            tools: self
-                .tools
-                .iter()
-                .filter(|(name, _)| {
-                    !rlm::is_reserved(name)
-                        && !matches!(name.as_str(), "ipython" | "finish_task" | "remember")
-                })
-                .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
-                .collect(),
+            skill_search_registered: self.skill_search_registered
+                && tools.contains_key("search_skills"),
+            tools,
             rlm_runtime: None,
             workspace_root: Arc::clone(&self.workspace_root),
             agent_mode: self.agent_mode,
@@ -516,6 +522,31 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Registers bounded skill discovery and ephemeral exact-name activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tool name is already registered.
+    pub fn register_skill_search(
+        &mut self,
+        skills: &crate::skills::SkillRuntime,
+    ) -> Result<(), ToolError> {
+        if self.tools.contains_key("search_skills") {
+            return Err(ToolError::Execution {
+                tool: "search_skills".into(),
+                message: "tool name conflicts with an existing tool".into(),
+            });
+        }
+        self.register(skill::SearchSkillsTool::new(skills.summaries()));
+        self.skill_search_registered = true;
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn has_skill_search(&self) -> bool {
+        self.skill_search_registered
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
@@ -558,6 +589,7 @@ impl ToolRegistry {
     pub fn retain_named(&mut self, allowed: &BTreeSet<String>) -> Vec<String> {
         self.tools
             .retain(|name, _| name == "finish_task" || allowed.contains(name));
+        self.skill_search_registered = self.tools.contains_key("search_skills");
         allowed
             .iter()
             .filter(|name| !self.tools.contains_key(*name))
@@ -612,7 +644,7 @@ impl ToolRegistry {
         if self.agent_mode == AgentMode::Plan
             && !matches!(
                 name,
-                "read_file" | "list_files" | "search" | "ask_user" | "write_plan"
+                "read_file" | "list_files" | "search" | "search_skills" | "ask_user" | "write_plan"
             )
         {
             return Err(ToolError::Disabled { tool: name.into() });

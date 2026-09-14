@@ -24,6 +24,12 @@ pub struct SkillRuntime {
     skills: BTreeMap<String, Skill>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillSummary {
+    pub name: String,
+    pub description: String,
+}
+
 impl SkillRuntime {
     #[must_use]
     pub fn new(skills: Vec<Skill>) -> Self {
@@ -63,14 +69,7 @@ impl SkillRuntime {
                 .skills
                 .get(name)
                 .ok_or_else(|| SkillInvocationError::Unknown(name.to_owned()))?;
-            let base_dir = skill.path.parent().unwrap_or(&skill.path).display();
-            let context = format!(
-                "<active_skill name=\"{}\" location=\"{}\">\nReferences are relative to {}. The activating user message contains any request arguments after the skill name. Do not install packages or execute referenced scripts automatically; inspect them and request the authority required by the active task.\n\n{}\n</active_skill>",
-                skill.name,
-                escape_xml(&skill.path.display().to_string()),
-                escape_xml(&base_dir.to_string()),
-                skill.body,
-            );
+            let context = render_skill_context(skill);
             total = total.saturating_add(context.len());
             if total > MAX_ACTIVE_SKILL_CONTEXT_BYTES {
                 return Err(SkillInvocationError::Oversized);
@@ -87,6 +86,66 @@ impl SkillRuntime {
             .map(|name| format!("skill:{name}"))
             .collect()
     }
+
+    #[must_use]
+    pub(crate) fn summaries(&self) -> Vec<SkillSummary> {
+        self.skills
+            .values()
+            .map(|skill| SkillSummary {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect()
+    }
+
+    /// Adds one exact skill to the ephemeral context for the current run.
+    /// Returns `false` when that skill is already active.
+    pub(crate) fn activate(
+        &self,
+        active_context: &mut Option<String>,
+        name: &str,
+    ) -> Result<bool, SkillInvocationError> {
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| SkillInvocationError::Unknown(name.to_owned()))?;
+        let marker = format!("<active_skill name=\"{}\"", escape_xml(name));
+        if active_context
+            .as_deref()
+            .is_some_and(|context| context.contains(&marker))
+        {
+            return Ok(false);
+        }
+        let context = render_skill_context(skill);
+        let current_len = active_context.as_ref().map_or(0, String::len);
+        let separator_len = usize::from(active_context.is_some()) * 2;
+        if current_len
+            .saturating_add(separator_len)
+            .saturating_add(context.len())
+            > MAX_ACTIVE_SKILL_CONTEXT_BYTES
+        {
+            return Err(SkillInvocationError::Oversized);
+        }
+        match active_context {
+            Some(active) => {
+                active.push_str("\n\n");
+                active.push_str(&context);
+            }
+            None => *active_context = Some(context),
+        }
+        Ok(true)
+    }
+}
+
+fn render_skill_context(skill: &Skill) -> String {
+    let base_dir = skill.path.parent().unwrap_or(&skill.path).display();
+    format!(
+        "<active_skill name=\"{}\" location=\"{}\">\nReferences are relative to {}. The current user request supplies the task context; for an explicit skill invocation, text after the skill name supplies its arguments. Do not install packages or execute referenced scripts automatically; inspect them and request the authority required by the active task.\n\n{}\n</active_skill>",
+        skill.name,
+        escape_xml(&skill.path.display().to_string()),
+        escape_xml(&base_dir.to_string()),
+        skill.body,
+    )
 }
 
 fn parse_invocation(input: &str) -> Result<Option<(&str, &str)>, SkillInvocationError> {

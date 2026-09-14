@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use mimir::{
     budget::Budget,
-    model::{Content, Message, ModelResponse, StopReason},
+    model::{Content, Message, ModelResponse, StopReason, ToolCall},
     provider::FakeProvider,
     resources::{MAX_SKILL_BODY_BYTES, ResourceLoader},
     runtime::{AgentRuntime, RuntimeConfig, VecEventSink},
@@ -16,6 +16,20 @@ use tempfile::TempDir;
 fn response(text: &str) -> ModelResponse {
     ModelResponse {
         message: Message::assistant(vec![Content::Text { text: text.into() }], StopReason::Stop),
+        response_id: None,
+    }
+}
+
+fn tool_response(id: &str, name: &str, arguments: serde_json::Value) -> ModelResponse {
+    ModelResponse {
+        message: Message::assistant(
+            vec![Content::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            })],
+            StopReason::ToolUse,
+        ),
         response_id: None,
     }
 }
@@ -50,11 +64,15 @@ async fn runtime_with_skills(
         .expect("resource loader")
         .load()
         .expect("resources");
+    let skills = SkillRuntime::new(resources.skills);
+    let mut tools =
+        ToolRegistry::with_default_tools(workspace, ToolPolicy::default()).expect("tools");
+    tools
+        .register_skill_search(&skills)
+        .expect("skill search tool");
     let runtime = AgentRuntime::resume(
         provider,
-        Arc::new(
-            ToolRegistry::with_default_tools(workspace, ToolPolicy::default()).expect("tools"),
-        ),
+        Arc::new(tools),
         store,
         RuntimeConfig {
             model: "fake-model".into(),
@@ -66,8 +84,71 @@ async fn runtime_with_skills(
     )
     .await
     .expect("runtime");
-    runtime.attach_skill_runtime(SkillRuntime::new(resources.skills));
+    runtime.attach_skill_runtime(skills);
     runtime
+}
+
+#[tokio::test]
+async fn model_can_discover_then_ephemerally_activate_a_skill() {
+    let workspace = TempDir::new().expect("workspace");
+    write_skill(
+        workspace.path(),
+        "brainstorming",
+        "Explore product ideas before implementation",
+        "Ask focused questions before selecting a design.",
+    );
+    write_skill(
+        workspace.path(),
+        "api-design",
+        "Design stable service interfaces",
+        "Define the interface contract.",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response(
+            "search-1",
+            "search_skills",
+            serde_json::json!({"query": "explore product ideas"}),
+        ),
+        tool_response(
+            "activate-1",
+            "search_skills",
+            serde_json::json!({"name": "brainstorming"}),
+        ),
+        response("finished with the selected skill"),
+    ]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = runtime_with_skills(workspace.path(), provider.clone(), store.clone()).await;
+
+    runtime
+        .run("Help me shape this feature", &VecEventSink::default())
+        .await
+        .expect("skill-assisted run");
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|definition| definition.name == "search_skills")
+    );
+    assert!(!requests[0].system_prompt.contains("<active_skill"));
+    assert!(!requests[1].system_prompt.contains("<active_skill"));
+    assert!(
+        requests[2]
+            .system_prompt
+            .contains("<active_skill name=\"brainstorming\"")
+    );
+    assert!(
+        requests[2]
+            .system_prompt
+            .contains("Ask focused questions before selecting a design.")
+    );
+
+    let loaded = store.load().await.expect("session records");
+    let serialized = serde_json::to_string(&loaded.records).expect("serialize records");
+    assert!(serialized.contains("brainstorming"));
+    assert!(!serialized.contains("Ask focused questions before selecting a design."));
 }
 
 #[tokio::test]

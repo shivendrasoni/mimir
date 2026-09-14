@@ -2637,7 +2637,7 @@ impl AgentRuntime {
                         blocked_reason = check.warning;
                     }
                 }
-                let execution = if let Some(reason) = blocked_reason {
+                let mut execution = if let Some(reason) = blocked_reason {
                     Err(crate::tools::ToolError::Execution {
                         tool: call.name.clone(),
                         message: reason,
@@ -2651,6 +2651,21 @@ impl AgentRuntime {
                         tool: call.name.clone(),
                     })
                 };
+                if execution.is_ok()
+                    && self.tools.has_skill_search()
+                    && call.name == "search_skills"
+                    && let Some(name) = arguments.get("name").and_then(serde_json::Value::as_str)
+                    && let Err(error) = self
+                        .skills
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .activate(&mut active_skill_context, name)
+                {
+                    execution = Err(crate::tools::ToolError::Execution {
+                        tool: call.name.clone(),
+                        message: error.to_string(),
+                    });
+                }
                 if let Err(crate::tools::ToolError::ApprovalRequired { request }) = &execution {
                     sink.emit(RuntimeEvent::PermissionRequested {
                         request: request.clone(),

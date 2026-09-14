@@ -24,6 +24,7 @@ use crossterm::{
 use crate::{
     auth::{AuthStore, DeviceAuthorization, OAuthProvider, PendingOAuth},
     error::Result,
+    extensions::{SessionForkPosition, SessionStartReason, SessionSwitchReason},
     learning::{self, LearningMode},
     mcp::{McpAuthCoordinator, McpOAuthAuthorization, McpOAuthClient, McpOAuthCodeReceiver},
     model::{Content, Message, Role, Usage},
@@ -970,6 +971,70 @@ pub async fn run_tui_with_autonomous(
                         .await
                         {
                             Ok(selected_runtime) => {
+                                let session_changed = runtime_key
+                                    .as_ref()
+                                    .is_some_and(|(_, current)| current != &session);
+                                if session_changed
+                                    && let Err(error) = runtime
+                                        .before_session_switch(
+                                            SessionSwitchReason::Resume,
+                                            Some(
+                                                state_root
+                                                    .join("sessions")
+                                                    .join(format!("{session}.jsonl"))
+                                                    .display()
+                                                    .to_string(),
+                                            ),
+                                        )
+                                        .await
+                                {
+                                    app.lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push_system_message(format!(
+                                            "runtime switch failed: {error}"
+                                        ));
+                                    continue;
+                                }
+                                let previous = runtime_key.as_ref().map(|(_, current)| {
+                                    state_root
+                                        .join("sessions")
+                                        .join(format!("{current}.jsonl"))
+                                        .display()
+                                        .to_string()
+                                });
+                                if let Err(error) = runtime
+                                    .shutdown_extension_session(if session_changed {
+                                        "session_switch"
+                                    } else {
+                                        "reload"
+                                    })
+                                    .await
+                                {
+                                    app.lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push_system_message(format!(
+                                            "runtime switch failed: {error}"
+                                        ));
+                                    continue;
+                                }
+                                if let Err(error) = selected_runtime
+                                    .start_extension_session(
+                                        if session_changed {
+                                            SessionStartReason::Resume
+                                        } else {
+                                            SessionStartReason::Reload
+                                        },
+                                        previous,
+                                    )
+                                    .await
+                                {
+                                    app.lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push_system_message(format!(
+                                            "runtime switch failed: {error}"
+                                        ));
+                                    continue;
+                                }
                                 runtime = selected_runtime;
                                 runtime_key = Some(selected_key);
                                 runtime_needs_refresh = false;
@@ -2299,14 +2364,25 @@ async fn import_tui_session(
     let imported_model = imported_state.model;
     let imported_thinking = imported_state.thinking_level;
     let store = FileSessionStore::create(state_root, &session).await?;
+    runtime
+        .before_session_switch(
+            SessionSwitchReason::Resume,
+            Some(path.display().to_string()),
+        )
+        .await?;
     store.replace_records(imported.records).await?;
     let model = if let Some(selection) = imported_model {
         format!("{}/{}", selection.provider, selection.model)
     } else {
         current_model(runtime, runtime_key.as_ref()).await
     };
-    *runtime =
+    let next_runtime =
         build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
+    runtime.shutdown_extension_session("session_import").await?;
+    next_runtime
+        .start_extension_session(SessionStartReason::Reload, Some(path.display().to_string()))
+        .await?;
+    *runtime = next_runtime;
     if let Some(level) = imported_thinking
         .as_deref()
         .and_then(parse_tui_thinking_level)
@@ -3225,6 +3301,7 @@ async fn continue_tui_session(
     entry_id: Uuid,
 ) -> Result<Option<String>> {
     let (source_session, catalog) = load_session_catalog(runtime_key.as_ref(), state_root).await?;
+    runtime.before_session_tree(&entry_id.to_string()).await?;
     let derivation = catalog.clone_at(entry_id, &source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
     let destination = FileSessionStore::create(state_root, &session).await?;
@@ -3232,8 +3309,23 @@ async fn continue_tui_session(
         destination.append(record).await?;
     }
     let model = current_model(runtime, runtime_key.as_ref()).await;
-    *runtime =
+    let next_runtime =
         build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
+    runtime.complete_session_tree(&entry_id.to_string()).await?;
+    runtime.shutdown_extension_session("session_tree").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::Fork,
+            Some(
+                FileSessionStore::create(state_root, &source_session)
+                    .await?
+                    .path()
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
+    *runtime = next_runtime;
     *runtime_key = Some((model, session.clone()));
     let mut state = app
         .lock()
@@ -3277,6 +3369,9 @@ async fn fork_tui_session(
     entry_id: Uuid,
 ) -> Result<Option<String>> {
     let (source_session, catalog) = load_session_catalog(runtime_key.as_ref(), state_root).await?;
+    runtime
+        .before_session_fork(&entry_id.to_string(), SessionForkPosition::Before)
+        .await?;
     let derivation = catalog.fork_before_user_message(entry_id, &source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
     let destination = FileSessionStore::create(state_root, &session).await?;
@@ -3284,8 +3379,22 @@ async fn fork_tui_session(
         destination.append(record).await?;
     }
     let model = current_model(runtime, runtime_key.as_ref()).await;
-    *runtime =
+    let next_runtime =
         build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
+    runtime.shutdown_extension_session("session_fork").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::Fork,
+            Some(
+                FileSessionStore::create(state_root, &source_session)
+                    .await?
+                    .path()
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
+    *runtime = next_runtime;
     *runtime_key = Some((model, session.clone()));
     let mut state = app
         .lock()
@@ -3387,7 +3496,34 @@ async fn resume_tui_session(
         )));
     }
     let model = current_model(runtime, runtime_key.as_ref()).await;
-    *runtime = build_runtime_with_preferences(runtime_factory, &model, session, state_root).await?;
+    let target = FileSessionStore::create(state_root, session)
+        .await?
+        .path()
+        .display()
+        .to_string();
+    let previous = runtime_key
+        .as_ref()
+        .map(|(_, current)| current.clone())
+        .unwrap_or_default();
+    let next_runtime =
+        build_runtime_with_preferences(runtime_factory, &model, session, state_root).await?;
+    runtime
+        .before_session_switch(SessionSwitchReason::Resume, Some(target))
+        .await?;
+    runtime.shutdown_extension_session("session_switch").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::Resume,
+            (!previous.is_empty()).then(|| {
+                state_root
+                    .join("sessions")
+                    .join(format!("{previous}.jsonl"))
+                    .display()
+                    .to_string()
+            }),
+        )
+        .await?;
+    *runtime = next_runtime;
     *runtime_key = Some((model, session.into()));
     let mut state = app
         .lock()
@@ -3409,18 +3545,43 @@ async fn start_tui_session(
     let previous = runtime_key.as_ref().map(|key| key.1.clone());
     let session = format!("session-{}", Uuid::new_v4().simple());
     let model = current_model(runtime, runtime_key.as_ref()).await;
+    runtime
+        .before_session_switch(
+            SessionSwitchReason::New,
+            Some(
+                state_root
+                    .join("sessions")
+                    .join(format!("{session}.jsonl"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
     let next_runtime =
         build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
     let store = FileSessionStore::create(state_root, &session).await?;
     store
         .append(SessionRecord::new(SessionPayload::RuntimeEvent {
             name: "session_created".into(),
-            detail: previous.unwrap_or_default(),
+            detail: previous.clone().unwrap_or_default(),
         }))
         .await?;
     if let Some(name) = name {
         persist_session_name(&store, name).await?;
     }
+    runtime.shutdown_extension_session("new_session").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::New,
+            previous.map(|previous| {
+                state_root
+                    .join("sessions")
+                    .join(format!("{previous}.jsonl"))
+                    .display()
+                    .to_string()
+            }),
+        )
+        .await?;
     *runtime = next_runtime;
     *runtime_key = Some((model, session.clone()));
     {
@@ -3478,16 +3639,39 @@ async fn clone_tui_session(
             "no active session".into(),
         ));
     };
-    let source = FileSessionStore::create(state_root, source_session).await?;
+    let model = model.clone();
+    let source_session = source_session.clone();
+    let source = FileSessionStore::create(state_root, &source_session).await?;
     let catalog = SessionBranchCatalog::from_records(source.load().await?.records)?;
-    let derivation = catalog.clone_active(source_session)?;
+    let derivation = catalog.clone_active(&source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
+    runtime
+        .before_session_switch(
+            SessionSwitchReason::New,
+            Some(
+                state_root
+                    .join("sessions")
+                    .join(format!("{session}.jsonl"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
     let destination = FileSessionStore::create(state_root, &session).await?;
     for record in derivation.records {
         destination.append(record).await?;
     }
-    *runtime = build_runtime_with_preferences(runtime_factory, model, &session, state_root).await?;
-    *runtime_key = Some((model.clone(), session.clone()));
+    let next_runtime =
+        build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
+    runtime.shutdown_extension_session("session_clone").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::Fork,
+            Some(source.path().display().to_string()),
+        )
+        .await?;
+    *runtime = next_runtime;
+    *runtime_key = Some((model, session.clone()));
     let mut state = app
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3508,7 +3692,22 @@ async fn reload_tui_runtime(
             "no active session".into(),
         ));
     };
-    *runtime = build_runtime_with_preferences(runtime_factory, model, session, state_root).await?;
+    let next_runtime =
+        build_runtime_with_preferences(runtime_factory, model, session, state_root).await?;
+    runtime.shutdown_extension_session("reload").await?;
+    next_runtime
+        .start_extension_session(
+            SessionStartReason::Reload,
+            Some(
+                state_root
+                    .join("sessions")
+                    .join(format!("{session}.jsonl"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
+    *runtime = next_runtime;
     let resources = runtime_factory.resource_snapshot().await?;
     app.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -18,8 +18,8 @@ use crate::{
     extensions::{
         ExtensionCommandInfo, ExtensionContextUsage, ExtensionFlagValue, ExtensionHostAction,
         ExtensionHostSnapshot, ExtensionManager, ExtensionToolInfo, LifecycleEvent,
-        LifecycleInterception, LifecycleMutation, LifecycleReplacement, SessionStartReason,
-        UiRequest,
+        LifecycleInterception, LifecycleMutation, LifecycleReplacement, SessionForkPosition,
+        SessionStartReason, SessionSwitchReason, UiRequest,
     },
     model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel},
     provider::{
@@ -237,6 +237,15 @@ pub trait EventSink: Send + Sync {
 struct RuntimeProviderSink<'a> {
     sink: &'a dyn EventSink,
     emitted: &'a AtomicBool,
+    runtime: &'a AgentRuntime,
+    message_lifecycle: Option<ProviderMessageLifecycle<'a>>,
+    lifecycle_error: Mutex<Option<MimirError>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderMessageLifecycle<'a> {
+    session_id: &'a str,
+    message_id: &'a str,
 }
 
 struct BroadcastingEventSink<'a> {
@@ -260,9 +269,11 @@ impl ProviderEventSink for RuntimeProviderSink<'_> {
             ProviderEvent::TextDelta(text) => {
                 self.emitted.store(true, Ordering::Release);
                 self.sink.emit(RuntimeEvent::TextDelta { text }).await;
+                self.dispatch_message_update().await;
             }
             ProviderEvent::ThinkingDelta(_) => {
                 self.emitted.store(true, Ordering::Release);
+                self.dispatch_message_update().await;
             }
             ProviderEvent::AuthenticationRefresh { provider, status } => {
                 let status = match status {
@@ -280,6 +291,31 @@ impl ProviderEventSink for RuntimeProviderSink<'_> {
                     })
                     .await;
             }
+        }
+    }
+}
+
+impl RuntimeProviderSink<'_> {
+    async fn dispatch_message_update(&self) {
+        let Some(lifecycle) = self.message_lifecycle else {
+            return;
+        };
+        if self.lifecycle_error.lock().await.is_some() {
+            return;
+        }
+        if let Err(error) = self
+            .runtime
+            .dispatch_extension_event(
+                LifecycleEvent::MessageUpdate {
+                    session_id: lifecycle.session_id.to_owned(),
+                    message_id: lifecycle.message_id.to_owned(),
+                    role: "assistant".into(),
+                },
+                self.sink,
+            )
+            .await
+        {
+            *self.lifecycle_error.lock().await = Some(error);
         }
     }
 }
@@ -536,6 +572,145 @@ impl AgentRuntime {
         *self.extension_session_id.write().await = session_id.to_owned();
         self.extension_session_started
             .store(false, Ordering::Release);
+    }
+
+    /// Dispatches a lifecycle event outside the provider loop and republishes
+    /// any interactive extension requests on the session event bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension protocol, capability, timeout, or host-action error.
+    pub async fn dispatch_extension_lifecycle(&self, event: LifecycleEvent) -> Result<bool> {
+        let sink = VecEventSink::default();
+        let blocked = self.dispatch_extension_event(event, &sink).await?;
+        self.publish_extension_ui_events(&sink).await?;
+        Ok(blocked)
+    }
+
+    /// Runs the cancellable hook before a session switch or replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension error, or a protocol error when an extension blocks the switch.
+    pub async fn before_session_switch(
+        &self,
+        reason: SessionSwitchReason,
+        target_session_file: Option<String>,
+    ) -> Result<()> {
+        let session_id = self.extension_session_id.read().await.clone();
+        if self
+            .dispatch_extension_lifecycle(LifecycleEvent::SessionBeforeSwitch {
+                session_id,
+                reason,
+                target_session_file,
+            })
+            .await?
+        {
+            return Err(MimirError::Protocol(
+                "session switch was blocked by an extension".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs the cancellable hook before deriving a forked session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension error, or a protocol error when an extension blocks the fork.
+    pub async fn before_session_fork(
+        &self,
+        entry_id: &str,
+        position: SessionForkPosition,
+    ) -> Result<()> {
+        let session_id = self.extension_session_id.read().await.clone();
+        if self
+            .dispatch_extension_lifecycle(LifecycleEvent::SessionBeforeFork {
+                session_id,
+                entry_id: entry_id.to_owned(),
+                position,
+            })
+            .await?
+        {
+            return Err(MimirError::Protocol(
+                "session fork was blocked by an extension".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs the cancellable hook before navigating to a session-tree entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension error, or a protocol error when an extension blocks navigation.
+    pub async fn before_session_tree(&self, target_id: &str) -> Result<()> {
+        let session_id = self.extension_session_id.read().await.clone();
+        if self
+            .dispatch_extension_lifecycle(LifecycleEvent::SessionBeforeTree {
+                session_id,
+                target_id: target_id.to_owned(),
+            })
+            .await?
+        {
+            return Err(MimirError::Protocol(
+                "session tree navigation was blocked by an extension".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Announces a completed session-tree navigation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension protocol, capability, timeout, or host-action error.
+    pub async fn complete_session_tree(&self, target_id: &str) -> Result<()> {
+        let session_id = self.extension_session_id.read().await.clone();
+        self.dispatch_extension_lifecycle(LifecycleEvent::SessionTree {
+            session_id,
+            target_id: target_id.to_owned(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Announces an explicitly coordinated session start exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension protocol, capability, timeout, or host-action error.
+    pub async fn start_extension_session(
+        &self,
+        reason: SessionStartReason,
+        previous_session_file: Option<String>,
+    ) -> Result<()> {
+        let sink = VecEventSink::default();
+        self.start_extension_session_with_sink(reason, previous_session_file, &sink)
+            .await?;
+        self.publish_extension_ui_events(&sink).await
+    }
+
+    /// Announces shutdown for an active extension session exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an extension protocol, capability, timeout, or host-action error.
+    pub async fn shutdown_extension_session(&self, reason: &str) -> Result<()> {
+        if !self.extension_session_started.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let session_id = self.extension_session_id.read().await.clone();
+        let sink = VecEventSink::default();
+        self.dispatch_extension_event(
+            LifecycleEvent::SessionShutdown {
+                session_id,
+                reason: reason.to_owned(),
+            },
+            &sink,
+        )
+        .await?;
+        self.publish_extension_ui_events(&sink).await
     }
 
     /// Returns the unresolved plan-mode clarification, if this runtime has one.
@@ -1348,6 +1523,18 @@ impl AgentRuntime {
         let (first_kept_entry_id, retained_message_count) =
             retained_record_span(&loaded.records, first_retained)?;
         let tokens_before = estimate_message_tokens(&messages);
+        let session_id = self.extension_session_id.read().await.clone();
+        if self
+            .dispatch_extension_lifecycle(LifecycleEvent::SessionBeforeCompact {
+                session_id: session_id.clone(),
+                context_tokens: tokens_before,
+            })
+            .await?
+        {
+            return Err(MimirError::Protocol(
+                "session compaction was blocked by an extension".into(),
+            ));
+        }
         let prompt = compaction_prompt(&messages[..split], custom_instructions);
         let mut summary = self
             .complete_control_request_unlocked(
@@ -1375,6 +1562,7 @@ impl AgentRuntime {
         let mut active_messages = self.messages.lock().await;
         *active_messages = vec![Message::system(summary.clone())];
         active_messages.extend(retained);
+        drop(active_messages);
         let result = CompactionResult {
             summary,
             first_kept_entry_id,
@@ -1385,6 +1573,8 @@ impl AgentRuntime {
             "type": "compaction_end",
             "result": result
         }))?;
+        self.dispatch_extension_lifecycle(LifecycleEvent::SessionCompact { session_id })
+            .await?;
         Ok(result)
     }
 
@@ -1544,7 +1734,7 @@ impl AgentRuntime {
         };
         let sink = VecEventSink::default();
         let response = self
-            .request_provider(provider, request, cancellation, &sink)
+            .request_provider(provider, request, cancellation, &sink, None)
             .await?;
         if response.message.role != Role::Assistant {
             return Err(MimirError::Protocol(
@@ -2111,17 +2301,8 @@ impl AgentRuntime {
             .clone();
         sink.emit(RuntimeEvent::RunStarted).await;
         let session_id = self.extension_session_id.read().await.clone();
-        if !session_id.is_empty() && !self.extension_session_started.swap(true, Ordering::AcqRel) {
-            self.dispatch_extension_event(
-                LifecycleEvent::SessionStart {
-                    session_id: session_id.clone(),
-                    reason: SessionStartReason::Resume,
-                    previous_session_file: None,
-                },
-                sink,
-            )
+        self.start_extension_session_with_sink(SessionStartReason::Resume, None, sink)
             .await?;
-        }
         let initial_system_prompt = self
             .combined_system_prompt(active_skill_context.as_deref())
             .await;
@@ -2444,8 +2625,27 @@ impl AgentRuntime {
                 sink,
             )
             .await?;
+            let assistant_message_id = uuid::Uuid::new_v4().to_string();
+            self.dispatch_extension_event(
+                LifecycleEvent::MessageStart {
+                    session_id: session_id.clone(),
+                    message_id: assistant_message_id.clone(),
+                    role: "assistant".into(),
+                },
+                sink,
+            )
+            .await?;
             let response = match self
-                .request_provider(provider, request, &cancellation, sink)
+                .request_provider(
+                    provider,
+                    request,
+                    &cancellation,
+                    sink,
+                    Some(ProviderMessageLifecycle {
+                        session_id: &session_id,
+                        message_id: &assistant_message_id,
+                    }),
+                )
                 .await
             {
                 Ok(response) => response,
@@ -2481,16 +2681,6 @@ impl AgentRuntime {
             usage
                 .record_turn(response.message.usage)
                 .map_err(|error| MimirError::BudgetPaused(error.pause(usage.snapshot())))?;
-            let assistant_message_id = uuid::Uuid::new_v4().to_string();
-            self.dispatch_extension_event(
-                LifecycleEvent::MessageStart {
-                    session_id: session_id.clone(),
-                    message_id: assistant_message_id.clone(),
-                    role: "assistant".into(),
-                },
-                sink,
-            )
-            .await?;
             let assistant_message = self
                 .dispatch_extension_message_end(
                     &session_id,
@@ -2744,6 +2934,15 @@ impl AgentRuntime {
                     observation: observation.clone(),
                 })
                 .await;
+                self.dispatch_extension_event(
+                    LifecycleEvent::ToolExecutionUpdate {
+                        session_id: session_id.clone(),
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                    },
+                    sink,
+                )
+                .await?;
                 let tool_result = Message::tool_result(
                     &extension_result.tool_call_id,
                     &extension_result.tool_name,
@@ -2958,6 +3157,47 @@ impl AgentRuntime {
         Ok(collected)
     }
 
+    async fn start_extension_session_with_sink(
+        &self,
+        reason: SessionStartReason,
+        previous_session_file: Option<String>,
+        sink: &dyn EventSink,
+    ) -> Result<()> {
+        let session_id = self.extension_session_id.read().await.clone();
+        if session_id.is_empty() || self.extension_session_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .dispatch_extension_event(
+                LifecycleEvent::SessionStart {
+                    session_id,
+                    reason,
+                    previous_session_file,
+                },
+                sink,
+            )
+            .await
+        {
+            self.extension_session_started
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn publish_extension_ui_events(&self, sink: &VecEventSink) -> Result<()> {
+        for event in sink.events().await {
+            if let RuntimeEvent::ExtensionUi { extension, request } = event {
+                self.publish_session_event(serde_json::json!({
+                    "type": "extension_ui_request",
+                    "extension": extension,
+                    "request": request,
+                }))?;
+            }
+        }
+        Ok(())
+    }
+
     async fn dispatch_extension_message_end(
         &self,
         session_id: &str,
@@ -3125,6 +3365,16 @@ impl AgentRuntime {
         let summary = summarize(&messages[..split]);
         let retained = messages[split..].to_vec();
         drop(messages);
+        let session_id = self.extension_session_id.read().await.clone();
+        if self
+            .dispatch_extension_lifecycle(LifecycleEvent::SessionBeforeCompact {
+                session_id: session_id.clone(),
+                context_tokens: tokens_before,
+            })
+            .await?
+        {
+            return Ok(());
+        }
         let loaded = self.store.load().await?;
         let first_retained = retained.first().ok_or_else(|| {
             MimirError::Protocol("automatic compaction retained an empty suffix".into())
@@ -3156,6 +3406,8 @@ impl AgentRuntime {
                 "summary": "automatic context compaction"
             }
         }))?;
+        self.dispatch_extension_lifecycle(LifecycleEvent::SessionCompact { session_id })
+            .await?;
         Ok(())
     }
 
@@ -3169,6 +3421,7 @@ impl AgentRuntime {
         request: ModelRequest,
         cancellation: &CancellationToken,
         sink: &dyn EventSink,
+        message_lifecycle: Option<ProviderMessageLifecycle<'_>>,
     ) -> Result<crate::model::ModelResponse> {
         let _retry_state = RetryStateGuard {
             retrying: &self.retrying,
@@ -3189,6 +3442,9 @@ impl AgentRuntime {
             let provider_sink = RuntimeProviderSink {
                 sink,
                 emitted: &emitted,
+                runtime: self,
+                message_lifecycle,
+                lifecycle_error: Mutex::new(None),
             };
             let outcome = tokio::select! {
                 biased;
@@ -3212,6 +3468,9 @@ impl AgentRuntime {
                     }),
                 }
             };
+            if let Some(error) = provider_sink.lifecycle_error.lock().await.take() {
+                return Err(error);
+            }
             match outcome {
                 Ok(response) => {
                     if attempt > 0 {

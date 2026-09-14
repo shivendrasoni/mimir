@@ -72,6 +72,7 @@ Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the 
 - [Providers and authentication](docs/PROVIDERS.md) — login, OAuth, API keys, and provider behavior
 - [RLM and continual harness](docs/RLM.md) — child agents, refinement, learning, and rollback
 - [Operations](docs/OPERATIONS.md) — state, sessions, daemon, goals, schedules, and extensions
+- [Extensions and lifecycle hooks](docs/EXTENSIONS.md) — hook reference, interception rules, installation, and examples
 - [Diagnostics](docs/DIAGNOSTICS.md) — privacy-safe run evidence, querying, annotation, and replay
 - [Reliability](docs/RELIABILITY.md) — invariants, failures, fault injection, and release gates
 - [Architecture](ARCHITECTURE.md) — runtime flow, modules, persistence, and extension points

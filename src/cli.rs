@@ -44,7 +44,8 @@ use crate::{
         ExtensionManifest, ExtensionPackageManager, FlagKind, HostLimits, HostRequest,
         JsonLineExtensionHost, ManifestSource, ResourceDiscoveryReason, RlmChildRuntimePolicy,
         RlmChildToolRegistryFactory, RlmExecutionRequest, RlmLimits, RlmModel, RlmProviderFactory,
-        RlmRuntime, RlmRuntimeLimits, RlmStore, RuntimeLimits,
+        RlmRuntime, RlmRuntimeLimits, RlmStore, RuntimeLimits, SessionForkPosition,
+        SessionStartReason, SessionSwitchReason,
     },
     learning::{self, LearningMode},
     mcp::{
@@ -5604,10 +5605,37 @@ impl PromptHandler for RuntimePromptHandler {
         active_session_id: &str,
         durable_session_id: &str,
     ) -> std::result::Result<bool, DaemonError> {
-        if let Some(runtime) = self.runtimes.lock().await.get(active_session_id).cloned() {
+        let previous_runtime = self.runtimes.lock().await.get(active_session_id).cloned();
+        if let Some(runtime) = &previous_runtime {
             runtime.wait_for_idle().await;
         }
         let runtime = build_runtime_for_session(&self.build, durable_session_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        let previous_session = self
+            .durable_bindings
+            .lock()
+            .await
+            .get(active_session_id)
+            .cloned()
+            .unwrap_or_else(|| active_session_id.to_owned());
+        if let Some(previous_runtime) = previous_runtime {
+            previous_runtime
+                .shutdown_extension_session("session_rebind")
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        }
+        runtime
+            .start_extension_session(
+                SessionStartReason::Resume,
+                Some(
+                    self.state_root
+                        .join("sessions")
+                        .join(format!("{previous_session}.jsonl"))
+                        .display()
+                        .to_string(),
+                ),
+            )
             .await
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
         self.runtimes
@@ -5646,6 +5674,10 @@ impl PromptHandler for RuntimePromptHandler {
     async fn close_session(&self, session_id: &str) -> std::result::Result<bool, DaemonError> {
         let runtime = self.runtimes.lock().await.remove(session_id);
         if let Some(runtime) = runtime {
+            runtime
+                .shutdown_extension_session("session_close")
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
             runtime.cancel();
             runtime.clear_steering().await;
         }
@@ -5663,6 +5695,63 @@ impl PromptHandler for RuntimePromptHandler {
             runner.abort();
         }
         Ok(true)
+    }
+
+    async fn before_session_switch(
+        &self,
+        session_id: &str,
+        reason: SessionSwitchReason,
+        target_session_file: Option<String>,
+    ) -> std::result::Result<bool, DaemonError> {
+        self.runtime(session_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            .before_session_switch(reason, target_session_file)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        Ok(false)
+    }
+
+    async fn before_session_fork(
+        &self,
+        session_id: &str,
+        entry_id: &str,
+        position: SessionForkPosition,
+    ) -> std::result::Result<bool, DaemonError> {
+        self.runtime(session_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            .before_session_fork(entry_id, position)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        Ok(false)
+    }
+
+    async fn before_session_tree(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> std::result::Result<bool, DaemonError> {
+        self.runtime(session_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            .before_session_tree(target_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        Ok(false)
+    }
+
+    async fn complete_session_tree(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> std::result::Result<(), DaemonError> {
+        self.runtime(session_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))?
+            .complete_session_tree(target_id)
+            .await
+            .map_err(|error| DaemonError::Protocol(error.to_string()))
     }
 
     async fn handle_session_control(
@@ -9963,6 +10052,19 @@ async fn clone_legacy_session(context: &mut RpcSessionContext) -> Result<()> {
     let records = source.load().await?.records;
     let session_id = format!("session-{}", Uuid::new_v4().simple());
     let state = resolve_state_dir(&context.build.state_dir)?;
+    context
+        .runtime
+        .before_session_switch(
+            SessionSwitchReason::New,
+            Some(
+                state
+                    .join("sessions")
+                    .join(format!("{session_id}.jsonl"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
     let destination = FileSessionStore::create(&state, &session_id).await?;
     for record in records {
         destination.append(record).await?;
@@ -9973,7 +10075,16 @@ async fn clone_legacy_session(context: &mut RpcSessionContext) -> Result<()> {
             detail: context.session_id.clone(),
         }))
         .await?;
-    context.runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    let previous_session_file = source.path().display().to_string();
+    let next_runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    context
+        .runtime
+        .shutdown_extension_session("session_clone")
+        .await?;
+    next_runtime
+        .start_extension_session(SessionStartReason::Fork, Some(previous_session_file))
+        .await?;
+    context.runtime = next_runtime;
     context.session_id = session_id;
     Ok(())
 }
@@ -9997,6 +10108,10 @@ async fn fork_legacy_session(context: &mut RpcSessionContext, entry_id: &str) ->
             ));
         }
     };
+    context
+        .runtime
+        .before_session_fork(&entry_id.to_string(), SessionForkPosition::Before)
+        .await?;
     let session_id = format!("session-{}", Uuid::new_v4().simple());
     let state = resolve_state_dir(&context.build.state_dir)?;
     let destination = FileSessionStore::create(&state, &session_id).await?;
@@ -10009,14 +10124,50 @@ async fn fork_legacy_session(context: &mut RpcSessionContext, entry_id: &str) ->
             detail: format!("{}:{entry_id}", context.session_id),
         }))
         .await?;
-    context.runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    let previous_session_file = source.path().display().to_string();
+    let next_runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    context
+        .runtime
+        .shutdown_extension_session("session_fork")
+        .await?;
+    next_runtime
+        .start_extension_session(SessionStartReason::Fork, Some(previous_session_file))
+        .await?;
+    context.runtime = next_runtime;
     context.session_id = session_id;
     Ok(selected_text)
 }
 
 async fn new_legacy_session(context: &mut RpcSessionContext, parent: Option<&str>) -> Result<()> {
     let session_id = format!("session-{}", Uuid::new_v4().simple());
-    context.runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    let state = resolve_state_dir(&context.build.state_dir)?;
+    context
+        .runtime
+        .before_session_switch(
+            SessionSwitchReason::New,
+            Some(
+                state
+                    .join("sessions")
+                    .join(format!("{session_id}.jsonl"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await?;
+    let previous_session_file = current_session_store(context)
+        .await?
+        .path()
+        .display()
+        .to_string();
+    let next_runtime = build_runtime_for_session(&context.build, &session_id).await?;
+    context
+        .runtime
+        .shutdown_extension_session("new_session")
+        .await?;
+    next_runtime
+        .start_extension_session(SessionStartReason::New, Some(previous_session_file))
+        .await?;
+    context.runtime = next_runtime;
     context.session_id = session_id;
     current_session_store(context)
         .await?
@@ -10040,7 +10191,27 @@ async fn switch_legacy_session(context: &mut RpcSessionContext, path: &str) -> R
             "session does not exist: {session_id}"
         )));
     }
-    context.runtime = build_runtime_for_session(&context.build, session_id).await?;
+    let next_runtime = build_runtime_for_session(&context.build, session_id).await?;
+    context
+        .runtime
+        .before_session_switch(
+            SessionSwitchReason::Resume,
+            Some(store.path().display().to_string()),
+        )
+        .await?;
+    let previous_session_file = current_session_store(context)
+        .await?
+        .path()
+        .display()
+        .to_string();
+    context
+        .runtime
+        .shutdown_extension_session("session_switch")
+        .await?;
+    next_runtime
+        .start_extension_session(SessionStartReason::Resume, Some(previous_session_file))
+        .await?;
+    context.runtime = next_runtime;
     context.session_id = session_id.into();
     Ok(())
 }

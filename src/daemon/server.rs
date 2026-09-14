@@ -43,6 +43,13 @@ const AGENT_MESSAGE_RATE_CAPACITY: usize = 3;
 const AGENT_MESSAGE_RATE_REFILL_MS: u64 = 1_000;
 const RECONNECT_CAPABILITIES: [&str; 2] = ["attach_snapshot", "event_sequence"];
 
+use crate::{
+    extensions::{SessionForkPosition, SessionSwitchReason},
+    model::{Content, Message, Role},
+    orchestration::{HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule, ScheduleSource},
+    runtime::RuntimeEvent,
+    runtime_events::RuntimeEventEnvelope,
+};
 #[cfg(unix)]
 use crate::{
     model::StopReason,
@@ -50,12 +57,6 @@ use crate::{
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     session_compat::import_jsonl,
     session_tree::SessionBranchCatalog,
-};
-use crate::{
-    model::{Content, Message, Role},
-    orchestration::{HeartbeatDeliveryMode, HeartbeatManagementAction, Schedule, ScheduleSource},
-    runtime::RuntimeEvent,
-    runtime_events::RuntimeEventEnvelope,
 };
 
 #[cfg(unix)]
@@ -220,6 +221,40 @@ pub trait PromptHandler: Send + Sync {
 
     async fn close_session(&self, _session_id: &str) -> Result<bool, DaemonError> {
         Ok(false)
+    }
+
+    async fn before_session_switch(
+        &self,
+        _session_id: &str,
+        _reason: SessionSwitchReason,
+        _target_session_file: Option<String>,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    async fn before_session_fork(
+        &self,
+        _session_id: &str,
+        _entry_id: &str,
+        _position: SessionForkPosition,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    async fn before_session_tree(
+        &self,
+        _session_id: &str,
+        _target_id: &str,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+
+    async fn complete_session_tree(
+        &self,
+        _session_id: &str,
+        _target_id: &str,
+    ) -> Result<(), DaemonError> {
+        Ok(())
     }
 
     async fn handle_session_control(
@@ -1563,6 +1598,56 @@ impl ServerCore {
             | "export_jsonl"
             | "set_session_entry_label" => {
                 let session_id = required_string(command, "activeSessionId")?;
+                let blocked = match command_name {
+                    "new_session" => {
+                        self.handler
+                            .before_session_switch(session_id, SessionSwitchReason::New, None)
+                            .await?
+                    }
+                    "switch_session" | "import_jsonl" => {
+                        let field = if command_name == "switch_session" {
+                            "sessionPath"
+                        } else {
+                            "inputPath"
+                        };
+                        self.handler
+                            .before_session_switch(
+                                session_id,
+                                SessionSwitchReason::Resume,
+                                optional_string(command, field)?,
+                            )
+                            .await?
+                    }
+                    "fork" => {
+                        let position = match optional_string(command, "position")?.as_deref() {
+                            None | Some("before") => SessionForkPosition::Before,
+                            Some("at") => SessionForkPosition::At,
+                            Some(_) => {
+                                return Err(DaemonError::Protocol(
+                                    "position must be before or at".into(),
+                                ));
+                            }
+                        };
+                        self.handler
+                            .before_session_fork(
+                                session_id,
+                                required_string(command, "entryId")?,
+                                position,
+                            )
+                            .await?
+                    }
+                    "navigate_tree" => {
+                        self.handler
+                            .before_session_tree(session_id, required_string(command, "targetId")?)
+                            .await?
+                    }
+                    _ => false,
+                };
+                if blocked {
+                    return Err(DaemonError::Protocol(format!(
+                        "{command_name} was blocked by an extension"
+                    )));
+                }
                 let bound_command = self
                     .public_bound_session_command(client_id, command)
                     .await?;
@@ -1593,6 +1678,11 @@ impl ServerCore {
                         ))
                     })?
                 };
+                if command_name == "navigate_tree" {
+                    self.handler
+                        .complete_session_tree(session_id, required_string(command, "targetId")?)
+                        .await?;
+                }
                 if matches!(
                     command_name,
                     "new_session" | "switch_session" | "import_jsonl" | "fork" | "navigate_tree"

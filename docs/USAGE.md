@@ -50,24 +50,21 @@ Referenced paths are validated against the workspace and are made explicit to th
 
 ## TypeSafe skill selection
 
-TypeSafe integration is off by default. Shadow mode sends the current text request and bounded skill names/descriptions to Jev, then records its typed recommendation without changing Mimir's behavior:
+TypeSafe is one cohesive configuration and is off by default. Turn it on to send the current text request and bounded skill names/descriptions to Jev. A confident recommendation loads the selected skill; uncertainty, invalid output, timeout, configuration, activation, or service failure falls back to the existing `search_skills` workflow.
 
 ```bash
-TYPESAFE_API_KEY=... mimir --typesafe-skill-selection shadow
+TYPESAFE_API_KEY=... mimir --typesafe on
 ```
 
-Assist mode uses the same request, but only for a stable 10% sample of eligible turns by default. It loads the recommended skill only when applicability is at least 0.60 and Choice confidence is at least 0.50. Every uncertain, invalid, timed-out, unsampled, or failed request falls back to the existing `search_skills` workflow.
+There are only two states: `on` and `off`. There is no shadow mode, assist mode, or rollout-percentage flag. An explicit `/skill:<name>` invocation still wins and skips automatic selection.
 
 ```bash
-TYPESAFE_API_KEY=... mimir --typesafe-skill-selection assist
-
-# Controlled test or a different rollout share
-mimir --typesafe-skill-selection assist --typesafe-assist-rollout-percent 25
+mimir --typesafe off
 ```
 
-Set `--typesafe-skill-selection off` for the immediate off switch. `MIMIR_TYPESAFE_SKILL_SELECTION`, `MIMIR_TYPESAFE_MODEL`, `MIMIR_TYPESAFE_TIMEOUT_MS`, and `MIMIR_TYPESAFE_ASSIST_ROLLOUT_PERCENT` provide environment equivalents.
+`MIMIR_TYPESAFE=on|off` is the environment equivalent. Model, timeout, and feature-specific policy live inside one `TypeSafeConfig`; they are intentionally not separate CLI flags, so future TypeSafe capabilities do not add unrelated top-level runtime fields.
 
-Selection diagnostics persist the mode, outcome, ranked probabilities, token usage, estimated TypeSafe cost, latency, rollout bucket, request byte count, and request SHA-256—not the request text or API key. Outcome events record task completion, and a later model-driven activation of a different skill records a correction. The original request is still sent to TypeSafe in shadow or assist mode, so enable either mode only where that data transfer is acceptable.
+Selection diagnostics persist the state, outcome, ranked probabilities, token usage, estimated TypeSafe cost, latency, request byte count, and request SHA-256—not the request text or API key. Outcome events record task completion, and a later model-driven activation of a different skill records a correction. The original request is sent to TypeSafe when the integration is on, so enable it only where that data transfer is acceptable.
 
 ## Process execution
 

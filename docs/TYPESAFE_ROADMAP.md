@@ -1,6 +1,6 @@
 # TypeSafe in Mimir: Lean Roadmap
 
-Status: proposed
+Status: implemented through Phase 3; runtime activation simplified to `off | on`
 
 ## The first bet
 
@@ -20,7 +20,7 @@ bet produces measured value.
 ## Rules
 
 1. Rust code owns policy, permissions, execution, and fallbacks.
-2. Start in `shadow` mode; TypeSafe failure must not block a turn.
+2. Validate with an offline shadow replay before enabling runtime behavior; TypeSafe failure must not block a turn.
 3. Measure total cost and latency, including the Jev request.
 4. Redact secrets and unnecessary user content from diagnostics.
 5. Add a reusable abstraction only when a second proven use case needs it.
@@ -42,8 +42,8 @@ problem.
 
 1. At the existing skill-selection boundary, ask Jev to rank the available skill
    summaries and judge whether any skill applies.
-2. Add only a small HTTP client, configuration, `off | shadow` mode, fallback,
-   and privacy-safe diagnostics.
+2. Add only a small HTTP client, a cohesive TypeSafe configuration, fallback,
+   and privacy-safe diagnostics. Keep the replay outside the runtime activation contract.
 3. Replay the Phase 0 set and compare selection errors, needless suggestions,
    task success, net cost, and latency.
 
@@ -56,13 +56,15 @@ meaningful quality regression.
 **Deliverable:** evidence for or against the hypothesis, with no user-visible
 behavior change.
 
-## Phase 2 — Controlled assisted rollout
+## Phase 2 — Explicit activation
 
-1. Add `assist` mode so the Jev result can prioritize or load a skill.
+1. Add one explicit TypeSafe switch: `off | on`. When on, a confident Jev result
+   can prioritize or load a skill.
 2. Fall back to current behavior on uncertainty, invalid output, timeout, or
    service failure.
-3. Roll out to a small share of eligible turns and monitor task success,
-   corrections, token use, latency, and total cost. Keep an immediate off switch.
+3. Monitor task success, corrections, token use, latency, and total cost. Keep
+   `off` as the immediate rollback; rollout percentages are deployment policy,
+   not a Mimir runtime flag.
 
 **Gate:** retain the capability only if it sustains equal or better task success,
 fewer wrong and needless loads, and positive net savings.
@@ -78,8 +80,8 @@ Only after Phase 2 succeeds, use measured Mimir data to select one:
 2. **Tool or MCP shortlisting** if tool context or wrong-tool calls are costly.
 3. **Completion verification** if false completion is a frequent quality problem.
 
-The selected bet repeats the same cycle: baseline, shadow test, explicit gate,
-assisted rollout, and rollback. If the data supports none, stop expanding.
+The selected bet repeats the same cycle: baseline, offline shadow test, explicit
+gate, activation, and rollback. If the data supports none, stop expanding.
 
 ## Deferred—not committed
 

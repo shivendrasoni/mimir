@@ -10,7 +10,7 @@ use mimir::{
     skills::SkillRuntime,
     tools::{ToolPolicy, ToolRegistry},
     tui::{Action, App, AppConfig},
-    typesafe::{TypeSafeSkillConfig, TypeSafeSkillMode, TypeSafeSkillSelector},
+    typesafe::{TypeSafeConfig, TypeSafeMode, TypeSafeSkillSelector},
 };
 use tempfile::TempDir;
 use typesafe_client::fake::FakeSystemOne;
@@ -154,7 +154,7 @@ async fn model_can_discover_then_ephemerally_activate_a_skill() {
 }
 
 #[tokio::test]
-async fn assist_mode_loads_a_confident_sampled_skill_and_records_redacted_outcomes() {
+async fn typesafe_on_loads_a_confident_skill_and_records_redacted_outcomes() {
     let workspace = TempDir::new().expect("workspace");
     write_skill(
         workspace.path(),
@@ -179,10 +179,9 @@ async fn assist_mode_loads_a_confident_sampled_skill_and_records_redacted_outcom
     );
     runtime
         .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
-            TypeSafeSkillConfig {
-                mode: TypeSafeSkillMode::Assist,
-                assist_rollout_percent: 100,
-                ..TypeSafeSkillConfig::default()
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
             },
             typesafe,
         ))
@@ -222,7 +221,7 @@ async fn assist_mode_loads_a_confident_sampled_skill_and_records_redacted_outcom
     assert!(
         diagnostics
             .iter()
-            .any(|detail| detail.contains("assist_activated"))
+            .any(|detail| detail.contains("\"decision\":\"activated\""))
     );
     assert!(
         diagnostics

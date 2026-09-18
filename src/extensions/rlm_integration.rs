@@ -293,7 +293,7 @@ impl RlmChildExecutor for AgentRuntimeChildExecutor {
                     budget,
                     provider_aware_token_budget: false,
                     provider_timeout: self.policy.provider_timeout,
-                    typesafe_skill_selection: crate::typesafe::TypeSafeSkillConfig::default(),
+                    typesafe: crate::typesafe::TypeSafeConfig::default(),
                 },
             )
             .await?,

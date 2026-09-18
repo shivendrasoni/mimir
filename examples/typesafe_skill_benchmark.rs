@@ -9,7 +9,7 @@ use std::{env, fs, path::PathBuf, process::ExitCode, time::Duration};
 use mimir::{
     skill_evaluation::{CaseResult, EvaluationSummary, SelectionOutcome, SkillEvaluationDataset},
     typesafe::{
-        TypeSafeRecommendationStatus, TypeSafeSkill, TypeSafeSkillConfig, TypeSafeSkillMode,
+        TypeSafeConfig, TypeSafeMode, TypeSafeRecommendationStatus, TypeSafeSkill,
         TypeSafeSkillSelector,
     },
 };
@@ -58,10 +58,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 async fn evaluate_jev(
     dataset: &SkillEvaluationDataset,
 ) -> Result<EvaluationSummary, Box<dyn std::error::Error>> {
-    let selector = TypeSafeSkillSelector::from_env(TypeSafeSkillConfig {
-        mode: TypeSafeSkillMode::Shadow,
+    let selector = TypeSafeSkillSelector::from_env(TypeSafeConfig {
+        mode: TypeSafeMode::On,
         timeout: Duration::from_secs(2),
-        ..TypeSafeSkillConfig::default()
+        ..TypeSafeConfig::default()
     });
     let skills = dataset
         .skills

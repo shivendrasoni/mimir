@@ -90,7 +90,7 @@ use crate::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
         load_tui_agent_mode, load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
     },
-    typesafe::{TypeSafeSkillConfig, TypeSafeSkillMode},
+    typesafe::{TypeSafeConfig, TypeSafeMode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -133,18 +133,16 @@ enum AgentModeArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum TypeSafeSkillModeArg {
+enum TypeSafeModeArg {
     Off,
-    Shadow,
-    Assist,
+    On,
 }
 
-impl From<TypeSafeSkillModeArg> for TypeSafeSkillMode {
-    fn from(value: TypeSafeSkillModeArg) -> Self {
+impl From<TypeSafeModeArg> for TypeSafeMode {
+    fn from(value: TypeSafeModeArg) -> Self {
         match value {
-            TypeSafeSkillModeArg::Off => Self::Off,
-            TypeSafeSkillModeArg::Shadow => Self::Shadow,
-            TypeSafeSkillModeArg::Assist => Self::Assist,
+            TypeSafeModeArg::Off => Self::Off,
+            TypeSafeModeArg::On => Self::On,
         }
     }
 }
@@ -248,29 +246,12 @@ pub struct Cli {
     no_skills: bool,
     #[arg(
         long,
-        env = "MIMIR_TYPESAFE_SKILL_SELECTION",
+        env = "MIMIR_TYPESAFE",
         value_enum,
         default_value = "off",
-        help = "TypeSafe skill selection: off, privacy-safe shadow diagnostics, or controlled assist"
+        help = "Enable or disable TypeSafe-backed features"
     )]
-    typesafe_skill_selection: TypeSafeSkillModeArg,
-    #[arg(long, env = "MIMIR_TYPESAFE_MODEL", default_value = "jev-latest")]
-    typesafe_model: String,
-    #[arg(
-        long,
-        env = "MIMIR_TYPESAFE_TIMEOUT_MS",
-        default_value_t = 2_000,
-        value_parser = parse_positive_u64
-    )]
-    typesafe_timeout_ms: u64,
-    #[arg(
-        long,
-        env = "MIMIR_TYPESAFE_ASSIST_ROLLOUT_PERCENT",
-        default_value_t = 10,
-        value_parser = parse_percentage,
-        help = "Stable percentage of eligible turns that assist mode may change"
-    )]
-    typesafe_assist_rollout_percent: u8,
+    typesafe: TypeSafeModeArg,
     #[arg(long)]
     no_prompt_templates: bool,
     #[arg(long)]
@@ -415,10 +396,7 @@ struct RuntimeBuildConfig {
     no_extensions: bool,
     no_context_files: bool,
     no_skills: bool,
-    typesafe_skill_selection: TypeSafeSkillMode,
-    typesafe_model: String,
-    typesafe_timeout_ms: u64,
-    typesafe_assist_rollout_percent: u8,
+    typesafe: TypeSafeConfig,
     no_prompt_templates: bool,
     no_themes: bool,
     skill_paths: Vec<PathBuf>,
@@ -469,10 +447,10 @@ impl RuntimeBuildConfig {
             no_extensions: cli.no_extensions,
             no_context_files: cli.no_context_files,
             no_skills: cli.no_skills,
-            typesafe_skill_selection: cli.typesafe_skill_selection.into(),
-            typesafe_model: cli.typesafe_model.clone(),
-            typesafe_timeout_ms: cli.typesafe_timeout_ms,
-            typesafe_assist_rollout_percent: cli.typesafe_assist_rollout_percent,
+            typesafe: TypeSafeConfig {
+                mode: cli.typesafe.into(),
+                ..TypeSafeConfig::default()
+            },
             no_prompt_templates: cli.no_prompt_templates,
             no_themes: cli.no_themes,
             skill_paths: cli.skill.clone(),
@@ -515,15 +493,6 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     (parsed > 0)
         .then_some(parsed)
         .ok_or_else(|| "must be a positive integer".to_owned())
-}
-
-fn parse_percentage(value: &str) -> std::result::Result<u8, String> {
-    let parsed = value
-        .parse::<u8>()
-        .map_err(|_| "must be an integer from 0 to 100".to_owned())?;
-    (parsed <= 100)
-        .then_some(parsed)
-        .ok_or_else(|| "must be an integer from 0 to 100".to_owned())
 }
 
 fn parse_u32_limit(value: &str) -> std::result::Result<LimitValue<u32>, String> {
@@ -1601,9 +1570,18 @@ fn validate_run_options(cli: &Cli) -> Result<()> {
             "--goal requires a non-empty objective".into(),
         ));
     }
-    if cli.typesafe_model.trim().is_empty() {
+    if cli.prompt_segments.iter().any(|segment| {
+        matches!(
+            segment.as_str(),
+            "--typesafe-skill-selection"
+                | "--typesafe-assist-rollout-percent"
+                | "--typesafe-model"
+                | "--typesafe-timeout-ms"
+        )
+    }) {
         return Err(MimirError::Configuration(
-            "--typesafe-model must not be blank".into(),
+            "legacy TypeSafe feature flags were removed; use --typesafe on or --typesafe off"
+                .into(),
         ));
     }
     if cli.goal.is_some()
@@ -7704,13 +7682,7 @@ async fn build_runtime_for_session(
         LimitValue::resolve,
     );
     config.provider_aware_token_budget = build.max_run_tokens.is_none();
-    config.typesafe_skill_selection = TypeSafeSkillConfig {
-        mode: build.typesafe_skill_selection,
-        model: build.typesafe_model.clone(),
-        timeout: Duration::from_millis(build.typesafe_timeout_ms),
-        assist_rollout_percent: build.typesafe_assist_rollout_percent,
-        ..TypeSafeSkillConfig::default()
-    };
+    config.typesafe.clone_from(&build.typesafe);
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -10378,52 +10350,29 @@ mod tui_model_selection_tests {
     }
 
     #[test]
-    fn typesafe_skill_selection_is_off_by_default_and_shadow_is_explicit() {
+    fn typesafe_is_off_by_default_and_has_one_on_switch() {
         let defaults =
             RuntimeBuildConfig::from_cli(&Cli::try_parse_from(["mimir"]).expect("defaults"));
+        assert_eq!(defaults.typesafe.mode, crate::typesafe::TypeSafeMode::Off);
         assert_eq!(
-            defaults.typesafe_skill_selection,
-            crate::typesafe::TypeSafeSkillMode::Off
+            defaults.typesafe.timeout,
+            std::time::Duration::from_millis(2_000)
         );
-        assert_eq!(defaults.typesafe_timeout_ms, 2_000);
-        assert_eq!(defaults.typesafe_model, "jev-latest");
-        assert_eq!(defaults.typesafe_assist_rollout_percent, 10);
+        assert_eq!(defaults.typesafe.model, "jev-latest");
 
-        let shadow = Cli::try_parse_from([
-            "mimir",
-            "--typesafe-skill-selection",
-            "shadow",
-            "--typesafe-timeout-ms",
-            "1500",
-            "--typesafe-model",
-            "jev-test",
-        ])
-        .expect("shadow options");
-        let shadow = RuntimeBuildConfig::from_cli(&shadow);
+        let enabled = Cli::try_parse_from(["mimir", "--typesafe", "on"]).expect("TypeSafe option");
+        let enabled = RuntimeBuildConfig::from_cli(&enabled);
+        assert_eq!(enabled.typesafe.mode, crate::typesafe::TypeSafeMode::On);
         assert_eq!(
-            shadow.typesafe_skill_selection,
-            crate::typesafe::TypeSafeSkillMode::Shadow
+            enabled.typesafe.timeout,
+            std::time::Duration::from_millis(2_000)
         );
-        assert_eq!(shadow.typesafe_timeout_ms, 1_500);
-        assert_eq!(shadow.typesafe_model, "jev-test");
+        assert_eq!(enabled.typesafe.model, "jev-latest");
 
-        let assist = Cli::try_parse_from([
-            "mimir",
-            "--typesafe-skill-selection",
-            "assist",
-            "--typesafe-assist-rollout-percent",
-            "25",
-        ])
-        .expect("assist options");
-        let assist = RuntimeBuildConfig::from_cli(&assist);
-        assert_eq!(
-            assist.typesafe_skill_selection,
-            crate::typesafe::TypeSafeSkillMode::Assist
-        );
-        assert_eq!(assist.typesafe_assist_rollout_percent, 25);
-        assert!(
-            Cli::try_parse_from(["mimir", "--typesafe-assist-rollout-percent", "101"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["mimir", "--typesafe", "shadow"]).is_err());
+        let legacy = Cli::try_parse_from(["mimir", "--typesafe-assist-rollout-percent", "25"])
+            .expect("legacy flag is parsed as a prompt segment");
+        assert!(validate_run_options(&legacy).is_err());
     }
 
     #[test]
@@ -10964,10 +10913,7 @@ mod tui_model_selection_tests {
             no_extensions: false,
             no_context_files: false,
             no_skills: false,
-            typesafe_skill_selection: crate::typesafe::TypeSafeSkillMode::Off,
-            typesafe_model: "jev-latest".into(),
-            typesafe_timeout_ms: 2_000,
-            typesafe_assist_rollout_percent: 10,
+            typesafe: crate::typesafe::TypeSafeConfig::default(),
             no_prompt_templates: false,
             no_themes: false,
             skill_paths: Vec::new(),

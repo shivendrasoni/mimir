@@ -11,9 +11,9 @@ Phase 2 therefore ships one controlled capability, but its production retention 
 ## What remains in scope
 
 - Keep TypeSafe limited to skill selection.
-- Keep the default mode `off` and the explicit assist rollout at 10% unless production evidence supports a change.
+- Keep TypeSafe `off` by default and expose only the explicit `on | off` activation contract.
 - Aggregate `typesafe_skill_selection`, `typesafe_skill_outcome`, and `typesafe_skill_correction` events across a comparable cohort.
-- Use `--typesafe-skill-selection off` as the immediate rollback if task success regresses, corrections rise materially, or net savings turn negative.
+- Use `--typesafe off` as the immediate rollback if task success regresses, corrections rise materially, or net savings turn negative.
 
 ## Evidence required before revisiting
 

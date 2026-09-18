@@ -1,24 +1,23 @@
-# Phase 2 controlled assisted rollout
+# Phase 2 explicit TypeSafe activation
 
 Status: implementation complete; production retention gate pending sustained real-turn telemetry.
 
 ## Capability
 
-Mimir now supports `off`, `shadow`, and `assist` skill-selection modes. The default remains `off`. Explicit `assist` mode:
+Mimir now exposes TypeSafe as one cohesive configuration with exactly two states: `off` and `on`. The default remains `off`. When explicitly turned on, Mimir:
 
-1. assigns each request a stable 0–99 bucket from its SHA-256 digest;
-2. calls Jev only when the bucket is inside the configured rollout percentage (10% by default);
-3. loads the recommended skill only when applicability is at least 0.60 and Choice confidence is at least 0.50; and
-4. falls back to the existing `search_skills` workflow on every unsampled, uncertain, invalid, timed-out, configuration, activation, or service failure.
+1. asks Jev to judge applicability and rank the bounded skill catalog;
+2. loads the recommended skill only when applicability is at least 0.60 and Choice confidence is at least 0.50; and
+3. falls back to the existing `search_skills` workflow on every uncertain, invalid, timed-out, configuration, activation, or service failure.
 
-An explicit `/skill:<name>` invocation always wins and skips automatic selection. The normal skill-search tool remains available after assisted activation, so the model can correct a recommendation.
+An explicit `/skill:<name>` invocation always wins and skips automatic selection. The normal skill-search tool remains available after TypeSafe activation, so the model can correct a recommendation.
 
 ## Monitoring contract
 
 Each evaluated turn emits a privacy-safe `typesafe_skill_selection` runtime event containing:
 
-- mode, decision, selected skill, top probabilities, and whether thresholds passed;
-- stable rollout bucket, request byte count, and request SHA-256;
+- state, decision, selected skill, top probabilities, and whether thresholds passed;
+- request byte count and request SHA-256;
 - TypeSafe model, input/output tokens, estimated cost, and end-to-end latency;
 - added skill-context tokens and a coarse activation/failure category.
 
@@ -27,22 +26,21 @@ The request text and API key are never copied into this diagnostic. A `typesafe_
 ## Controls and rollback
 
 ```bash
-# 10% controlled rollout
-mimir --typesafe-skill-selection assist
+# Enable TypeSafe
+mimir --typesafe on
 
 # Immediate off switch
-mimir --typesafe-skill-selection off
+mimir --typesafe off
 
 # Environment equivalents
-MIMIR_TYPESAFE_SKILL_SELECTION=assist
-MIMIR_TYPESAFE_ASSIST_ROLLOUT_PERCENT=10
+MIMIR_TYPESAFE=on
 ```
 
-Changing the rollout percentage does not reshuffle existing requests because sampling is deterministic. Setting it to `0` exercises assist configuration without sending TypeSafe requests or changing behavior.
+There is no runtime rollout-percentage control. If a deployment needs a staged rollout, it selects which processes receive `MIMIR_TYPESAFE=on`; Mimir's activation contract remains binary.
 
 ## Retention gate
 
-Do not make assist the default or expand TypeSafe to another use case until real-turn telemetry sustains all of the following against a comparable off/shadow cohort:
+Do not make TypeSafe the default or expand it to another use case until real-turn telemetry sustains all of the following against a comparable off cohort:
 
 - equal or better task completion;
 - fewer wrong and needless skill loads;

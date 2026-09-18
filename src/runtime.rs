@@ -33,7 +33,7 @@ use crate::{
         ClarifyingQuestion, ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry,
     },
     typesafe::{
-        TypeSafeRecommendationStatus, TypeSafeSkill, TypeSafeSkillConfig, TypeSafeSkillMode,
+        TypeSafeConfig, TypeSafeMode, TypeSafeRecommendationStatus, TypeSafeSkill,
         TypeSafeSkillSelector,
     },
 };
@@ -54,7 +54,7 @@ pub struct RuntimeConfig {
     /// Re-resolve the token ceiling from the active provider whenever its model changes.
     pub provider_aware_token_budget: bool,
     pub provider_timeout: Duration,
-    pub typesafe_skill_selection: TypeSafeSkillConfig,
+    pub typesafe: TypeSafeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +85,7 @@ impl RuntimeConfig {
             budget: Budget::default(),
             provider_aware_token_budget: false,
             provider_timeout: Duration::from_secs(15 * 60),
-            typesafe_skill_selection: TypeSafeSkillConfig::default(),
+            typesafe: TypeSafeConfig::default(),
         }
     }
 }
@@ -390,10 +390,9 @@ struct RuntimeSelection {
 
 #[derive(Debug, Clone)]
 struct PreparedTypeSafeSelection {
-    mode: &'static str,
     request_sha256: String,
     selected_skill: Option<String>,
-    assisted_skill: Option<String>,
+    activated_skill: Option<String>,
 }
 
 struct RunningFlag<'a>(&'a AtomicBool);
@@ -510,8 +509,7 @@ impl AgentRuntime {
         if config.provider_aware_token_budget {
             operational_budget.max_tokens = provider_default_token_limit(&config.provider);
         }
-        let typesafe_skill_selector =
-            TypeSafeSkillSelector::from_env(config.typesafe_skill_selection.clone());
+        let typesafe_skill_selector = TypeSafeSkillSelector::from_env(config.typesafe.clone());
         Ok(Self {
             selection: RwLock::new(RuntimeSelection {
                 provider,
@@ -2248,7 +2246,7 @@ impl AgentRuntime {
                 active_skill_context,
                 typesafe
                     .as_ref()
-                    .and_then(|selection| selection.assisted_skill.clone()),
+                    .and_then(|selection| selection.activated_skill.clone()),
                 &sink,
             )
             .await;
@@ -2288,7 +2286,7 @@ impl AgentRuntime {
                 active_skill_context,
                 typesafe
                     .as_ref()
-                    .and_then(|selection| selection.assisted_skill.clone()),
+                    .and_then(|selection| selection.activated_skill.clone()),
                 &sink,
             )
             .await;
@@ -2346,7 +2344,7 @@ impl AgentRuntime {
         &self,
         prompts: &[Message],
         mut active_skill_context: Option<String>,
-        assisted_skill: Option<String>,
+        typesafe_activated_skill: Option<String>,
         sink: &dyn EventSink,
     ) -> Result<String> {
         let cancellation = self
@@ -2909,13 +2907,13 @@ impl AgentRuntime {
                     match activation {
                         Ok(activated) => {
                             if activated
-                                && assisted_skill
+                                && typesafe_activated_skill
                                     .as_deref()
-                                    .is_some_and(|assisted| assisted != name)
+                                    .is_some_and(|activated| activated != name)
                             {
                                 let detail = serde_json::json!({
                                     "type": "typesafe_skill_correction",
-                                    "assisted_skill": assisted_skill,
+                                    "activated_skill": typesafe_activated_skill,
                                     "corrected_skill": name,
                                 });
                                 if let Ok(detail) = serde_json::to_string(&detail) {
@@ -3188,7 +3186,7 @@ impl AgentRuntime {
         explicit_skill: bool,
     ) -> Option<PreparedTypeSafeSelection> {
         let selector = self.typesafe_skill_selector.read().await.clone();
-        if explicit_skill || selector.mode() == TypeSafeSkillMode::Off {
+        if explicit_skill || selector.mode() == TypeSafeMode::Off {
             return None;
         }
         let request = messages
@@ -3212,10 +3210,9 @@ impl AgentRuntime {
         let recommendation = selector.recommend(&request, &skills).await;
         let selected_skill = recommendation.selected_skill.clone();
         let context_before = active_skill_context.as_ref().map_or(0, String::len);
-        let mut assisted_skill = None;
+        let mut activated_skill = None;
         let mut activation_error = None;
-        if selector.mode() == TypeSafeSkillMode::Assist
-            && recommendation.status == TypeSafeRecommendationStatus::Success
+        if recommendation.status == TypeSafeRecommendationStatus::Success
             && recommendation.meets_thresholds
             && let Some(name) = selected_skill.as_deref()
         {
@@ -3225,7 +3222,7 @@ impl AgentRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .activate(active_skill_context, name)
             {
-                Ok(true) => assisted_skill = Some(name.to_owned()),
+                Ok(true) => activated_skill = Some(name.to_owned()),
                 Ok(false) => {}
                 Err(_) => activation_error = Some("skill_activation"),
             }
@@ -3235,16 +3232,14 @@ impl AgentRuntime {
             .map_or(0, String::len)
             .saturating_sub(context_before)
             .div_ceil(4);
-        let decision = if assisted_skill.is_some() {
-            "assist_activated"
+        let decision = if activated_skill.is_some() {
+            "activated"
         } else if recommendation.status == TypeSafeRecommendationStatus::Success
             && !recommendation.meets_thresholds
         {
             "fallback_uncertain"
-        } else if recommendation.error_kind == Some("rollout_not_sampled") {
-            "fallback_not_sampled"
         } else if recommendation.status == TypeSafeRecommendationStatus::Success {
-            "shadow_recommendation"
+            "no_activation"
         } else {
             "fallback_unavailable"
         };
@@ -3260,10 +3255,9 @@ impl AgentRuntime {
                 .await;
         }
         Some(PreparedTypeSafeSelection {
-            mode: selector.mode().as_str(),
             request_sha256: recommendation.request_sha256,
             selected_skill,
-            assisted_skill,
+            activated_skill,
         })
     }
 
@@ -3277,10 +3271,9 @@ impl AgentRuntime {
         };
         let detail = serde_json::json!({
             "type": "typesafe_skill_outcome",
-            "mode": selection.mode,
             "request_sha256": selection.request_sha256,
             "selected_skill": selection.selected_skill,
-            "assisted_skill": selection.assisted_skill,
+            "activated_skill": selection.activated_skill,
             "task_succeeded": task_succeeded,
         });
         if let Ok(detail) = serde_json::to_string(&detail) {

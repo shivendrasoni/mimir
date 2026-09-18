@@ -2,6 +2,11 @@
     missing_docs,
     reason = "public only so the repository benchmark example can reuse the measured fixtures"
 )]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::format_push_string,
+    reason = "the checked benchmark corpus is tiny and report formatting is off the runtime path"
+)]
 
 use std::time::Instant;
 
@@ -49,6 +54,10 @@ pub struct CaseResult {
     pub outcome: SelectionOutcome,
     pub context_tokens: u64,
     pub latency_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applicable_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +115,8 @@ impl SkillEvaluationDataset {
                 selected_skill: selected,
                 context_tokens,
                 latency_micros: u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                applicable_probability: None,
+                choice_confidence: None,
             });
         }
         EvaluationSummary::from_results(&self.name, results, 0, 0)

@@ -33,5 +33,6 @@ pub mod skill_evaluation;
 pub mod skills;
 pub mod tools;
 pub mod tui;
+pub mod typesafe;
 
 mod atomic;

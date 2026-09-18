@@ -221,6 +221,7 @@ async fn agent_runtime_dispatches_lifecycle_and_surfaces_extension_ui() {
         budget: Budget::default(),
         provider_aware_token_budget: false,
         provider_timeout: std::time::Duration::from_secs(2),
+        typesafe_skill_selection: mimir::typesafe::TypeSafeSkillConfig::default(),
     };
     let runtime = AgentRuntime::resume(
         provider,

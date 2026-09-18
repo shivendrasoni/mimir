@@ -32,6 +32,7 @@ use crate::{
     tools::{
         ClarifyingQuestion, ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry,
     },
+    typesafe::{TypeSafeSkill, TypeSafeSkillConfig, TypeSafeSkillMode, TypeSafeSkillSelector},
 };
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
@@ -50,6 +51,7 @@ pub struct RuntimeConfig {
     /// Re-resolve the token ceiling from the active provider whenever its model changes.
     pub provider_aware_token_budget: bool,
     pub provider_timeout: Duration,
+    pub typesafe_skill_selection: TypeSafeSkillConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,7 @@ impl RuntimeConfig {
             budget: Budget::default(),
             provider_aware_token_budget: false,
             provider_timeout: Duration::from_secs(15 * 60),
+            typesafe_skill_selection: TypeSafeSkillConfig::default(),
         }
     }
 }
@@ -363,6 +366,7 @@ pub struct AgentRuntime {
     control_cancellation: StdMutex<CancellationToken>,
     retry_cancellation: StdMutex<CancellationToken>,
     skills: StdMutex<SkillRuntime>,
+    typesafe_skill_selector: TypeSafeSkillSelector,
     extensions: RwLock<Option<Arc<ExtensionManager>>>,
     extension_session_id: RwLock<String>,
     extension_session_name: RwLock<Option<String>>,
@@ -495,6 +499,8 @@ impl AgentRuntime {
         if config.provider_aware_token_budget {
             operational_budget.max_tokens = provider_default_token_limit(&config.provider);
         }
+        let typesafe_skill_selector =
+            TypeSafeSkillSelector::from_env(config.typesafe_skill_selection.clone());
         Ok(Self {
             selection: RwLock::new(RuntimeSelection {
                 provider,
@@ -527,6 +533,7 @@ impl AgentRuntime {
             control_cancellation: StdMutex::new(CancellationToken::new()),
             retry_cancellation: StdMutex::new(CancellationToken::new()),
             skills: StdMutex::new(SkillRuntime::default()),
+            typesafe_skill_selector,
             extensions: RwLock::new(None),
             extension_session_id: RwLock::new(String::new()),
             extension_session_name: RwLock::new(None),
@@ -2208,6 +2215,8 @@ impl AgentRuntime {
             .skill_context_for_messages(messages)
             .map_err(|error| skill_invocation_error(&error))?;
         let _guard = self.run_lock.lock().await;
+        self.record_typesafe_shadow(messages, active_skill_context.is_some())
+            .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
             downstream: sink,
@@ -2233,6 +2242,8 @@ impl AgentRuntime {
         let active_skill_context = self
             .skill_context_for_messages(&pending)
             .map_err(|error| skill_invocation_error(&error))?;
+        self.record_typesafe_shadow(&pending, active_skill_context.is_some())
+            .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
             downstream: sink,
@@ -3099,6 +3110,42 @@ impl AgentRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .context_for_messages(messages)
+    }
+
+    async fn record_typesafe_shadow(&self, messages: &[Message], explicit_skill: bool) {
+        if explicit_skill || self.typesafe_skill_selector.mode() == TypeSafeSkillMode::Off {
+            return;
+        }
+        let request = messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(Message::text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let skills = self
+            .skills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .summaries()
+            .into_iter()
+            .map(|skill| TypeSafeSkill {
+                name: skill.name,
+                description: skill.description,
+            })
+            .collect::<Vec<_>>();
+        let recommendation = self
+            .typesafe_skill_selector
+            .recommend(&request, &skills)
+            .await;
+        if let Ok(detail) = serde_json::to_string(&serde_json::json!({
+            "type": "typesafe_skill_selection",
+            "selection": recommendation,
+        })) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_skill_selection", &detail)
+                .await;
+        }
     }
 
     /// Dispatches a typed lifecycle event and emits any validated UI requests.

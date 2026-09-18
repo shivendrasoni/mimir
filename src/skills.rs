@@ -207,32 +207,6 @@ fn terms(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ranks_exact_names_and_description_matches_deterministically() {
-        let brainstorming = SkillSummary {
-            name: "brainstorming".into(),
-            description: "Explore product ideas before implementation".into(),
-        };
-        let api = SkillSummary {
-            name: "api-design".into(),
-            description: "Design stable service interfaces".into(),
-        };
-        assert_eq!(
-            rank_skill_summaries("brainstorming", &[brainstorming.clone(), api.clone()], 1)[0].name,
-            "brainstorming"
-        );
-        assert_eq!(
-            rank_skill_summaries("product ideas", &[brainstorming, api.clone()], 1)[0].name,
-            "brainstorming"
-        );
-        assert!(rank_skill_summaries("unrelated quantum gardening", &[api], 1).is_empty());
-    }
-}
-
 fn render_skill_context(skill: &Skill) -> String {
     let base_dir = skill.path.parent().unwrap_or(&skill.path).display();
     format!(
@@ -293,4 +267,30 @@ fn escape_xml(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranks_exact_names_and_description_matches_deterministically() {
+        let brainstorming = SkillSummary {
+            name: "brainstorming".into(),
+            description: "Explore product ideas before implementation".into(),
+        };
+        let api = SkillSummary {
+            name: "api-design".into(),
+            description: "Design stable service interfaces".into(),
+        };
+        assert_eq!(
+            rank_skill_summaries("brainstorming", &[brainstorming.clone(), api.clone()], 1)[0].name,
+            "brainstorming"
+        );
+        assert_eq!(
+            rank_skill_summaries("product ideas", &[brainstorming, api.clone()], 1)[0].name,
+            "brainstorming"
+        );
+        assert!(rank_skill_summaries("unrelated quantum gardening", &[api], 1).is_empty());
+    }
 }

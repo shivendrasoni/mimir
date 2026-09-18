@@ -90,6 +90,7 @@ use crate::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
         load_tui_agent_mode, load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
     },
+    typesafe::{TypeSafeSkillConfig, TypeSafeSkillMode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -129,6 +130,21 @@ enum AgentModeArg {
     Default,
     Plan,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TypeSafeSkillModeArg {
+    Off,
+    Shadow,
+}
+
+impl From<TypeSafeSkillModeArg> for TypeSafeSkillMode {
+    fn from(value: TypeSafeSkillModeArg) -> Self {
+        match value {
+            TypeSafeSkillModeArg::Off => Self::Off,
+            TypeSafeSkillModeArg::Shadow => Self::Shadow,
+        }
+    }
 }
 
 impl From<AgentModeArg> for AgentMode {
@@ -228,6 +244,23 @@ pub struct Cli {
     no_context_files: bool,
     #[arg(long)]
     no_skills: bool,
+    #[arg(
+        long,
+        env = "MIMIR_TYPESAFE_SKILL_SELECTION",
+        value_enum,
+        default_value = "off",
+        help = "TypeSafe skill selection experiment: off or privacy-safe shadow diagnostics"
+    )]
+    typesafe_skill_selection: TypeSafeSkillModeArg,
+    #[arg(long, env = "MIMIR_TYPESAFE_MODEL", default_value = "jev-latest")]
+    typesafe_model: String,
+    #[arg(
+        long,
+        env = "MIMIR_TYPESAFE_TIMEOUT_MS",
+        default_value_t = 2_000,
+        value_parser = parse_positive_u64
+    )]
+    typesafe_timeout_ms: u64,
     #[arg(long)]
     no_prompt_templates: bool,
     #[arg(long)]
@@ -372,6 +405,9 @@ struct RuntimeBuildConfig {
     no_extensions: bool,
     no_context_files: bool,
     no_skills: bool,
+    typesafe_skill_selection: TypeSafeSkillMode,
+    typesafe_model: String,
+    typesafe_timeout_ms: u64,
     no_prompt_templates: bool,
     no_themes: bool,
     skill_paths: Vec<PathBuf>,
@@ -422,6 +458,9 @@ impl RuntimeBuildConfig {
             no_extensions: cli.no_extensions,
             no_context_files: cli.no_context_files,
             no_skills: cli.no_skills,
+            typesafe_skill_selection: cli.typesafe_skill_selection.into(),
+            typesafe_model: cli.typesafe_model.clone(),
+            typesafe_timeout_ms: cli.typesafe_timeout_ms,
             no_prompt_templates: cli.no_prompt_templates,
             no_themes: cli.no_themes,
             skill_paths: cli.skill.clone(),
@@ -7639,6 +7678,12 @@ async fn build_runtime_for_session(
         LimitValue::resolve,
     );
     config.provider_aware_token_budget = build.max_run_tokens.is_none();
+    config.typesafe_skill_selection = TypeSafeSkillConfig {
+        mode: build.typesafe_skill_selection,
+        model: build.typesafe_model.clone(),
+        timeout: Duration::from_millis(build.typesafe_timeout_ms),
+        ..TypeSafeSkillConfig::default()
+    };
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -10306,6 +10351,36 @@ mod tui_model_selection_tests {
     }
 
     #[test]
+    fn typesafe_skill_selection_is_off_by_default_and_shadow_is_explicit() {
+        let defaults =
+            RuntimeBuildConfig::from_cli(&Cli::try_parse_from(["mimir"]).expect("defaults"));
+        assert_eq!(
+            defaults.typesafe_skill_selection,
+            crate::typesafe::TypeSafeSkillMode::Off
+        );
+        assert_eq!(defaults.typesafe_timeout_ms, 2_000);
+        assert_eq!(defaults.typesafe_model, "jev-latest");
+
+        let shadow = Cli::try_parse_from([
+            "mimir",
+            "--typesafe-skill-selection",
+            "shadow",
+            "--typesafe-timeout-ms",
+            "1500",
+            "--typesafe-model",
+            "jev-test",
+        ])
+        .expect("shadow options");
+        let shadow = RuntimeBuildConfig::from_cli(&shadow);
+        assert_eq!(
+            shadow.typesafe_skill_selection,
+            crate::typesafe::TypeSafeSkillMode::Shadow
+        );
+        assert_eq!(shadow.typesafe_timeout_ms, 1_500);
+        assert_eq!(shadow.typesafe_model, "jev-test");
+    }
+
+    #[test]
     fn bare_cli_defaults_to_global_anthropic_sonnet() {
         let defaults = Cli::try_parse_from(["mimir"]).expect("defaults");
         let expected_state = std::env::var_os("HOME")
@@ -10843,6 +10918,9 @@ mod tui_model_selection_tests {
             no_extensions: false,
             no_context_files: false,
             no_skills: false,
+            typesafe_skill_selection: crate::typesafe::TypeSafeSkillMode::Off,
+            typesafe_model: "jev-latest".into(),
+            typesafe_timeout_ms: 2_000,
             no_prompt_templates: false,
             no_themes: false,
             skill_paths: Vec::new(),

@@ -137,6 +137,102 @@ impl SkillRuntime {
     }
 }
 
+/// Ranks the bounded skill catalog with Mimir's current lexical discovery
+/// heuristic. The result is deterministic and contains only matching skills.
+#[must_use]
+pub(crate) fn rank_skill_summaries<'a>(
+    query: &str,
+    skills: &'a [SkillSummary],
+    limit: usize,
+) -> Vec<&'a SkillSummary> {
+    let mut matches = skills
+        .iter()
+        .filter_map(|skill| {
+            let score = relevance_score(query, skill);
+            (score > 0).then_some((score, skill))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    matches.truncate(limit);
+    matches.into_iter().map(|(_, skill)| skill).collect()
+}
+
+fn relevance_score(query: &str, skill: &SkillSummary) -> u32 {
+    let query = query.trim().to_ascii_lowercase();
+    let name = skill.name.to_ascii_lowercase();
+    let description = skill.description.to_ascii_lowercase();
+    if query == name {
+        return 10_000;
+    }
+    let query_terms = terms(&query);
+    if query_terms.is_empty() {
+        return 0;
+    }
+    let name_terms = terms(&name);
+    let description_terms = terms(&description);
+    let mut score = u32::from(description.contains(&query)) * 80;
+    let mut matched_terms = 0_u32;
+    for term in &query_terms {
+        let term_score = if name_terms.contains(term) {
+            40
+        } else if name.contains(term) {
+            24
+        } else if description_terms.contains(term) {
+            12
+        } else if term.len() >= 4 && description.contains(term) {
+            4
+        } else {
+            0
+        };
+        if term_score > 0 {
+            matched_terms += 1;
+            score += term_score;
+        }
+    }
+    if usize::try_from(matched_terms).ok() == Some(query_terms.len()) {
+        score += 20;
+    }
+    score
+}
+
+fn terms(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| term.len() > 1)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranks_exact_names_and_description_matches_deterministically() {
+        let brainstorming = SkillSummary {
+            name: "brainstorming".into(),
+            description: "Explore product ideas before implementation".into(),
+        };
+        let api = SkillSummary {
+            name: "api-design".into(),
+            description: "Design stable service interfaces".into(),
+        };
+        assert_eq!(
+            rank_skill_summaries("brainstorming", &[brainstorming.clone(), api.clone()], 1)[0].name,
+            "brainstorming"
+        );
+        assert_eq!(
+            rank_skill_summaries("product ideas", &[brainstorming, api.clone()], 1)[0].name,
+            "brainstorming"
+        );
+        assert!(rank_skill_summaries("unrelated quantum gardening", &[api], 1).is_empty());
+    }
+}
+
 fn render_skill_context(skill: &Skill) -> String {
     let base_dir = skill.path.parent().unwrap_or(&skill.path).display();
     format!(

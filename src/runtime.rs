@@ -32,7 +32,10 @@ use crate::{
     tools::{
         ClarifyingQuestion, ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry,
     },
-    typesafe::{TypeSafeSkill, TypeSafeSkillConfig, TypeSafeSkillMode, TypeSafeSkillSelector},
+    typesafe::{
+        TypeSafeRecommendationStatus, TypeSafeSkill, TypeSafeSkillConfig, TypeSafeSkillMode,
+        TypeSafeSkillSelector,
+    },
 };
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
@@ -366,7 +369,7 @@ pub struct AgentRuntime {
     control_cancellation: StdMutex<CancellationToken>,
     retry_cancellation: StdMutex<CancellationToken>,
     skills: StdMutex<SkillRuntime>,
-    typesafe_skill_selector: TypeSafeSkillSelector,
+    typesafe_skill_selector: RwLock<Arc<TypeSafeSkillSelector>>,
     extensions: RwLock<Option<Arc<ExtensionManager>>>,
     extension_session_id: RwLock<String>,
     extension_session_name: RwLock<Option<String>>,
@@ -383,6 +386,14 @@ struct RuntimeSelection {
     thinking_level: ThinkingLevel,
     supported_thinking_levels: Vec<ThinkingLevel>,
     thinking_level_map: Option<BTreeMap<ThinkingLevel, Option<String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTypeSafeSelection {
+    mode: &'static str,
+    request_sha256: String,
+    selected_skill: Option<String>,
+    assisted_skill: Option<String>,
 }
 
 struct RunningFlag<'a>(&'a AtomicBool);
@@ -533,7 +544,7 @@ impl AgentRuntime {
             control_cancellation: StdMutex::new(CancellationToken::new()),
             retry_cancellation: StdMutex::new(CancellationToken::new()),
             skills: StdMutex::new(SkillRuntime::default()),
-            typesafe_skill_selector,
+            typesafe_skill_selector: RwLock::new(Arc::new(typesafe_skill_selector)),
             extensions: RwLock::new(None),
             extension_session_id: RwLock::new(String::new()),
             extension_session_name: RwLock::new(None),
@@ -767,6 +778,12 @@ impl AgentRuntime {
             .skills
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = skills;
+    }
+
+    /// Replaces the `TypeSafe` selector for contract tests and embedded runtimes.
+    #[doc(hidden)]
+    pub async fn attach_typesafe_skill_selector(&self, selector: TypeSafeSkillSelector) {
+        *self.typesafe_skill_selector.write().await = Arc::new(selector);
     }
 
     pub async fn extension_manager(&self) -> Option<Arc<ExtensionManager>> {
@@ -2211,11 +2228,13 @@ impl AgentRuntime {
             .clear_pending_plan_question()
             .await
             .map_err(|error| MimirError::Tool(error.to_string()))?;
-        let active_skill_context = self
+        let mut active_skill_context = self
             .skill_context_for_messages(messages)
             .map_err(|error| skill_invocation_error(&error))?;
         let _guard = self.run_lock.lock().await;
-        self.record_typesafe_shadow(messages, active_skill_context.is_some())
+        let explicit_skill = active_skill_context.is_some();
+        let typesafe = self
+            .prepare_typesafe_selection(messages, &mut active_skill_context, explicit_skill)
             .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
@@ -2223,7 +2242,18 @@ impl AgentRuntime {
             bus: &self.events,
             source,
         };
-        let result = self.run_inner(messages, active_skill_context, &sink).await;
+        let result = self
+            .run_inner(
+                messages,
+                active_skill_context,
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.assisted_skill.clone()),
+                &sink,
+            )
+            .await;
+        self.record_typesafe_outcome(typesafe.as_ref(), result.is_ok())
+            .await;
         self.finish_run(result, &sink).await
     }
 
@@ -2239,10 +2269,12 @@ impl AgentRuntime {
         if pending.is_empty() {
             return Ok(None);
         }
-        let active_skill_context = self
+        let mut active_skill_context = self
             .skill_context_for_messages(&pending)
             .map_err(|error| skill_invocation_error(&error))?;
-        self.record_typesafe_shadow(&pending, active_skill_context.is_some())
+        let explicit_skill = active_skill_context.is_some();
+        let typesafe = self
+            .prepare_typesafe_selection(&pending, &mut active_skill_context, explicit_skill)
             .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
@@ -2250,7 +2282,18 @@ impl AgentRuntime {
             bus: &self.events,
             source: RuntimeEventSource::new(),
         };
-        let result = self.run_inner(&[], active_skill_context, &sink).await;
+        let result = self
+            .run_inner(
+                &[],
+                active_skill_context,
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.assisted_skill.clone()),
+                &sink,
+            )
+            .await;
+        self.record_typesafe_outcome(typesafe.as_ref(), result.is_ok())
+            .await;
         self.finish_run(result, &sink).await.map(Some)
     }
 
@@ -2303,6 +2346,7 @@ impl AgentRuntime {
         &self,
         prompts: &[Message],
         mut active_skill_context: Option<String>,
+        assisted_skill: Option<String>,
         sink: &dyn EventSink,
     ) -> Result<String> {
         let cancellation = self
@@ -2856,16 +2900,41 @@ impl AgentRuntime {
                     && self.tools.has_skill_search()
                     && call.name == "search_skills"
                     && let Some(name) = arguments.get("name").and_then(serde_json::Value::as_str)
-                    && let Err(error) = self
+                {
+                    let activation = self
                         .skills
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .activate(&mut active_skill_context, name)
-                {
-                    execution = Err(crate::tools::ToolError::Execution {
-                        tool: call.name.clone(),
-                        message: error.to_string(),
-                    });
+                        .activate(&mut active_skill_context, name);
+                    match activation {
+                        Ok(activated) => {
+                            if activated
+                                && assisted_skill
+                                    .as_deref()
+                                    .is_some_and(|assisted| assisted != name)
+                            {
+                                let detail = serde_json::json!({
+                                    "type": "typesafe_skill_correction",
+                                    "assisted_skill": assisted_skill,
+                                    "corrected_skill": name,
+                                });
+                                if let Ok(detail) = serde_json::to_string(&detail) {
+                                    let _ = self
+                                        .record_runtime_event_raw(
+                                            "typesafe_skill_correction",
+                                            &detail,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            execution = Err(crate::tools::ToolError::Execution {
+                                tool: call.name.clone(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
                 }
                 if let Err(crate::tools::ToolError::ApprovalRequired { request }) = &execution {
                     sink.emit(RuntimeEvent::PermissionRequested {
@@ -3112,9 +3181,15 @@ impl AgentRuntime {
             .context_for_messages(messages)
     }
 
-    async fn record_typesafe_shadow(&self, messages: &[Message], explicit_skill: bool) {
-        if explicit_skill || self.typesafe_skill_selector.mode() == TypeSafeSkillMode::Off {
-            return;
+    async fn prepare_typesafe_selection(
+        &self,
+        messages: &[Message],
+        active_skill_context: &mut Option<String>,
+        explicit_skill: bool,
+    ) -> Option<PreparedTypeSafeSelection> {
+        let selector = self.typesafe_skill_selector.read().await.clone();
+        if explicit_skill || selector.mode() == TypeSafeSkillMode::Off {
+            return None;
         }
         let request = messages
             .iter()
@@ -3134,16 +3209,83 @@ impl AgentRuntime {
                 description: skill.description,
             })
             .collect::<Vec<_>>();
-        let recommendation = self
-            .typesafe_skill_selector
-            .recommend(&request, &skills)
-            .await;
+        let recommendation = selector.recommend(&request, &skills).await;
+        let selected_skill = recommendation.selected_skill.clone();
+        let context_before = active_skill_context.as_ref().map_or(0, String::len);
+        let mut assisted_skill = None;
+        let mut activation_error = None;
+        if selector.mode() == TypeSafeSkillMode::Assist
+            && recommendation.status == TypeSafeRecommendationStatus::Success
+            && recommendation.meets_thresholds
+            && let Some(name) = selected_skill.as_deref()
+        {
+            match self
+                .skills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .activate(active_skill_context, name)
+            {
+                Ok(true) => assisted_skill = Some(name.to_owned()),
+                Ok(false) => {}
+                Err(_) => activation_error = Some("skill_activation"),
+            }
+        }
+        let added_context_tokens = active_skill_context
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_sub(context_before)
+            .div_ceil(4);
+        let decision = if assisted_skill.is_some() {
+            "assist_activated"
+        } else if recommendation.status == TypeSafeRecommendationStatus::Success
+            && !recommendation.meets_thresholds
+        {
+            "fallback_uncertain"
+        } else if recommendation.error_kind == Some("rollout_not_sampled") {
+            "fallback_not_sampled"
+        } else if recommendation.status == TypeSafeRecommendationStatus::Success {
+            "shadow_recommendation"
+        } else {
+            "fallback_unavailable"
+        };
         if let Ok(detail) = serde_json::to_string(&serde_json::json!({
             "type": "typesafe_skill_selection",
             "selection": recommendation,
+            "decision": decision,
+            "activation_error": activation_error,
+            "added_context_tokens": added_context_tokens,
         })) {
             let _ = self
                 .record_runtime_event_raw("typesafe_skill_selection", &detail)
+                .await;
+        }
+        Some(PreparedTypeSafeSelection {
+            mode: selector.mode().as_str(),
+            request_sha256: recommendation.request_sha256,
+            selected_skill,
+            assisted_skill,
+        })
+    }
+
+    async fn record_typesafe_outcome(
+        &self,
+        selection: Option<&PreparedTypeSafeSelection>,
+        task_succeeded: bool,
+    ) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let detail = serde_json::json!({
+            "type": "typesafe_skill_outcome",
+            "mode": selection.mode,
+            "request_sha256": selection.request_sha256,
+            "selected_skill": selection.selected_skill,
+            "assisted_skill": selection.assisted_skill,
+            "task_succeeded": task_succeeded,
+        });
+        if let Ok(detail) = serde_json::to_string(&detail) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_skill_outcome", &detail)
                 .await;
         }
     }

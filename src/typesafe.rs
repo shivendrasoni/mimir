@@ -28,6 +28,20 @@ pub enum TypeSafeSkillMode {
     Off,
     /// Record Jev's recommendation without changing the active skill.
     Shadow,
+    /// Load a confident skill for a deterministically sampled share of turns.
+    Assist,
+}
+
+impl TypeSafeSkillMode {
+    /// Stable value used in diagnostics and configuration displays.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Assist => "assist",
+        }
+    }
 }
 
 /// Bounded configuration for the skill-selection experiment.
@@ -43,6 +57,8 @@ pub struct TypeSafeSkillConfig {
     pub applicability_threshold: f64,
     /// Minimum concentration of the Choice distribution.
     pub confidence_threshold: f64,
+    /// Deterministic percentage of otherwise eligible turns assisted in assist mode.
+    pub assist_rollout_percent: u8,
 }
 
 impl Default for TypeSafeSkillConfig {
@@ -53,6 +69,7 @@ impl Default for TypeSafeSkillConfig {
             timeout: Duration::from_millis(2_000),
             applicability_threshold: 0.60,
             confidence_threshold: 0.50,
+            assist_rollout_percent: 10,
         }
     }
 }
@@ -97,6 +114,8 @@ pub struct TypeSafeSkillRecommendation {
     pub request_bytes: usize,
     /// SHA-256 digest used to correlate repeated cases without storing text.
     pub request_sha256: String,
+    /// Stable 0-99 rollout bucket derived from the request digest.
+    pub rollout_bucket: Option<u8>,
     /// Coarse failure category without a raw error or credential material.
     pub error_kind: Option<&'static str>,
 }
@@ -185,12 +204,28 @@ impl TypeSafeSkillSelector {
     ) -> TypeSafeSkillRecommendation {
         let request_bytes = request.len();
         let request_sha256 = request_hash(request);
+        let rollout_bucket = rollout_bucket(request);
+        let mode = self.config.mode.as_str();
         if self.config.mode == TypeSafeSkillMode::Off {
             return empty_recommendation(
+                mode,
                 TypeSafeRecommendationStatus::Disabled,
                 request_bytes,
                 request_sha256,
+                Some(rollout_bucket),
                 None,
+            );
+        }
+        if self.config.mode == TypeSafeSkillMode::Assist
+            && rollout_bucket >= self.config.assist_rollout_percent.min(100)
+        {
+            return empty_recommendation(
+                mode,
+                TypeSafeRecommendationStatus::Skipped,
+                request_bytes,
+                request_sha256,
+                Some(rollout_bucket),
+                Some("rollout_not_sampled"),
             );
         }
         if request.trim().is_empty()
@@ -198,17 +233,21 @@ impl TypeSafeSkillSelector {
             || request_bytes > MAX_SELECTION_REQUEST_BYTES
         {
             return empty_recommendation(
+                mode,
                 TypeSafeRecommendationStatus::Skipped,
                 request_bytes,
                 request_sha256,
+                Some(rollout_bucket),
                 (request_bytes > MAX_SELECTION_REQUEST_BYTES).then_some("request_too_large"),
             );
         }
         let Some(transport) = self.transport.as_ref() else {
             return empty_recommendation(
+                mode,
                 TypeSafeRecommendationStatus::Unavailable,
                 request_bytes,
                 request_sha256,
+                Some(rollout_bucket),
                 self.initialization_error,
             );
         };
@@ -234,9 +273,11 @@ impl TypeSafeSkillSelector {
         let state = serde_json::json!({"request": request, "skills": skills});
         let Ok(content) = typesafe_client::Content::json(&state) else {
             return empty_recommendation(
+                mode,
                 TypeSafeRecommendationStatus::Unavailable,
                 request_bytes,
                 request_sha256,
+                Some(rollout_bucket),
                 Some("encode"),
             );
         };
@@ -252,9 +293,11 @@ impl TypeSafeSkillSelector {
             Ok(response) => response,
             Err(error) => {
                 let mut unavailable = empty_recommendation(
+                    mode,
                     TypeSafeRecommendationStatus::Unavailable,
                     request_bytes,
                     request_sha256,
+                    Some(rollout_bucket),
                     Some(error_kind(&error)),
                 );
                 unavailable.latency_ms = latency_ms;
@@ -265,18 +308,22 @@ impl TypeSafeSkillSelector {
             Ok(answer) => answer.noul,
             Err(_) => {
                 return empty_recommendation(
+                    mode,
                     TypeSafeRecommendationStatus::Unavailable,
                     request_bytes,
                     request_sha256,
+                    Some(rollout_bucket),
                     Some("invalid_answer"),
                 );
             }
         };
         let Ok(choice) = response.answer(&ranking) else {
             return empty_recommendation(
+                mode,
                 TypeSafeRecommendationStatus::Unavailable,
                 request_bytes,
                 request_sha256,
+                Some(rollout_bucket),
                 Some("invalid_answer"),
             );
         };
@@ -291,7 +338,7 @@ impl TypeSafeSkillSelector {
         ranked.truncate(5);
         TypeSafeSkillRecommendation {
             status: TypeSafeRecommendationStatus::Success,
-            mode: "shadow",
+            mode,
             selected_skill: Some(choice.choice.clone()),
             applicable_probability: Some(applicable),
             choice_confidence: Some(choice.confidence),
@@ -305,20 +352,23 @@ impl TypeSafeSkillSelector {
             latency_ms,
             request_bytes,
             request_sha256,
+            rollout_bucket: Some(rollout_bucket),
             error_kind: None,
         }
     }
 }
 
 fn empty_recommendation(
+    mode: &'static str,
     status: TypeSafeRecommendationStatus,
     request_bytes: usize,
     request_sha256: String,
+    rollout_bucket: Option<u8>,
     error_kind: Option<&'static str>,
 ) -> TypeSafeSkillRecommendation {
     TypeSafeSkillRecommendation {
         status,
-        mode: "shadow",
+        mode,
         selected_skill: None,
         applicable_probability: None,
         choice_confidence: None,
@@ -331,12 +381,20 @@ fn empty_recommendation(
         latency_ms: 0,
         request_bytes,
         request_sha256,
+        rollout_bucket,
         error_kind,
     }
 }
 
 fn request_hash(request: &str) -> String {
     format!("{:x}", Sha256::digest(request.as_bytes()))
+}
+
+fn rollout_bucket(request: &str) -> u8 {
+    let digest = Sha256::digest(request.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u8::try_from(u64::from_be_bytes(prefix) % 100).unwrap_or_default()
 }
 
 fn error_kind(error: &Error) -> &'static str {
@@ -433,5 +491,25 @@ mod tests {
         assert_eq!(result.status, TypeSafeRecommendationStatus::Unavailable);
         assert_eq!(result.error_kind, Some("timeout"));
         assert!(result.selected_skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn assist_rollout_zero_skips_without_spending_a_request() {
+        let fake = Arc::new(FakeSystemOne::new());
+        let selector = TypeSafeSkillSelector::with_transport(
+            TypeSafeSkillConfig {
+                mode: TypeSafeSkillMode::Assist,
+                assist_rollout_percent: 0,
+                ..TypeSafeSkillConfig::default()
+            },
+            fake.clone(),
+        );
+
+        let result = selector.recommend("make a PDF", &skills()).await;
+
+        assert_eq!(result.status, TypeSafeRecommendationStatus::Skipped);
+        assert_eq!(result.mode, "assist");
+        assert_eq!(result.error_kind, Some("rollout_not_sampled"));
+        assert_eq!(fake.request_count(), 0);
     }
 }

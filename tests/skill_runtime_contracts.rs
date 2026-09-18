@@ -10,8 +10,10 @@ use mimir::{
     skills::SkillRuntime,
     tools::{ToolPolicy, ToolRegistry},
     tui::{Action, App, AppConfig},
+    typesafe::{TypeSafeSkillConfig, TypeSafeSkillMode, TypeSafeSkillSelector},
 };
 use tempfile::TempDir;
+use typesafe_client::fake::FakeSystemOne;
 
 fn response(text: &str) -> ModelResponse {
     ModelResponse {
@@ -149,6 +151,85 @@ async fn model_can_discover_then_ephemerally_activate_a_skill() {
     let serialized = serde_json::to_string(&loaded.records).expect("serialize records");
     assert!(serialized.contains("brainstorming"));
     assert!(!serialized.contains("Ask focused questions before selecting a design."));
+}
+
+#[tokio::test]
+async fn assist_mode_loads_a_confident_sampled_skill_and_records_redacted_outcomes() {
+    let workspace = TempDir::new().expect("workspace");
+    write_skill(
+        workspace.path(),
+        "brainstorming",
+        "Explore product ideas before implementation",
+        "Ask focused questions before selecting a design.",
+    );
+    write_skill(
+        workspace.path(),
+        "api-design",
+        "Design stable service interfaces",
+        "Define the interface contract.",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![response("assisted")]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = runtime_with_skills(workspace.path(), provider.clone(), store.clone()).await;
+    let typesafe = Arc::new(FakeSystemOne::new());
+    typesafe.set_noul("skill_applies", 0.96);
+    typesafe.set_choice_probabilities(
+        "best_skill",
+        [("brainstorming", 0.95), ("api-design", 0.05)],
+    );
+    runtime
+        .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
+            TypeSafeSkillConfig {
+                mode: TypeSafeSkillMode::Assist,
+                assist_rollout_percent: 100,
+                ..TypeSafeSkillConfig::default()
+            },
+            typesafe,
+        ))
+        .await;
+
+    let prompt = "Help me shape this feature";
+    assert_eq!(
+        runtime
+            .run(prompt, &VecEventSink::default())
+            .await
+            .expect("assisted run"),
+        "assisted"
+    );
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .system_prompt
+            .contains("<active_skill name=\"brainstorming\"")
+    );
+    assert!(requests[0].system_prompt.contains("Ask focused questions"));
+    let loaded = store.load().await.expect("session");
+    let diagnostics = loaded
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            mimir::session::SessionPayload::RuntimeEvent { name, detail }
+                if name.starts_with("typesafe_skill_") =>
+            {
+                Some(detail.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|detail| detail.contains("assist_activated"))
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|detail| detail.contains("task_succeeded"))
+    );
+    assert!(diagnostics.iter().all(|detail| !detail.contains(prompt)));
 }
 
 #[tokio::test]

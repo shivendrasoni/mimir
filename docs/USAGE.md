@@ -48,6 +48,27 @@ Inside the TUI, type `@` anywhere in the composer to pick a file or folder from 
 
 Referenced paths are validated against the workspace and are made explicit to the model. Folders are inspected selectively instead of being injected wholesale.
 
+## TypeSafe skill selection
+
+TypeSafe integration is off by default. Shadow mode sends the current text request and bounded skill names/descriptions to Jev, then records its typed recommendation without changing Mimir's behavior:
+
+```bash
+TYPESAFE_API_KEY=... mimir --typesafe-skill-selection shadow
+```
+
+Assist mode uses the same request, but only for a stable 10% sample of eligible turns by default. It loads the recommended skill only when applicability is at least 0.60 and Choice confidence is at least 0.50. Every uncertain, invalid, timed-out, unsampled, or failed request falls back to the existing `search_skills` workflow.
+
+```bash
+TYPESAFE_API_KEY=... mimir --typesafe-skill-selection assist
+
+# Controlled test or a different rollout share
+mimir --typesafe-skill-selection assist --typesafe-assist-rollout-percent 25
+```
+
+Set `--typesafe-skill-selection off` for the immediate off switch. `MIMIR_TYPESAFE_SKILL_SELECTION`, `MIMIR_TYPESAFE_MODEL`, `MIMIR_TYPESAFE_TIMEOUT_MS`, and `MIMIR_TYPESAFE_ASSIST_ROLLOUT_PERCENT` provide environment equivalents.
+
+Selection diagnostics persist the mode, outcome, ranked probabilities, token usage, estimated TypeSafe cost, latency, rollout bucket, request byte count, and request SHA-256—not the request text or API key. Outcome events record task completion, and a later model-driven activation of a different skill records a correction. The original request is still sent to TypeSafe in shadow or assist mode, so enable either mode only where that data transfer is acceptable.
+
 ## Process execution
 
 Long-running servers should be backgrounded with stdout and stderr redirected to a workspace log. Direct TUI commands use `!command` or `!!command` to exclude the result from model context. Auto mode runs those commands without an allowlist.

@@ -51,12 +51,15 @@ mimir diagnose replay <run-id>
 
 Direct text, JSON, JSON-RPC, ACP, autonomous, REPL, and TUI processes attach the diagnostic collector at CLI dispatch. Each daemon-managed prompt attaches its own collector for the complete prompt lifecycle, including queued follow-ups and autonomous continuations, so long-lived daemon sessions produce one bounded bundle per admitted prompt.
 
-## TypeSafe skill-selection evidence
+## TypeSafe turn-selection evidence
 
-When TypeSafe is `on`, an evaluated turn adds three runtime-event kinds:
+When TypeSafe is `on`, an evaluated turn can add these runtime-event kinds:
 
 - `typesafe_skill_selection` records the decision, selected skill, bounded probabilities, threshold result, request byte count and hash, model, token usage, estimated cost, latency, added context, and a coarse failure category;
-- `typesafe_skill_outcome` records whether the enclosing Mimir turn completed; and
-- `typesafe_skill_correction` records when the main model later activates a different skill.
+- `typesafe_skill_outcome` records whether the enclosing Mimir turn completed;
+- `typesafe_skill_correction` records when the main model later activates a different skill;
+- `typesafe_tool_selection` records the shortlist decision, per-tool probabilities, uncertainty result, full and active tool counts, shared request usage, and estimated provider-context savings;
+- `typesafe_tool_outcome` records task completion and whether the initial shortlist was active; and
+- `typesafe_tool_recovery` records names activated through the always-visible `search_tools` recovery tool.
 
-These events never contain the TypeSafe API key or request text. They are intended for aggregate canary comparison of completion, wrong or needless loads, corrections, net token savings, cost, and latency. They do not replace the session transcript and must not be interpreted as proof of task quality in isolation.
+These events never contain the TypeSafe API key or request text. They are intended for aggregate release comparison of completion, wrong or needless loads, corrections, recovery frequency, net token savings, cost, and latency. Shared TypeSafe usage appears on the skill and tool selection records with the same request hash and must be counted once. These events do not replace the session transcript and must not be interpreted as proof of task quality in isolation.

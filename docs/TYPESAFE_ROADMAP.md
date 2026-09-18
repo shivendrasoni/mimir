@@ -1,6 +1,6 @@
 # TypeSafe in Mimir: Lean Roadmap
 
-Status: Phase 2 implementation and controlled acceptance complete; production canary tracked separately; Phase 3 expansion declined
+Status: Phases 0–3 implementation and controlled acceptance complete; combined first release pending
 
 ## The first bet
 
@@ -13,9 +13,9 @@ This comes first because skill selection can affect the whole turn, irrelevant
 skill instructions consume provider tokens, and Jev can start as a read-only
 recommendation with Mimir's current behavior as the fallback.
 
-Do not build a general TypeSafe framework yet. Model routing, verification,
-guardrails, continual learning, and orchestration remain out of scope until this
-bet produces measured value.
+Do not build a general TypeSafe framework. Phase 3 adds only the measured
+tool/MCP shortlisting bet; model routing, verification, guardrails, continual
+learning, and orchestration remain out of scope.
 
 ## Rules
 
@@ -74,16 +74,34 @@ needless loads, bounded cost and latency, safe fallback, and working rollback.
 retention plan. The canary—not this implementation phase—determines whether the
 capability is retained and whether it may ever become the default.
 
-## Phase 3 — Pick one next bet
+## Phase 3 — Tool and MCP shortlisting
 
-Only after Phase 2 succeeds, use measured Mimir data to select one:
+The harness had not been released, so there was no production cohort on which to
+run the planned Phase 2 canary. The product decision was to complete one Phase 3
+bet and launch both capabilities together while preserving the explicit switch
+and immediate rollback.
 
-1. **Thinking-level routing** if reasoning spend is the largest avoidable cost.
-2. **Tool or MCP shortlisting** if tool context or wrong-tool calls are costly.
-3. **Completion verification** if false completion is a frequent quality problem.
+1. Measure the complete configured tool-schema context and label every tool that
+   may be needed across representative multi-step turns.
+2. Ask one independent Noul per optional tool in the same Jev request as skill
+   selection. Keep parameter schemas out of TypeSafe state.
+3. Include a tool at probability 0.60 or above. Fall back to the complete pool
+   if any omitted tool is at or above 0.55, the call fails, recovery is
+   unavailable, or estimated provider-context savings are below 256 tokens.
+4. Always retain `search_tools`, `search_skills`, and enabled autonomous
+   completion. `search_tools` can activate an omitted configured capability on
+   the next model step.
+5. Keep `--typesafe off` as one immediate rollback for skill and tool selection.
 
-The selected bet repeats the same cycle: baseline, offline shadow test, explicit
-gate, activation, and rollback. If the data supports none, stop expanding.
+**Controlled gate:** the calibrated 32-case replay passed with 100% required-tool
+recall, 64.3% provider tool-context savings, 2,978.3 net first-step tokens saved
+per case after charging the complete Jev input, 739 ms p95 latency, and seven
+safe full-pool fallbacks. Runtime contracts cover shortlist enforcement,
+service/uncertainty fallback, and same-run tool recovery.
+
+**Deliverable:** skill selection and conservative tool/MCP shortlisting share one
+TypeSafe request and one `on | off` activation contract. Production retention is
+evaluated after the first combined release.
 
 ## Deferred—not committed
 
@@ -99,5 +117,9 @@ from the number of things Jev could theoretically do.
 - [Phase 0 baseline](../benchmarks/typesafe-skill-selection/phase-0-baseline.md)
 - [Phase 1 calibrated replay](../benchmarks/typesafe-skill-selection/phase-1-shadow-final.md)
 - [Phase 2 controlled acceptance](../benchmarks/typesafe-skill-selection/phase-2-acceptance.md)
-- [Phase 2 production canary plan](../benchmarks/typesafe-skill-selection/phase-2-canary.md)
-- [Phase 3 stop decision](../benchmarks/typesafe-skill-selection/phase-3-decision.md)
+- [Phase 2 canary history](../benchmarks/typesafe-skill-selection/phase-2-canary.md)
+- [Phase 3 selection decision](../benchmarks/typesafe-skill-selection/phase-3-decision.md)
+- [Phase 3 tool-pool baseline](../benchmarks/typesafe-tool-selection/phase-3-baseline.md)
+- [Phase 3 initial stopped replay](../benchmarks/typesafe-tool-selection/phase-3-shadow-initial.md)
+- [Phase 3 calibrated replay](../benchmarks/typesafe-tool-selection/phase-3-shadow-final.md)
+- [Phase 3 controlled acceptance](../benchmarks/typesafe-tool-selection/phase-3-acceptance.md)

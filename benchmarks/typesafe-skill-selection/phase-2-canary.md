@@ -1,6 +1,6 @@
 # Phase 2 production canary
 
-Status: planned; run after publishing a canary build.
+Status: superseded before release. Mimir had no production cohort, so Phase 2 and the accepted Phase 3 tool-pool capability will launch together under the same explicit switch. Retain this document as the historical skill-only canary plan.
 
 ## Deployment
 
@@ -26,4 +26,4 @@ Use `typesafe_skill_selection`, `typesafe_skill_outcome`, and `typesafe_skill_co
 
 - Pass: retain the explicit capability and decide separately whether sufficient evidence exists to change the default.
 - Fail or inconclusive: set `--typesafe off`; extend the observation window only when the reason is insufficient sample size, not to erase a quality regression.
-- Do not begin tool/MCP shortlisting or another TypeSafe use case as part of this canary.
+- This skill-only canary was not run. Use the combined retention contract in the Phase 3 acceptance report after the first release.

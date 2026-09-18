@@ -1,26 +1,23 @@
 # Phase 3 next-bet decision
 
-Decision: stop expansion; select none of the three deferred bets.
+Decision: select tool and MCP shortlisting.
 
-## Why
+## Why the earlier stop changed
 
-Phase 1 established that Jev can materially improve labelled skill selection: the calibrated replay reached 88.5% exact accuracy versus 76.9% for the current lexical selector, reduced wasted loaded context by 79.8%, preserved the no-skill slice, stayed below the latency and token gates, and cost about $0.000978 for 26 calls.
+The original decision stopped because Mimir had no comparable evidence for a second use case and Phase 2 was intended to run in production first. Mimir has not yet been released, so no production cohort exists. The product decision is to complete one Phase 3 bet and launch it with Phase 2 rather than publish an intermediate canary build.
 
-Phase 2 therefore produces one canary-ready capability, while production retention is tracked separately in the canary plan. The repository does not yet contain comparable measurements showing that reasoning spend, tool/MCP selection, or false completion is Mimir's largest remaining avoidable problem. Choosing a second use case now would violate the roadmap's measured-problem rule and its instruction not to build a general TypeSafe framework.
+A pre-committed 32-case baseline then measured the complete 20-tool pool at 9,450 provider-context tokens per model step while only 1.72 tools were required on average. The labelled corpus therefore identified tool context as a material avoidable cost: 86.1% of the full pool was unnecessary for the average case.
 
-## What remains in scope
+## Selected scope
 
-- Keep TypeSafe limited to skill selection.
-- Keep TypeSafe `off` by default and expose only the explicit `on | off` activation contract.
-- Aggregate `typesafe_skill_selection`, `typesafe_skill_outcome`, and `typesafe_skill_correction` events across a comparable cohort.
-- Use `--typesafe off` as the immediate rollback if task success regresses, corrections rise materially, or net savings turn negative.
+- Judge optional built-in, extension, and MCP tools independently with one Noul per tool.
+- Put the tool questions in the same Jev request as skill selection rather than adding a second request.
+- Send bounded names and descriptions to TypeSafe, never parameter schemas.
+- Keep Rust authoritative over thresholds, permissions, execution, fallback, and recovery.
+- Keep TypeSafe off by default with the existing `on | off` activation contract.
 
-## Evidence required before revisiting
+Thinking-level routing and completion verification remain deferred. This is not authorization for a general TypeSafe framework.
 
-Select exactly one next bet only after Phase 2 sustains its gate and one candidate dominates measured avoidable cost or quality loss:
+## Evidence
 
-1. thinking-level routing: reasoning-token and latency distributions by task difficulty;
-2. tool/MCP shortlisting: tool-context size, wrong-tool rate, and recovery cost; or
-3. completion verification: false-completion rate and user correction cost.
-
-If none dominates, continue to stop. Retry selection, compaction checks, semantic guardrails, citation verification, continual-learning critics, multi-agent routing, memory reranking, heartbeat prioritization, natural-language commands, and semantic linting remain deferred.
+The initial conservative policy stopped safely because 28 of 32 cases fell back to the full pool. The calibrated policy passed the pre-committed gate with 100% required-tool recall, 64.3% provider-context savings, 2,978.3 net first-step tokens saved per case after the complete TypeSafe input, 739 ms p95 latency, and seven safe full-pool fallbacks. See the versioned baseline, initial replay, final replay, and controlled-acceptance report in `benchmarks/typesafe-tool-selection/`.

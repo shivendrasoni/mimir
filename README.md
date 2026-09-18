@@ -13,7 +13,7 @@ Around that RLM foundation, Mimir provides provider adaptation, model/tool execu
 
 User-level skills are discovered from the cross-harness `~/.agents/skills/` directory. Project-specific skills remain discoverable from `.agents/skills/` at each workspace level; an explicit `--skill <PATH>` still has highest precedence.
 
-Optional TypeSafe skill selection can judge whether one discovered skill applies to the current turn and load it before the main provider call. It is deliberately binary and off by default: use `--typesafe on` (or `MIMIR_TYPESAFE=on`) to enable it and `--typesafe off` for immediate rollback. TypeSafe does not choose tools, models, permissions, or execution policy.
+Optional TypeSafe turn selection can load one relevant skill and shortlist the configured built-in, extension, and MCP tool pool before the main provider call. Skill and tool judgments share one Jev request. Tool shortlisting is applied only when every omission clears the calibrated uncertainty gate and saves meaningful provider context; otherwise Mimir keeps the full pool. `search_tools`, `search_skills`, and autonomous completion remain visible for recovery. The feature is deliberately binary and off by default: use `--typesafe on` (or `MIMIR_TYPESAFE=on`) to enable it and `--typesafe off` for immediate rollback. Rust still owns permissions, execution policy, providers, and every fallback.
 
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
@@ -46,7 +46,7 @@ mimir --agent-mode auto
 # Plan mode produces a reviewable plan before implementation
 mimir --agent-mode plan
 
-# Optional TypeSafe skill selection (requires TYPESAFE_API_KEY)
+# Optional TypeSafe skill and tool-pool selection (requires TYPESAFE_API_KEY)
 mimir --typesafe on --print "create a formatted project spreadsheet"
 ```
 
@@ -67,7 +67,7 @@ Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the 
 - [Operations](docs/OPERATIONS.md) — state, sessions, daemon, goals, schedules, and extensions
 - [Extensions and lifecycle hooks](docs/EXTENSIONS.md) — hook reference, interception rules, installation, and examples
 - [Diagnostics](docs/DIAGNOSTICS.md) — privacy-safe run evidence, querying, annotation, and replay
-- [TypeSafe roadmap](docs/TYPESAFE_ROADMAP.md) — scoped skill-selection phases, evidence, activation, and rollback
+- [TypeSafe roadmap](docs/TYPESAFE_ROADMAP.md) — scoped skill and tool-pool phases, evidence, activation, and rollback
 - [Reliability](docs/RELIABILITY.md) — invariants, failures, fault injection, and release gates
 - [Architecture](ARCHITECTURE.md) — runtime flow, modules, persistence, and extension points
 - [Security](SECURITY.md) — trust boundaries, controls, and operational guidance

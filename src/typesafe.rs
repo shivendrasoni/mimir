@@ -1,15 +1,19 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use typesafe_client::{
-    CallOptions, ChoiceQuestion, Client, Error, NoulQuestion, Questions, RetryPolicy, SystemOne,
-    SystemOneRequest,
+    CallOptions, ChoiceQuestion, Client, Error, NoulAnswer, NoulQuestion, QuestionKey, Questions,
+    RetryPolicy, SystemOne, SystemOneRequest,
 };
 
 const APPLICABILITY_QUESTION: &str = "skill_applies";
 const RANKING_QUESTION: &str = "best_skill";
+const TOOL_QUESTION_PREFIX: &str = "tool_needed_";
 const MAX_SELECTION_REQUEST_BYTES: usize = 64 * 1_024;
+const MAX_TOOL_CATALOG_SIZE: usize = 255;
+const MAX_TOOL_DESCRIPTION_BYTES: usize = 2_048;
+const MAX_SELECTION_STATE_BYTES: usize = 512 * 1_024;
 
 /// Name and bounded description supplied to the `TypeSafe` selector.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -17,6 +21,15 @@ pub struct TypeSafeSkill {
     /// Exact runtime skill name.
     pub name: String,
     /// Discovery summary; full skill instructions are never sent.
+    pub description: String,
+}
+
+/// Name and bounded description supplied for one configured runtime tool.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TypeSafeTool {
+    /// Exact registered tool name.
+    pub name: String,
+    /// Provider-facing summary; the parameter schema is deliberately excluded.
     pub description: String,
 }
 
@@ -52,6 +65,8 @@ pub struct TypeSafeConfig {
     pub timeout: Duration,
     /// Skill-selection policy owned by the `TypeSafe` integration.
     pub skill_selection: TypeSafeSkillSelectionConfig,
+    /// Tool-pool shortlisting policy owned by the `TypeSafe` integration.
+    pub tool_selection: TypeSafeToolSelectionConfig,
 }
 
 /// Internal policy for TypeSafe-backed skill selection.
@@ -63,6 +78,17 @@ pub struct TypeSafeSkillSelectionConfig {
     pub confidence_threshold: f64,
 }
 
+/// Conservative policy for turning independent tool-need judgments into a shortlist.
+#[derive(Debug, Clone)]
+pub struct TypeSafeToolSelectionConfig {
+    /// Include a tool when its probability of being needed reaches this value.
+    pub inclusion_threshold: f64,
+    /// Fall back to the full pool when an omitted tool is at or above this value.
+    pub uncertainty_floor: f64,
+    /// Minimum provider-context reduction required before applying a shortlist.
+    pub minimum_context_savings_tokens: u64,
+}
+
 impl Default for TypeSafeConfig {
     fn default() -> Self {
         Self {
@@ -70,6 +96,17 @@ impl Default for TypeSafeConfig {
             model: "jev-latest".into(),
             timeout: Duration::from_millis(2_000),
             skill_selection: TypeSafeSkillSelectionConfig::default(),
+            tool_selection: TypeSafeToolSelectionConfig::default(),
+        }
+    }
+}
+
+impl Default for TypeSafeToolSelectionConfig {
+    fn default() -> Self {
+        Self {
+            inclusion_threshold: 0.60,
+            uncertainty_floor: 0.55,
+            minimum_context_savings_tokens: 256,
         }
     }
 }
@@ -127,13 +164,48 @@ pub struct TypeSafeSkillRecommendation {
     pub error_kind: Option<&'static str>,
 }
 
+/// Probability that one configured tool may be needed during the current run.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RankedTool {
+    /// Exact tool name from the bounded catalog.
+    pub name: String,
+    /// Probability that the tool may be needed at any point in the run.
+    pub probability: f64,
+}
+
+/// Conservative tool-pool recommendation from the shared `TypeSafe` request.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TypeSafeToolRecommendation {
+    /// Whether tool questions were skipped, successful, or unavailable.
+    pub status: TypeSafeRecommendationStatus,
+    /// Tools meeting the pre-committed inclusion threshold.
+    pub selected_tools: Vec<String>,
+    /// Every tool probability in deterministic catalog order.
+    pub probabilities: Vec<RankedTool>,
+    /// Whether no omitted tool fell into the configured uncertainty band.
+    pub meets_thresholds: bool,
+    /// Number of omitted tools whose probabilities require full-pool fallback.
+    pub uncertain_tool_count: usize,
+    /// Coarse failure category without raw service or credential material.
+    pub error_kind: Option<&'static str>,
+}
+
+/// Skill and tool decisions evaluated together over one request state.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TypeSafeTurnRecommendation {
+    /// At-most-one skill recommendation and shared request diagnostics.
+    pub skill: TypeSafeSkillRecommendation,
+    /// Multi-label tool-pool recommendation from independent Noul questions.
+    pub tools: TypeSafeToolRecommendation,
+}
+
 /// Coarse result category that never contains credentials or request content.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeSafeRecommendationStatus {
     /// Feature is off.
     Disabled,
-    /// No text or no skills were available.
+    /// No text or no selection candidates were available.
     Skipped,
     /// A verified typed response was returned.
     Success,
@@ -197,8 +269,10 @@ impl TypeSafeSkillSelector {
         self.config.mode
     }
 
-    /// Sends one request containing an applicability Noul and a skill Choice.
-    /// Every failure is converted into an unavailable recommendation.
+    /// Sends the Phase 2 skill questions without tool-pool questions.
+    ///
+    /// This remains available for the versioned skill-selection benchmark. The
+    /// runtime uses [`Self::recommend_turn`] so Phase 2 and Phase 3 share one call.
     #[allow(
         clippy::cast_precision_loss,
         clippy::too_many_lines,
@@ -209,11 +283,29 @@ impl TypeSafeSkillSelector {
         request: &str,
         skills: &[TypeSafeSkill],
     ) -> TypeSafeSkillRecommendation {
+        self.recommend_turn(request, skills, &[]).await.skill
+    }
+
+    /// Sends one speculative request containing the independent skill and tool
+    /// judgments needed for the current turn. Every setup, service, or answer
+    /// failure becomes an unavailable result so the runtime can use its full
+    /// deterministic fallback.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::too_many_lines,
+        reason = "one auditable adapter keeps shared-call accounting and fallback semantics together"
+    )]
+    pub async fn recommend_turn(
+        &self,
+        request: &str,
+        skills: &[TypeSafeSkill],
+        tools: &[TypeSafeTool],
+    ) -> TypeSafeTurnRecommendation {
         let request_bytes = request.len();
         let request_sha256 = request_hash(request);
         let mode = self.config.mode.as_str();
         if self.config.mode == TypeSafeMode::Off {
-            return empty_recommendation(
+            return empty_turn_recommendation(
                 mode,
                 TypeSafeRecommendationStatus::Disabled,
                 request_bytes,
@@ -221,20 +313,35 @@ impl TypeSafeSkillSelector {
                 None,
             );
         }
+        let unique_tools = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
         if request.trim().is_empty()
-            || skills.is_empty()
+            || (skills.is_empty() && tools.is_empty())
             || request_bytes > MAX_SELECTION_REQUEST_BYTES
+            || tools.len() > MAX_TOOL_CATALOG_SIZE
+            || unique_tools.len() != tools.len()
         {
-            return empty_recommendation(
+            let error_kind = if request_bytes > MAX_SELECTION_REQUEST_BYTES {
+                Some("request_too_large")
+            } else if tools.len() > MAX_TOOL_CATALOG_SIZE {
+                Some("tool_catalog_too_large")
+            } else if unique_tools.len() != tools.len() {
+                Some("duplicate_tool")
+            } else {
+                None
+            };
+            return empty_turn_recommendation(
                 mode,
                 TypeSafeRecommendationStatus::Skipped,
                 request_bytes,
                 request_sha256,
-                (request_bytes > MAX_SELECTION_REQUEST_BYTES).then_some("request_too_large"),
+                error_kind,
             );
         }
         let Some(transport) = self.transport.as_ref() else {
-            return empty_recommendation(
+            return empty_turn_recommendation(
                 mode,
                 TypeSafeRecommendationStatus::Unavailable,
                 request_bytes,
@@ -244,26 +351,76 @@ impl TypeSafeSkillSelector {
         };
 
         let mut questions = Questions::new();
-        let applicability = questions.add(
-            APPLICABILITY_QUESTION,
-            NoulQuestion::new(
-                "Does exactly one skill in `skills` clearly apply to `request` and provide specialized instructions that would materially help complete it?",
-            )
-            .with_criteria(
-                "A listed skill directly covers the requested artifact or workflow; yes includes paraphrases of its description",
-                "No listed skill directly applies, or only a generic coding or writing response is needed",
-            ),
-        );
-        let ranking_question = skills.iter().fold(
-            ChoiceQuestion::new(
-                "Which skill in `skills` is the best direct match for `request`? Compare similar skills by their complete descriptions.",
-            ),
-            |question, skill| question.with_option(&skill.name, skill.description.clone()),
-        );
-        let ranking = questions.add(RANKING_QUESTION, ranking_question);
-        let state = serde_json::json!({"request": request, "skills": skills});
+        let skill_questions = if skills.is_empty() {
+            None
+        } else {
+            let applicability = questions.add(
+                APPLICABILITY_QUESTION,
+                NoulQuestion::new(
+                    "Does exactly one skill in `skills` clearly apply to `request` and provide specialized instructions that would materially help complete it?",
+                )
+                .with_criteria(
+                    "A listed skill directly covers the requested artifact or workflow; yes includes paraphrases of its description",
+                    "No listed skill directly applies, or only a generic coding or writing response is needed",
+                ),
+            );
+            let ranking_question = skills.iter().fold(
+                ChoiceQuestion::new(
+                    "Which skill in `skills` is the best direct match for `request`? Compare similar skills by their complete descriptions.",
+                ),
+                |question, skill| question.with_option(&skill.name, skill.description.clone()),
+            );
+            let ranking = questions.add(RANKING_QUESTION, ranking_question);
+            Some((applicability, ranking))
+        };
+        let bounded_tools = tools
+            .iter()
+            .map(|tool| TypeSafeTool {
+                name: tool.name.clone(),
+                description: truncate_utf8(&tool.description, MAX_TOOL_DESCRIPTION_BYTES),
+            })
+            .collect::<Vec<_>>();
+        let tool_questions = bounded_tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let key = questions.add(
+                    format!("{TOOL_QUESTION_PREFIX}{index}"),
+                    NoulQuestion::new(format!(
+                        "Could the tool at `tools[{index}]` be needed at any point to complete `request` correctly, including likely prerequisites and follow-up steps?"
+                    ))
+                    .with_criteria(
+                        format!(
+                            "Yes: `{}` provides a concrete capability that may be required during the complete multi-step task, even if it is not the first action",
+                            tool.name
+                        ),
+                        format!(
+                            "No: `{}` is unrelated or redundant for the task; do not count it merely as a fallback discovery option",
+                            tool.name
+                        ),
+                    ),
+                );
+                (tool.name.clone(), key)
+            })
+            .collect::<Vec<(String, QuestionKey<NoulAnswer>)>>();
+        let state = serde_json::json!({
+            "request": request,
+            "skills": skills,
+            "tools": bounded_tools,
+        });
+        if serde_json::to_vec(&state)
+            .map_or(true, |encoded| encoded.len() > MAX_SELECTION_STATE_BYTES)
+        {
+            return empty_turn_recommendation(
+                mode,
+                TypeSafeRecommendationStatus::Skipped,
+                request_bytes,
+                request_sha256,
+                Some("selection_state_too_large"),
+            );
+        }
         let Ok(content) = typesafe_client::Content::json(&state) else {
-            return empty_recommendation(
+            return empty_turn_recommendation(
                 mode,
                 TypeSafeRecommendationStatus::Unavailable,
                 request_bytes,
@@ -282,64 +439,111 @@ impl TypeSafeSkillSelector {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                let mut unavailable = empty_recommendation(
+                let mut unavailable = empty_turn_recommendation(
                     mode,
                     TypeSafeRecommendationStatus::Unavailable,
                     request_bytes,
                     request_sha256,
                     Some(error_kind(&error)),
                 );
-                unavailable.latency_ms = latency_ms;
+                unavailable.skill.latency_ms = latency_ms;
                 return unavailable;
             }
         };
-        let applicable = match response.answer(&applicability) {
-            Ok(answer) => answer.noul,
-            Err(_) => {
-                return empty_recommendation(
-                    mode,
-                    TypeSafeRecommendationStatus::Unavailable,
-                    request_bytes,
-                    request_sha256,
-                    Some("invalid_answer"),
-                );
-            }
+        let (selected_skill, applicable_probability, choice_confidence, ranking) =
+            if let Some((applicability, ranking)) = skill_questions {
+                let applicable = match response.answer(&applicability) {
+                    Ok(answer) => answer.noul,
+                    Err(_) => {
+                        return invalid_answer_turn(
+                            mode,
+                            request_bytes,
+                            request_sha256,
+                            latency_ms,
+                        );
+                    }
+                };
+                let Ok(choice) = response.answer(&ranking) else {
+                    return invalid_answer_turn(mode, request_bytes, request_sha256, latency_ms);
+                };
+                let mut ranked = choice
+                    .ranked()
+                    .into_iter()
+                    .map(|(name, probability)| RankedSkill {
+                        name: name.into(),
+                        probability,
+                    })
+                    .collect::<Vec<_>>();
+                ranked.truncate(5);
+                (
+                    Some(choice.choice.clone()),
+                    Some(applicable),
+                    Some(choice.confidence),
+                    ranked,
+                )
+            } else {
+                (None, None, None, Vec::new())
+            };
+        let mut tool_probabilities = Vec::with_capacity(tool_questions.len());
+        for (name, key) in tool_questions {
+            let Ok(answer) = response.answer(&key) else {
+                return invalid_answer_turn(mode, request_bytes, request_sha256, latency_ms);
+            };
+            tool_probabilities.push(RankedTool {
+                name,
+                probability: answer.noul,
+            });
+        }
+        let selected_tools = tool_probabilities
+            .iter()
+            .filter(|tool| tool.probability >= self.config.tool_selection.inclusion_threshold)
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let uncertain_tool_count = tool_probabilities
+            .iter()
+            .filter(|tool| {
+                tool.probability < self.config.tool_selection.inclusion_threshold
+                    && tool.probability >= self.config.tool_selection.uncertainty_floor
+            })
+            .count();
+        let skill_meets_thresholds = applicable_probability.is_some_and(|applicable| {
+            applicable >= self.config.skill_selection.applicability_threshold
+                && choice_confidence.is_some_and(|confidence| {
+                    confidence >= self.config.skill_selection.confidence_threshold
+                })
+        });
+        let tool_status = if tools.is_empty() {
+            TypeSafeRecommendationStatus::Skipped
+        } else {
+            TypeSafeRecommendationStatus::Success
         };
-        let Ok(choice) = response.answer(&ranking) else {
-            return empty_recommendation(
+        TypeSafeTurnRecommendation {
+            skill: TypeSafeSkillRecommendation {
+                status: TypeSafeRecommendationStatus::Success,
                 mode,
-                TypeSafeRecommendationStatus::Unavailable,
+                selected_skill,
+                applicable_probability,
+                choice_confidence,
+                ranking,
+                meets_thresholds: skill_meets_thresholds,
+                model: Some(response.model),
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                estimated_cost_usd: response.usage.input_tokens as f64 * 0.042 / 1_000_000.0,
+                latency_ms,
                 request_bytes,
                 request_sha256,
-                Some("invalid_answer"),
-            );
-        };
-        let mut ranked = choice
-            .ranked()
-            .into_iter()
-            .map(|(name, probability)| RankedSkill {
-                name: name.into(),
-                probability,
-            })
-            .collect::<Vec<_>>();
-        ranked.truncate(5);
-        TypeSafeSkillRecommendation {
-            status: TypeSafeRecommendationStatus::Success,
-            mode,
-            selected_skill: Some(choice.choice.clone()),
-            applicable_probability: Some(applicable),
-            choice_confidence: Some(choice.confidence),
-            ranking: ranked,
-            meets_thresholds: applicable >= self.config.skill_selection.applicability_threshold
-                && choice.confidence >= self.config.skill_selection.confidence_threshold,
-            model: Some(response.model),
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            estimated_cost_usd: response.usage.input_tokens as f64 * 0.042 / 1_000_000.0,
-            latency_ms,
-            request_bytes,
-            request_sha256,
-            error_kind: None,
+                error_kind: None,
+            },
+            tools: TypeSafeToolRecommendation {
+                status: tool_status,
+                selected_tools,
+                probabilities: tool_probabilities,
+                meets_thresholds: tool_status == TypeSafeRecommendationStatus::Success
+                    && uncertain_tool_count == 0,
+                uncertain_tool_count,
+                error_kind: None,
+            },
         }
     }
 }
@@ -368,6 +572,61 @@ fn empty_recommendation(
         request_sha256,
         error_kind,
     }
+}
+
+fn empty_tool_recommendation(
+    status: TypeSafeRecommendationStatus,
+    error_kind: Option<&'static str>,
+) -> TypeSafeToolRecommendation {
+    TypeSafeToolRecommendation {
+        status,
+        selected_tools: Vec::new(),
+        probabilities: Vec::new(),
+        meets_thresholds: false,
+        uncertain_tool_count: 0,
+        error_kind,
+    }
+}
+
+fn empty_turn_recommendation(
+    mode: &'static str,
+    status: TypeSafeRecommendationStatus,
+    request_bytes: usize,
+    request_sha256: String,
+    error_kind: Option<&'static str>,
+) -> TypeSafeTurnRecommendation {
+    TypeSafeTurnRecommendation {
+        skill: empty_recommendation(mode, status, request_bytes, request_sha256, error_kind),
+        tools: empty_tool_recommendation(status, error_kind),
+    }
+}
+
+fn invalid_answer_turn(
+    mode: &'static str,
+    request_bytes: usize,
+    request_sha256: String,
+    latency_ms: u64,
+) -> TypeSafeTurnRecommendation {
+    let mut result = empty_turn_recommendation(
+        mode,
+        TypeSafeRecommendationStatus::Unavailable,
+        request_bytes,
+        request_sha256,
+        Some("invalid_answer"),
+    );
+    result.skill.latency_ms = latency_ms;
+    result
+}
+
+fn truncate_utf8(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn request_hash(request: &str) -> String {
@@ -404,6 +663,23 @@ mod tests {
             TypeSafeSkill {
                 name: "spreadsheets".into(),
                 description: "Analyze XLSX and CSV workbooks".into(),
+            },
+        ]
+    }
+
+    fn tools() -> Vec<TypeSafeTool> {
+        vec![
+            TypeSafeTool {
+                name: "read_file".into(),
+                description: "Read a workspace file".into(),
+            },
+            TypeSafeTool {
+                name: "write_file".into(),
+                description: "Create or replace a workspace file".into(),
+            },
+            TypeSafeTool {
+                name: "calendar_events".into(),
+                description: "List calendar events".into(),
             },
         ]
     }
@@ -447,6 +723,62 @@ mod tests {
 
         assert_eq!(result.status, TypeSafeRecommendationStatus::Disabled);
         assert_eq!(fake.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_turn_request_selects_multiple_tools_with_the_skill() {
+        let fake = Arc::new(FakeSystemOne::new());
+        fake.set_noul(APPLICABILITY_QUESTION, 0.94);
+        fake.set_choice_probabilities(RANKING_QUESTION, [("spreadsheets", 0.9), ("pdf", 0.1)]);
+        fake.set_noul("tool_needed_0", 0.92);
+        fake.set_noul("tool_needed_1", 0.84);
+        fake.set_noul("tool_needed_2", 0.03);
+        let selector = TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            fake.clone(),
+        );
+
+        let result = selector
+            .recommend_turn("Update the workbook on disk", &skills(), &tools())
+            .await;
+
+        assert_eq!(fake.request_count(), 1);
+        assert_eq!(
+            result.tools.selected_tools,
+            ["read_file".to_owned(), "write_file".to_owned()]
+        );
+        assert!(result.tools.meets_thresholds);
+        assert_eq!(result.skill.selected_skill.as_deref(), Some("spreadsheets"));
+        let sent = serde_json::to_value(fake.last_request().expect("request").state)
+            .expect("serialized state");
+        assert_eq!(sent["tools"].as_array().map(Vec::len), Some(3));
+        assert!(sent["tools"][0].get("parameters").is_none());
+    }
+
+    #[tokio::test]
+    async fn uncertain_omission_requires_full_pool_fallback() {
+        let fake = Arc::new(FakeSystemOne::new());
+        fake.set_noul("tool_needed_0", 0.91);
+        fake.set_noul("tool_needed_1", 0.57);
+        fake.set_noul("tool_needed_2", 0.02);
+        let selector = TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            fake,
+        );
+
+        let result = selector
+            .recommend_turn("Inspect a file", &[], &tools())
+            .await;
+
+        assert!(!result.tools.meets_thresholds);
+        assert_eq!(result.tools.uncertain_tool_count, 1);
+        assert_eq!(result.tools.selected_tools, ["read_file".to_owned()]);
     }
 
     #[tokio::test]

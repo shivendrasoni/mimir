@@ -7658,6 +7658,11 @@ async fn build_runtime_for_session(
             .register_rlm_runtime(rlm_runtime)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
+    if build.typesafe.mode == TypeSafeMode::On && !build.agent_mode.is_plan() {
+        tool_registry
+            .register_tool_search()
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+    }
     if let Some(allowed) = &build.tool_allowlist
         && !build.agent_mode.is_plan()
     {

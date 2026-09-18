@@ -11,6 +11,7 @@ mod plan;
 mod process;
 mod rlm;
 mod skill;
+mod tool_search;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -542,9 +543,35 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Registers bounded discovery for tools that are not in an active shortlist.
+    ///
+    /// The catalog is captured only after built-in, extension, and MCP tools have
+    /// been assembled, so recovery can expose any configured capability without
+    /// sending every full schema to the provider on every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reserved recovery-tool name is already registered.
+    pub fn register_tool_search(&mut self) -> Result<(), ToolError> {
+        if self.tools.contains_key("search_tools") {
+            return Err(ToolError::Execution {
+                tool: "search_tools".into(),
+                message: "tool name conflicts with an existing tool".into(),
+            });
+        }
+        let definitions = self.definitions();
+        self.register(tool_search::SearchToolsTool::new(definitions));
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) const fn has_skill_search(&self) -> bool {
         self.skill_search_registered
+    }
+
+    #[must_use]
+    pub(crate) fn has_tool_search(&self) -> bool {
+        self.tools.contains_key("search_tools")
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {

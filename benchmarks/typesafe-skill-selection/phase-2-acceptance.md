@@ -1,6 +1,6 @@
 # Phase 2 controlled acceptance
 
-Status: complete. The capability is ready for a separately published production canary; no production-retention claim is made here.
+Status: complete as the historical skill-only gate. Phase 3 subsequently added tool-pool shortlisting to the same TypeSafe request and activation switch before Mimir's first release.
 
 ## Capability accepted
 
@@ -61,4 +61,4 @@ There is no runtime rollout percentage or shadow state. Canary targeting is depl
 
 ## Scope boundary
 
-This report closes Phase 2 implementation and controlled acceptance. Production testing is intentionally separate and is defined in [phase-2-canary.md](phase-2-canary.md). Until that canary passes, TypeSafe remains off by default and Phase 3 remains a stop decision.
+This report closes the Phase 2 skill-only implementation and controlled acceptance. The planned standalone canary was superseded before release; TypeSafe remains off by default, and the combined release contract is documented in the Phase 3 acceptance report.

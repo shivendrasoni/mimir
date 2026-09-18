@@ -1,6 +1,6 @@
 # TypeSafe in Mimir: Lean Roadmap
 
-Status: implemented through Phase 3; runtime activation simplified to `off | on`
+Status: Phase 2 implementation and controlled acceptance complete; production canary tracked separately; Phase 3 expansion declined
 
 ## The first bet
 
@@ -66,11 +66,13 @@ behavior change.
    `off` as the immediate rollback; rollout percentages are deployment policy,
    not a Mimir runtime flag.
 
-**Gate:** retain the capability only if it sustains equal or better task success,
-fewer wrong and needless loads, and positive net savings.
+**Controlled gate:** proceed to a production canary only if labelled replay and
+runtime contracts show equal or better selection quality, fewer wrong and
+needless loads, bounded cost and latency, safe fallback, and working rollback.
 
-**Deliverable:** one proven production capability—or a documented decision to
-remove it.
+**Deliverable:** one canary-ready capability with a separate production
+retention plan. The canary—not this implementation phase—determines whether the
+capability is retained and whether it may ever become the default.
 
 ## Phase 3 — Pick one next bet
 
@@ -91,3 +93,11 @@ prioritization, natural-language commands, and semantic linting remain ideas onl
 
 Review this roadmap at each gate. Expand it from measured Mimir problems, not
 from the number of things Jev could theoretically do.
+
+## Evidence
+
+- [Phase 0 baseline](../benchmarks/typesafe-skill-selection/phase-0-baseline.md)
+- [Phase 1 calibrated replay](../benchmarks/typesafe-skill-selection/phase-1-shadow-final.md)
+- [Phase 2 controlled acceptance](../benchmarks/typesafe-skill-selection/phase-2-acceptance.md)
+- [Phase 2 production canary plan](../benchmarks/typesafe-skill-selection/phase-2-canary.md)
+- [Phase 3 stop decision](../benchmarks/typesafe-skill-selection/phase-3-decision.md)

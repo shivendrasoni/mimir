@@ -6,7 +6,7 @@ Decision: stop expansion; select none of the three deferred bets.
 
 Phase 1 established that Jev can materially improve labelled skill selection: the calibrated replay reached 88.5% exact accuracy versus 76.9% for the current lexical selector, reduced wasted loaded context by 79.8%, preserved the no-skill slice, stayed below the latency and token gates, and cost about $0.000978 for 26 calls.
 
-Phase 2 therefore ships one controlled capability, but its production retention gate still requires sustained real-turn telemetry. The repository does not yet contain comparable measurements showing that reasoning spend, tool/MCP selection, or false completion is Mimir's largest remaining avoidable problem. Choosing a second use case now would violate the roadmap's measured-problem rule and its instruction not to build a general TypeSafe framework.
+Phase 2 therefore produces one canary-ready capability, while production retention is tracked separately in the canary plan. The repository does not yet contain comparable measurements showing that reasoning spend, tool/MCP selection, or false completion is Mimir's largest remaining avoidable problem. Choosing a second use case now would violate the roadmap's measured-problem rule and its instruction not to build a general TypeSafe framework.
 
 ## What remains in scope
 

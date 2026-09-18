@@ -50,3 +50,13 @@ mimir diagnose replay <run-id>
 ## Process coverage
 
 Direct text, JSON, JSON-RPC, ACP, autonomous, REPL, and TUI processes attach the diagnostic collector at CLI dispatch. Each daemon-managed prompt attaches its own collector for the complete prompt lifecycle, including queued follow-ups and autonomous continuations, so long-lived daemon sessions produce one bounded bundle per admitted prompt.
+
+## TypeSafe skill-selection evidence
+
+When TypeSafe is `on`, an evaluated turn adds three runtime-event kinds:
+
+- `typesafe_skill_selection` records the decision, selected skill, bounded probabilities, threshold result, request byte count and hash, model, token usage, estimated cost, latency, added context, and a coarse failure category;
+- `typesafe_skill_outcome` records whether the enclosing Mimir turn completed; and
+- `typesafe_skill_correction` records when the main model later activates a different skill.
+
+These events never contain the TypeSafe API key or request text. They are intended for aggregate canary comparison of completion, wrong or needless loads, corrections, net token savings, cost, and latency. They do not replace the session transcript and must not be interpreted as proof of task quality in isolation.

@@ -8,6 +8,8 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 
 - API keys are held in `SecretString`, omitted from request previews, redacted from `Debug`, and never included in diagnostics.
 - `.env` loading is optional convenience; the file is never parsed into logs or persisted state.
+- TypeSafe is off by default. When explicitly enabled, Mimir sends the current user request and bounded discovered-skill names and descriptions to the TypeSafe API over its Rust client. The API key and request text are not copied into TypeSafe runtime events; those events retain only bounded decision metadata, counts, hashes, timing, and usage.
+- A TypeSafe result has no authority over tools, permissions, providers, or execution. Rust-owned applicability and confidence thresholds gate at most one skill activation, an explicit skill wins, and all TypeSafe failures fall back to the normal skill-search path.
 - Provider adapters use TLS, request timeouts, an 8 MiB stream/response ceiling, sanitized errors, and redacted debug output.
 - Anthropic API-key and OAuth bearer authentication are separate typed paths. Custom providers accept only HTTPS or loopback HTTP endpoints and environment-variable credential references.
 - File tools canonicalize a workspace root, reject traversal and escaping symlinks, cap reads/writes/searches, and atomically replace writes.
@@ -27,6 +29,7 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 - Use a dedicated writable state directory with restrictive OS permissions.
 - Run dependency auditing in CI and review `Cargo.lock` changes.
 - Treat provider responses as instructions, never authority to expand policy.
+- Enable TypeSafe only when sending the current request and skill summaries to that external service is acceptable; use `--typesafe off` as the immediate rollback.
 
 ## Reporting
 

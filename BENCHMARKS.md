@@ -44,6 +44,21 @@ With the underlying model matched, Mimir recorded the same solve rate, a slightl
 
 These are harness-level results from a small, fixed task suite, not universal model-quality claims. Token accounting follows each harness adapter's recorded totals. Cost is omitted here because the Claude Code report mixes vendor-reported and locally estimated costs, while the Codex run has no recorded comparison cost.
 
+## TypeSafe skill selection
+
+The TypeSafe experiment uses a versioned 26-case labelled corpus spanning spreadsheets, PDFs, documents, presentations, image generation, security review, code review, and requests requiring no skill. A live replay on 2026-09-19 produced:
+
+| Metric | Existing selector | TypeSafe | Gate result |
+| --- | ---: | ---: | --- |
+| Exact selection accuracy | 76.9% | 88.5% | Pass: +11.5 points |
+| Wrong / missed / needless | 4 / 1 / 1 | 1 / 2 / 0 | Pass: fewer total errors |
+| No-skill accuracy | 80.0% | 100.0% | Pass: no regression |
+| Wasted loaded context | 361.5 tokens/case | 73.1 tokens/case | Pass: 79.8% lower |
+| Selection p95 latency | 0.134 ms | 741 ms | Pass: below 2.5 s |
+| TypeSafe input | 0 | 896.0 tokens/case | Pass: below 1,800 |
+
+The 26 TypeSafe calls cost an estimated $0.000978. This controlled replay supports explicit canary use; it is not production evidence. See the [Phase 2 acceptance report](benchmarks/typesafe-skill-selection/phase-2-acceptance.md) and the separate [production canary plan](benchmarks/typesafe-skill-selection/phase-2-canary.md).
+
 ## Local runtime measurements
 
 Benchmarks are captured from the release binary on the benchmark machine after all quality gates pass. Reproduce the basic checks with:

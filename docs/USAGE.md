@@ -39,6 +39,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"health"}' | mimir --provider fa
 
 The model has a workspace-rooted `bash` tool. In `default` mode every model-issued shell command requires confirmation, while `/mode auto` runs shell commands and workspace edits immediately. Use `/mode default` to return to confirmation.
 
+When the optional official `rtk` executable is on `PATH`, Mimir transparently runs supported Bash commands through RTK after Mimir has approved the original command. This reduces command output sent back into model context without changing Mimir's permission checks or execution bounds. Unsupported commands and RTK errors pass through unchanged. Prefix an individual command with `RTK_DISABLED=1` to bypass rewriting, and run `rtk gain` outside Mimir to inspect RTK's estimated output savings.
+
 `/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and `write_plan`. It can inspect the repository, pause for a structured clarification, and create or revise one session-bound Markdown file under `plans/`; direct shell commands, extensions, MCP, IPython, child agents, and autonomous continuations are disabled. Plan mode supports native model providers only.
 
 Outside plan mode, an explicit request such as “remember that this project uses strict Clippy” can invoke the built-in `remember` tool. It stores a project-scoped memory by default through the same durable refinement history as `/refine`. Say that the memory is temporary to select session scope. User scope requires explicit wording such as “remember this across all projects”; the host verifies that wording and rejects project phases, status, branches, commits, versions, paths, and completion claims from global memory.

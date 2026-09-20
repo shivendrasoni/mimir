@@ -14,6 +14,7 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 - Anthropic API-key and OAuth bearer authentication are separate typed paths. Custom providers accept only HTTPS or loopback HTTP endpoints and environment-variable credential references.
 - File tools canonicalize a workspace root, reject traversal and escaping symlinks, cap reads/writes/searches, and atomically replace writes.
 - Process execution is disabled by default. When enabled, a missing allowlist denies all execution. Matching is exact; `/tmp/cargo` does not match `cargo`. Commands receive direct argv, cleared environment, a fixed PATH, null stdin, bounded combined output, timeout, and process-group termination.
+- Bash execution may invoke an optional `rtk` executable from the inherited `PATH` to rewrite an already-authorized command before execution. Treat that binary and `PATH` as trusted executable dependencies. Missing, rejected, malformed, or slow RTK rewrites fall back to the original command; Mimir's approval and allowlist decisions remain based on that original command.
 - State writes use atomic replacement, path-scoped in-process locks, and reject symlinked state components. Credential, daemon-metadata, and session files are mode `0600` on Unix.
 - Diagnostic bundles are metadata-only, redact absolute paths and credential-like literals, use mode `0700` directories and `0600` files on Unix, and enforce event-count, file-size, total-size, and retained-run bounds.
 - Daemon IPC rejects frames larger than 1 MiB, refuses to unlink non-socket paths, bounds inactive history, and cancels in-flight connections during shutdown.
@@ -26,6 +27,7 @@ Prompts, model responses, tool arguments, workspace contents, session files, RPC
 ## Operational guidance
 
 - Keep `--allow-process` off unless the task requires it; use the smallest exact `--allowed-programs` list.
+- Install RTK only from its official repository and keep untrusted directories out of `PATH` when Bash execution is enabled.
 - Use a dedicated writable state directory with restrictive OS permissions.
 - Run dependency auditing in CI and review `Cargo.lock` changes.
 - Treat provider responses as instructions, never authority to expand policy.

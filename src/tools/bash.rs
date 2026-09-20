@@ -41,6 +41,7 @@ use super::{ToolError, ToolPolicy, WorkspacePathPolicy};
 
 const MAX_FULL_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,17 +281,38 @@ impl BashRunner {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cancellation.clone();
         self.running.store(true, Ordering::Release);
 
-        let child = spawn_shell(command, self.paths.root()).inspect_err(|_error| {
-            self.running.store(false, Ordering::Release);
-        })?;
-        let result = capture_shell(
-            child,
-            self.policy.command_timeout,
-            self.policy.max_output_bytes,
-            &cancellation,
-            output.as_ref(),
-        )
-        .await;
+        // RTK is an optional companion binary. Mimir owns authorization for
+        // the original command; RTK only rewrites that approved command into
+        // an output-filtering proxy invocation. Missing, outdated, denied, or
+        // slow RTK installations therefore degrade to the original command.
+        let rewritten = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            rewritten = rewrite_with_rtk(command, self.paths.root()) => rewritten,
+        };
+        let command = rewritten.as_deref().unwrap_or(command);
+        let result = if cancellation.is_cancelled() {
+            Ok(BashResult {
+                output: String::new(),
+                exit_code: None,
+                cancelled: true,
+                truncated: false,
+                full_output_path: None,
+                timed_out: false,
+            })
+        } else {
+            let child = spawn_shell(command, self.paths.root()).inspect_err(|_error| {
+                self.running.store(false, Ordering::Release);
+            })?;
+            capture_shell(
+                child,
+                self.policy.command_timeout,
+                self.policy.max_output_bytes,
+                &cancellation,
+                output.as_ref(),
+            )
+            .await
+        };
         if let Some(forwarder) = cancellation_forwarder {
             forwarder.abort();
         }
@@ -337,7 +359,10 @@ fn validate_allowlisted_command(
             message: "command contains control characters".into(),
         });
     }
-    let program = command.split_whitespace().next().unwrap_or_default();
+    let program = command
+        .split_whitespace()
+        .find(|token| *token != "RTK_DISABLED=1")
+        .unwrap_or_default();
     if program.is_empty() {
         return Err(ToolError::InvalidArguments {
             tool: "bash".into(),
@@ -389,6 +414,52 @@ fn shell_path() -> OsString {
     std::env::var_os("PATH")
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| OsString::from("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"))
+}
+
+async fn rewrite_with_rtk(command: &str, workspace: &Path) -> Option<String> {
+    rewrite_with_rtk_binary(std::ffi::OsStr::new("rtk"), command, workspace).await
+}
+
+async fn rewrite_with_rtk_binary(
+    binary: &std::ffi::OsStr,
+    command: &str,
+    workspace: &Path,
+) -> Option<String> {
+    let mut process = Command::new(binary);
+    process
+        .args(["rewrite", command])
+        .current_dir(workspace)
+        .env_clear()
+        .env("PATH", shell_path())
+        .env("LANG", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(RTK_REWRITE_TIMEOUT, process.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !matches!(output.status.code(), Some(0 | 3)) {
+        return None;
+    }
+    let rewritten = String::from_utf8(output.stdout).ok()?;
+    let rewritten = rewritten.trim();
+    if rewritten.is_empty()
+        || rewritten.len() > MAX_COMMAND_BYTES
+        || rewritten
+            .chars()
+            .any(|character| character.is_control() && character != '\t' && character != '\n')
+    {
+        return None;
+    }
+    tracing::debug!(
+        target: "mimir::tools::bash",
+        original_bytes = command.len(),
+        rewritten_bytes = rewritten.len(),
+        "RTK rewrote bash command"
+    );
+    Some(rewritten.to_owned())
 }
 
 async fn capture_shell(
@@ -572,4 +643,89 @@ async fn terminate_group(child: &mut Child) {
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::{rewrite_with_rtk_binary, validate_allowlisted_command};
+
+    fn fake_rtk(root: &TempDir, body: &str) -> std::path::PathBuf {
+        let path = root.path().join("rtk");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("fake rtk");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).expect("permissions");
+        path
+    }
+
+    #[tokio::test]
+    async fn rtk_rewrite_accepts_allow_and_ask_protocol_outcomes() {
+        let root = TempDir::new().expect("tempdir");
+        for (name, exit_code) in [("allow", 0), ("ask", 3)] {
+            let directory = TempDir::new_in(root.path()).expect("case tempdir");
+            let binary = fake_rtk(
+                &directory,
+                &format!(
+                    "[ \"$1\" = rewrite ] || exit 9\n[ \"$2\" = 'cargo test' ] || exit 8\nprintf 'rtk cargo test'\nexit {exit_code}"
+                ),
+            );
+            assert_eq!(
+                rewrite_with_rtk_binary(binary.as_os_str(), "cargo test", root.path()).await,
+                Some("rtk cargo test".into()),
+                "{name} outcome"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rtk_rewrite_falls_back_for_passthrough_and_invalid_output() {
+        let missing_root = TempDir::new().expect("tempdir");
+        assert_eq!(
+            rewrite_with_rtk_binary(
+                missing_root.path().join("missing-rtk").as_os_str(),
+                "cargo test",
+                missing_root.path(),
+            )
+            .await,
+            None
+        );
+
+        let root = TempDir::new().expect("tempdir");
+        let passthrough = fake_rtk(&root, "exit 1");
+        assert_eq!(
+            rewrite_with_rtk_binary(passthrough.as_os_str(), "printf ok", root.path()).await,
+            None
+        );
+
+        let denied_root = TempDir::new().expect("tempdir");
+        let denied = fake_rtk(&denied_root, "exit 2");
+        assert_eq!(
+            rewrite_with_rtk_binary(denied.as_os_str(), "cargo test", denied_root.path()).await,
+            None
+        );
+
+        let invalid_root = TempDir::new().expect("tempdir");
+        let invalid = fake_rtk(&invalid_root, "printf '\\001bad'\nexit 0");
+        assert_eq!(
+            rewrite_with_rtk_binary(invalid.as_os_str(), "cargo test", invalid_root.path()).await,
+            None
+        );
+    }
+
+    #[test]
+    fn rtk_single_command_bypass_keeps_program_allowlist_enforced() {
+        let allowed = ["cargo".to_owned()];
+        assert!(
+            validate_allowlisted_command("RTK_DISABLED=1 cargo test", Some(&allowed), false)
+                .is_ok()
+        );
+        assert!(
+            validate_allowlisted_command("RTK_DISABLED=1 git status", Some(&allowed), false)
+                .is_err()
+        );
+    }
 }

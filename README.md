@@ -17,6 +17,8 @@ Optional TypeSafe turn selection can load one relevant skill and shortlist the c
 
 It does not require Node.js. Python 3 is optional and is started only when the explicitly authorized `ipython` tool is enabled with `--allow-process` and a non-empty program allowlist.
 
+If the optional [RTK](https://github.com/rtk-ai/rtk) binary is on `PATH`, Mimir automatically asks `rtk rewrite` to route supported Bash commands through RTK's compact-output filters. Mimir still authorizes the original command and retains its existing timeout, cancellation, and output limits; an absent, unsupported, or failing RTK installation falls back to the original command. Use RTK's `RTK_DISABLED=1` command prefix for a one-command bypass and `rtk gain` to inspect estimated Bash-output savings. RTK is a companion executable, not a Rust library dependency; install the official project with `cargo install --git https://github.com/rtk-ai/rtk --branch master --locked`.
+
 ## Install
 
 Binary releases are not currently published. Build and install Mimir from source:

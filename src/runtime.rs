@@ -21,7 +21,7 @@ use crate::{
         LifecycleInterception, LifecycleMutation, LifecycleReplacement, SessionForkPosition,
         SessionStartReason, SessionSwitchReason, UiRequest,
     },
-    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel},
+    model::{Content, Message, ModelRequest, Role, StopReason, ThinkingLevel, ToolDefinition},
     provider::{
         AuthenticationRefreshStatus, Provider, ProviderError, ProviderEvent, ProviderEventSink,
     },
@@ -31,6 +31,11 @@ use crate::{
     skills::{SkillInvocationError, SkillRuntime},
     tools::{
         ClarifyingQuestion, ObservationStatus, PermissionRequest, ToolObservation, ToolRegistry,
+    },
+    typesafe::{
+        TypeSafeConfig, TypeSafeMode, TypeSafeRecommendationStatus, TypeSafeSkill,
+        TypeSafeSkillRecommendation, TypeSafeSkillSelector, TypeSafeTool,
+        TypeSafeTurnRecommendation,
     },
 };
 
@@ -50,6 +55,7 @@ pub struct RuntimeConfig {
     /// Re-resolve the token ceiling from the active provider whenever its model changes.
     pub provider_aware_token_budget: bool,
     pub provider_timeout: Duration,
+    pub typesafe: TypeSafeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +86,7 @@ impl RuntimeConfig {
             budget: Budget::default(),
             provider_aware_token_budget: false,
             provider_timeout: Duration::from_secs(15 * 60),
+            typesafe: TypeSafeConfig::default(),
         }
     }
 }
@@ -363,6 +370,7 @@ pub struct AgentRuntime {
     control_cancellation: StdMutex<CancellationToken>,
     retry_cancellation: StdMutex<CancellationToken>,
     skills: StdMutex<SkillRuntime>,
+    typesafe_skill_selector: RwLock<Arc<TypeSafeSkillSelector>>,
     extensions: RwLock<Option<Arc<ExtensionManager>>>,
     extension_session_id: RwLock<String>,
     extension_session_name: RwLock<Option<String>>,
@@ -379,6 +387,16 @@ struct RuntimeSelection {
     thinking_level: ThinkingLevel,
     supported_thinking_levels: Vec<ThinkingLevel>,
     thinking_level_map: Option<BTreeMap<ThinkingLevel, Option<String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTypeSafeSelection {
+    request_sha256: String,
+    selected_skill: Option<String>,
+    activated_skill: Option<String>,
+    shortlisted_tools: Option<BTreeSet<String>>,
+    full_tool_count: usize,
+    shortlisted_tool_count: usize,
 }
 
 struct RunningFlag<'a>(&'a AtomicBool);
@@ -495,6 +513,7 @@ impl AgentRuntime {
         if config.provider_aware_token_budget {
             operational_budget.max_tokens = provider_default_token_limit(&config.provider);
         }
+        let typesafe_skill_selector = TypeSafeSkillSelector::from_env(config.typesafe.clone());
         Ok(Self {
             selection: RwLock::new(RuntimeSelection {
                 provider,
@@ -527,6 +546,7 @@ impl AgentRuntime {
             control_cancellation: StdMutex::new(CancellationToken::new()),
             retry_cancellation: StdMutex::new(CancellationToken::new()),
             skills: StdMutex::new(SkillRuntime::default()),
+            typesafe_skill_selector: RwLock::new(Arc::new(typesafe_skill_selector)),
             extensions: RwLock::new(None),
             extension_session_id: RwLock::new(String::new()),
             extension_session_name: RwLock::new(None),
@@ -760,6 +780,12 @@ impl AgentRuntime {
             .skills
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = skills;
+    }
+
+    /// Replaces the `TypeSafe` selector for contract tests and embedded runtimes.
+    #[doc(hidden)]
+    pub async fn attach_typesafe_skill_selector(&self, selector: TypeSafeSkillSelector) {
+        *self.typesafe_skill_selector.write().await = Arc::new(selector);
     }
 
     pub async fn extension_manager(&self) -> Option<Arc<ExtensionManager>> {
@@ -1034,23 +1060,46 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn active_tool_definitions(&self) -> Vec<crate::model::ToolDefinition> {
+    async fn active_tool_definitions(
+        &self,
+        typesafe_shortlist: Option<&BTreeSet<String>>,
+    ) -> Vec<crate::model::ToolDefinition> {
         let definitions = self.tools.definitions();
         let active = self.active_tools.read().await;
-        active.as_ref().map_or(definitions.clone(), |active| {
-            definitions
-                .into_iter()
-                .filter(|definition| active.contains(&definition.name))
-                .collect()
-        })
+        let recovery_available = definitions
+            .iter()
+            .any(|definition| definition.name == "search_tools")
+            && active
+                .as_ref()
+                .is_none_or(|active| active.contains("search_tools"));
+        let typesafe_shortlist = typesafe_shortlist.filter(|_| recovery_available);
+        definitions
+            .into_iter()
+            .filter(|definition| {
+                active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(&definition.name))
+                    && typesafe_shortlist
+                        .is_none_or(|shortlist| shortlist.contains(&definition.name))
+            })
+            .collect()
     }
 
-    async fn is_tool_active(&self, name: &str) -> bool {
-        self.active_tools
-            .read()
-            .await
-            .as_ref()
-            .is_none_or(|active| active.contains(name))
+    async fn is_tool_active(
+        &self,
+        name: &str,
+        typesafe_shortlist: Option<&BTreeSet<String>>,
+    ) -> bool {
+        let active = self.active_tools.read().await;
+        let base_active = active.as_ref().is_none_or(|active| active.contains(name));
+        let recovery_available = self.tools.has_tool_search()
+            && active
+                .as_ref()
+                .is_none_or(|active| active.contains("search_tools"));
+        base_active
+            && typesafe_shortlist
+                .filter(|_| recovery_available)
+                .is_none_or(|shortlist| shortlist.contains(name))
     }
 
     /// Renders a registered custom message and emits its bounded terminal lines.
@@ -2204,17 +2253,35 @@ impl AgentRuntime {
             .clear_pending_plan_question()
             .await
             .map_err(|error| MimirError::Tool(error.to_string()))?;
-        let active_skill_context = self
+        let mut active_skill_context = self
             .skill_context_for_messages(messages)
             .map_err(|error| skill_invocation_error(&error))?;
         let _guard = self.run_lock.lock().await;
+        let explicit_skill = active_skill_context.is_some();
+        let typesafe = self
+            .prepare_typesafe_selection(messages, &mut active_skill_context, explicit_skill)
+            .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
             downstream: sink,
             bus: &self.events,
             source,
         };
-        let result = self.run_inner(messages, active_skill_context, &sink).await;
+        let result = self
+            .run_inner(
+                messages,
+                active_skill_context,
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.activated_skill.clone()),
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.shortlisted_tools.clone()),
+                &sink,
+            )
+            .await;
+        self.record_typesafe_outcome(typesafe.as_ref(), result.is_ok())
+            .await;
         self.finish_run(result, &sink).await
     }
 
@@ -2230,16 +2297,34 @@ impl AgentRuntime {
         if pending.is_empty() {
             return Ok(None);
         }
-        let active_skill_context = self
+        let mut active_skill_context = self
             .skill_context_for_messages(&pending)
             .map_err(|error| skill_invocation_error(&error))?;
+        let explicit_skill = active_skill_context.is_some();
+        let typesafe = self
+            .prepare_typesafe_selection(&pending, &mut active_skill_context, explicit_skill)
+            .await;
         let _running = RunningFlag::new(&self.running);
         let sink = BroadcastingEventSink {
             downstream: sink,
             bus: &self.events,
             source: RuntimeEventSource::new(),
         };
-        let result = self.run_inner(&[], active_skill_context, &sink).await;
+        let result = self
+            .run_inner(
+                &[],
+                active_skill_context,
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.activated_skill.clone()),
+                typesafe
+                    .as_ref()
+                    .and_then(|selection| selection.shortlisted_tools.clone()),
+                &sink,
+            )
+            .await;
+        self.record_typesafe_outcome(typesafe.as_ref(), result.is_ok())
+            .await;
         self.finish_run(result, &sink).await.map(Some)
     }
 
@@ -2292,6 +2377,8 @@ impl AgentRuntime {
         &self,
         prompts: &[Message],
         mut active_skill_context: Option<String>,
+        typesafe_activated_skill: Option<String>,
+        mut typesafe_tool_shortlist: Option<BTreeSet<String>>,
         sink: &dyn EventSink,
     ) -> Result<String> {
         let cancellation = self
@@ -2432,7 +2519,9 @@ impl AgentRuntime {
                 self.combined_system_prompt(active_skill_context.as_deref())
                     .await,
             );
-            let preflight_tools = self.active_tool_definitions().await;
+            let preflight_tools = self
+                .active_tool_definitions(typesafe_tool_shortlist.as_ref())
+                .await;
             let max_output_tokens = self.max_output_tokens.load(Ordering::Acquire);
             self.compact_if_needed(
                 &preflight_system_prompt,
@@ -2593,7 +2682,9 @@ impl AgentRuntime {
                 thinking_effort,
                 system_prompt: effective_system_prompt,
                 messages: prepare_context_messages(&messages),
-                tools: self.active_tool_definitions().await,
+                tools: self
+                    .active_tool_definitions(typesafe_tool_shortlist.as_ref())
+                    .await,
                 max_output_tokens,
             };
             let turn = usage.snapshot().turns.saturating_add(1);
@@ -2832,7 +2923,10 @@ impl AgentRuntime {
                         tool: call.name.clone(),
                         message: reason,
                     })
-                } else if self.is_tool_active(&call.name).await {
+                } else if self
+                    .is_tool_active(&call.name, typesafe_tool_shortlist.as_ref())
+                    .await
+                {
                     self.tools
                         .execute_cancellable(&call.name, call.arguments, &cancellation)
                         .await
@@ -2845,16 +2939,79 @@ impl AgentRuntime {
                     && self.tools.has_skill_search()
                     && call.name == "search_skills"
                     && let Some(name) = arguments.get("name").and_then(serde_json::Value::as_str)
-                    && let Err(error) = self
+                {
+                    let activation = self
                         .skills
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .activate(&mut active_skill_context, name)
+                        .activate(&mut active_skill_context, name);
+                    match activation {
+                        Ok(activated) => {
+                            if activated
+                                && typesafe_activated_skill
+                                    .as_deref()
+                                    .is_some_and(|activated| activated != name)
+                            {
+                                let detail = serde_json::json!({
+                                    "type": "typesafe_skill_correction",
+                                    "activated_skill": typesafe_activated_skill,
+                                    "corrected_skill": name,
+                                });
+                                if let Ok(detail) = serde_json::to_string(&detail) {
+                                    let _ = self
+                                        .record_runtime_event_raw(
+                                            "typesafe_skill_correction",
+                                            &detail,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            execution = Err(crate::tools::ToolError::Execution {
+                                tool: call.name.clone(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+                if call.name == "search_tools"
+                    && let (Some(shortlist), Ok(observation)) =
+                        (typesafe_tool_shortlist.as_mut(), execution.as_ref())
                 {
-                    execution = Err(crate::tools::ToolError::Execution {
-                        tool: call.name.clone(),
-                        message: error.to_string(),
-                    });
+                    let available = self
+                        .tools
+                        .definitions()
+                        .into_iter()
+                        .map(|definition| definition.name)
+                        .collect::<BTreeSet<_>>();
+                    let activated = serde_json::from_str::<serde_json::Value>(&observation.content)
+                        .ok()
+                        .and_then(|content| content.get("activated").cloned())
+                        .and_then(|activated| activated.as_array().cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|entry| {
+                            entry
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .filter(|name| available.contains(name))
+                        .collect::<BTreeSet<_>>();
+                    if !activated.is_empty() {
+                        shortlist.extend(activated.iter().cloned());
+                        let detail = serde_json::json!({
+                            "type": "typesafe_tool_recovery",
+                            "activated_tools": activated,
+                            "active_tool_count": shortlist.len(),
+                        });
+                        if let Ok(detail) = serde_json::to_string(&detail) {
+                            let _ = self
+                                .record_runtime_event_raw("typesafe_tool_recovery", &detail)
+                                .await;
+                        }
+                    }
                 }
                 if let Err(crate::tools::ToolError::ApprovalRequired { request }) = &execution {
                     sink.emit(RuntimeEvent::PermissionRequested {
@@ -3099,6 +3256,254 @@ impl AgentRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .context_for_messages(messages)
+    }
+
+    async fn prepare_typesafe_selection(
+        &self,
+        messages: &[Message],
+        active_skill_context: &mut Option<String>,
+        explicit_skill: bool,
+    ) -> Option<PreparedTypeSafeSelection> {
+        let selector = self.typesafe_skill_selector.read().await.clone();
+        if selector.mode() == TypeSafeMode::Off {
+            return None;
+        }
+        let request = messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(Message::text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let skills = if explicit_skill {
+            Vec::new()
+        } else {
+            self.skills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .summaries()
+                .into_iter()
+                .map(|skill| TypeSafeSkill {
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect::<Vec<_>>()
+        };
+        let full_tool_definitions = self.active_tool_definitions(None).await;
+        let can_shortlist_tools = full_tool_definitions
+            .iter()
+            .any(|definition| definition.name == "search_tools");
+        let tool_candidates = if can_shortlist_tools {
+            full_tool_definitions
+                .iter()
+                .filter(|definition| !typesafe_always_available_tool(&definition.name))
+                .map(|definition| TypeSafeTool {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let recommendation = selector
+            .recommend_turn(&request, &skills, &tool_candidates)
+            .await;
+        let selected_skill = recommendation.skill.selected_skill.clone();
+        let activated_skill = self
+            .apply_typesafe_skill_selection(
+                &recommendation.skill,
+                active_skill_context,
+                explicit_skill,
+            )
+            .await;
+        let (shortlisted_tools, shortlisted_tool_count) = self
+            .prepare_typesafe_tool_shortlist(
+                &recommendation,
+                &full_tool_definitions,
+                can_shortlist_tools,
+            )
+            .await;
+        Some(PreparedTypeSafeSelection {
+            request_sha256: recommendation.skill.request_sha256,
+            selected_skill,
+            activated_skill,
+            shortlisted_tools,
+            full_tool_count: full_tool_definitions.len(),
+            shortlisted_tool_count,
+        })
+    }
+
+    async fn apply_typesafe_skill_selection(
+        &self,
+        recommendation: &TypeSafeSkillRecommendation,
+        active_skill_context: &mut Option<String>,
+        explicit_skill: bool,
+    ) -> Option<String> {
+        let selected_skill = recommendation.selected_skill.clone();
+        let context_before = active_skill_context.as_ref().map_or(0, String::len);
+        let mut activated_skill = None;
+        let mut activation_error = None;
+        if !explicit_skill
+            && recommendation.status == TypeSafeRecommendationStatus::Success
+            && recommendation.meets_thresholds
+            && let Some(name) = selected_skill.as_deref()
+        {
+            match self
+                .skills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .activate(active_skill_context, name)
+            {
+                Ok(true) => activated_skill = Some(name.to_owned()),
+                Ok(false) => {}
+                Err(_) => activation_error = Some("skill_activation"),
+            }
+        }
+        let added_context_tokens = active_skill_context
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_sub(context_before)
+            .div_ceil(4);
+        let skill_decision = if explicit_skill {
+            "explicit_skill"
+        } else if activated_skill.is_some() {
+            "activated"
+        } else if recommendation.status == TypeSafeRecommendationStatus::Success
+            && !recommendation.meets_thresholds
+        {
+            "fallback_uncertain"
+        } else if recommendation.status == TypeSafeRecommendationStatus::Success {
+            "no_activation"
+        } else {
+            "fallback_unavailable"
+        };
+        if let Ok(detail) = serde_json::to_string(&serde_json::json!({
+            "type": "typesafe_skill_selection",
+            "selection": recommendation,
+            "decision": skill_decision,
+            "activation_error": activation_error,
+            "added_context_tokens": added_context_tokens,
+        })) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_skill_selection", &detail)
+                .await;
+        }
+        activated_skill
+    }
+
+    async fn prepare_typesafe_tool_shortlist(
+        &self,
+        recommendation: &TypeSafeTurnRecommendation,
+        full_tool_definitions: &[ToolDefinition],
+        can_shortlist_tools: bool,
+    ) -> (Option<BTreeSet<String>>, usize) {
+        let full_tool_tokens = estimate_tool_definition_tokens(full_tool_definitions);
+        let mut shortlisted_tools = None;
+        let mut shortlisted_tool_tokens = full_tool_tokens;
+        let mut tool_decision = if can_shortlist_tools {
+            "fallback_unavailable"
+        } else {
+            "fallback_no_recovery"
+        };
+        if can_shortlist_tools
+            && recommendation.tools.status == TypeSafeRecommendationStatus::Success
+            && recommendation.tools.meets_thresholds
+        {
+            let mut selected = recommendation
+                .tools
+                .selected_tools
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            selected.extend(
+                full_tool_definitions
+                    .iter()
+                    .filter(|definition| typesafe_always_available_tool(&definition.name))
+                    .map(|definition| definition.name.clone()),
+            );
+            let selected_definitions = full_tool_definitions
+                .iter()
+                .filter(|definition| selected.contains(&definition.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_tokens = estimate_tool_definition_tokens(&selected_definitions);
+            let savings = full_tool_tokens.saturating_sub(selected_tokens);
+            if savings
+                >= self
+                    .config
+                    .typesafe
+                    .tool_selection
+                    .minimum_context_savings_tokens
+            {
+                shortlisted_tool_tokens = selected_tokens;
+                shortlisted_tools = Some(selected);
+                tool_decision = "shortlisted";
+            } else {
+                tool_decision = "fallback_no_savings";
+            }
+        } else if can_shortlist_tools
+            && recommendation.tools.status == TypeSafeRecommendationStatus::Success
+        {
+            tool_decision = "fallback_uncertain";
+        }
+        let shortlisted_tool_count = shortlisted_tools
+            .as_ref()
+            .map_or(full_tool_definitions.len(), BTreeSet::len);
+        if let Ok(detail) = serde_json::to_string(&serde_json::json!({
+            "type": "typesafe_tool_selection",
+            "selection": recommendation.tools,
+            "decision": tool_decision,
+            "request_sha256": recommendation.skill.request_sha256,
+            "shared_input_tokens": recommendation.skill.input_tokens,
+            "shared_output_tokens": recommendation.skill.output_tokens,
+            "shared_estimated_cost_usd": recommendation.skill.estimated_cost_usd,
+            "shared_latency_ms": recommendation.skill.latency_ms,
+            "full_tool_count": full_tool_definitions.len(),
+            "active_tool_count": shortlisted_tool_count,
+            "full_context_tokens": full_tool_tokens,
+            "active_context_tokens": shortlisted_tool_tokens,
+            "estimated_provider_context_savings_tokens": full_tool_tokens.saturating_sub(shortlisted_tool_tokens),
+        })) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_tool_selection", &detail)
+                .await;
+        }
+        (shortlisted_tools, shortlisted_tool_count)
+    }
+
+    async fn record_typesafe_outcome(
+        &self,
+        selection: Option<&PreparedTypeSafeSelection>,
+        task_succeeded: bool,
+    ) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let detail = serde_json::json!({
+            "type": "typesafe_skill_outcome",
+            "request_sha256": selection.request_sha256,
+            "selected_skill": selection.selected_skill,
+            "activated_skill": selection.activated_skill,
+            "task_succeeded": task_succeeded,
+        });
+        if let Ok(detail) = serde_json::to_string(&detail) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_skill_outcome", &detail)
+                .await;
+        }
+        let tool_detail = serde_json::json!({
+            "type": "typesafe_tool_outcome",
+            "request_sha256": selection.request_sha256,
+            "shortlist_active": selection.shortlisted_tools.is_some(),
+            "full_tool_count": selection.full_tool_count,
+            "initial_tool_count": selection.shortlisted_tool_count,
+            "task_succeeded": task_succeeded,
+        });
+        if let Ok(detail) = serde_json::to_string(&tool_detail) {
+            let _ = self
+                .record_runtime_event_raw("typesafe_tool_outcome", &detail)
+                .await;
+        }
     }
 
     /// Dispatches a typed lifecycle event and emits any validated UI requests.
@@ -3910,10 +4315,17 @@ fn estimate_request_tokens(
     tools: &[crate::model::ToolDefinition],
 ) -> u64 {
     const REQUEST_FRAMING_TOKENS: u64 = 256;
-    const TOOL_FRAMING_TOKENS: u64 = 16;
     let system_tokens =
         u64::try_from(system_prompt.chars().count().div_ceil(4)).unwrap_or(u64::MAX);
-    let tool_tokens = tools.iter().fold(0_u64, |total, tool| {
+    REQUEST_FRAMING_TOKENS
+        .saturating_add(system_tokens)
+        .saturating_add(estimate_tool_definition_tokens(tools))
+        .saturating_add(estimate_message_tokens(messages))
+}
+
+fn estimate_tool_definition_tokens(tools: &[crate::model::ToolDefinition]) -> u64 {
+    const TOOL_FRAMING_TOKENS: u64 = 16;
+    tools.iter().fold(0_u64, |total, tool| {
         let characters = tool
             .name
             .chars()
@@ -3925,11 +4337,11 @@ fn estimate_request_tokens(
                 .unwrap_or(u64::MAX)
                 .saturating_add(TOOL_FRAMING_TOKENS),
         )
-    });
-    REQUEST_FRAMING_TOKENS
-        .saturating_add(system_tokens)
-        .saturating_add(tool_tokens)
-        .saturating_add(estimate_message_tokens(messages))
+    })
+}
+
+fn typesafe_always_available_tool(name: &str) -> bool {
+    matches!(name, "search_tools" | "search_skills" | "finish_task")
 }
 
 fn auto_compaction_split(

@@ -1,0 +1,76 @@
+{
+  "name": "mimir-skill-selection-v1",
+  "skills": [
+    {
+      "name": "documents",
+      "description": "Create, edit, redline, and verify Word or DOCX documents where page layout matters.",
+      "context_tokens": 1900
+    },
+    {
+      "name": "pdf",
+      "description": "Read, create, inspect, render, and verify PDF files, including fillable AcroForms.",
+      "context_tokens": 1700
+    },
+    {
+      "name": "spreadsheets",
+      "description": "Create, modify, analyze, and visualize XLSX, CSV, or TSV spreadsheet files with formulas, formatting, and charts.",
+      "context_tokens": 2200
+    },
+    {
+      "name": "presentations",
+      "description": "Read, create, or edit PowerPoint and slide deck presentations with visual layout verification.",
+      "context_tokens": 2100
+    },
+    {
+      "name": "imagegen",
+      "description": "Generate or edit raster images, illustrations, textures, mockups, and transparent-background cutouts.",
+      "context_tokens": 1400
+    },
+    {
+      "name": "security-audit",
+      "description": "Audit a repository or scoped component for security vulnerabilities and exploitable attack paths.",
+      "context_tokens": 2600
+    },
+    {
+      "name": "code-review",
+      "description": "Review a code change for correctness, regressions, maintainability, and missing validation.",
+      "context_tokens": 1600
+    }
+  ],
+  "cases": [
+    {"id":"sheet-01","request":"Turn this CSV into a quarterly workbook with formulas and a chart.","expected_skill":"spreadsheets"},
+    {"id":"sheet-02","request":"Compare revenue by region in the attached xlsx.","expected_skill":"spreadsheets"},
+    {"id":"sheet-03","request":"Organize these receipt totals so finance can filter and pivot them.","expected_skill":"spreadsheets"},
+    {"id":"pdf-01","request":"Create a fillable vendor declaration from this scan.","expected_skill":"pdf"},
+    {"id":"pdf-02","request":"Extract the tables from the annual report PDF.","expected_skill":"pdf"},
+    {"id":"pdf-03","request":"Convert this policy into an accessible tagged file that prints consistently.","expected_skill":"pdf"},
+    {"id":"docs-01","request":"Create a polished editable contract in Word.","expected_skill":"documents"},
+    {"id":"docs-02","request":"Redline the attached agreement and preserve tracked changes.","expected_skill":"documents"},
+    {"id":"docs-03","request":"Lay this memo out as a letterhead document with a signature page.","expected_skill":"documents"},
+    {"id":"slides-01","request":"Draft a board deck explaining our retention plan.","expected_skill":"presentations"},
+    {"id":"slides-02","request":"Make the speaker notes consistent across the keynote.","expected_skill":"presentations"},
+    {"id":"slides-03","request":"Turn these bullet points into a client pitch people can present.","expected_skill":"presentations"},
+    {"id":"image-01","request":"Generate a watercolor hero image of a greenhouse at dawn.","expected_skill":"imagegen"},
+    {"id":"image-02","request":"Remove the background from this product photo.","expected_skill":"imagegen"},
+    {"id":"image-03","request":"Make a photorealistic cutout of the device on transparent pixels.","expected_skill":"imagegen"},
+    {"id":"security-01","request":"Audit the authentication flow for privilege escalation.","expected_skill":"security-audit"},
+    {"id":"security-02","request":"Scan this repository for vulnerabilities reachable from the network.","expected_skill":"security-audit"},
+    {"id":"security-03","request":"Could this patch leak an API key or let tenants read each other's data?","expected_skill":"security-audit"},
+    {"id":"review-01","request":"Review this diff for regressions and maintainability problems.","expected_skill":"code-review"},
+    {"id":"review-02","request":"Check whether the pull request handles empty input and retries correctly.","expected_skill":"code-review"},
+    {"id":"review-03","request":"Tell me whether this implementation matches the specification.","expected_skill":"code-review"},
+    {"id":"none-01","request":"Rewrite this README introduction in a friendlier tone.","expected_skill":null},
+    {"id":"none-02","request":"What does this Rust lifetime error mean?","expected_skill":null},
+    {"id":"none-03","request":"Rename the local variable from item to account.","expected_skill":null},
+    {"id":"none-04","request":"Summarize the last five git commits.","expected_skill":null},
+    {"id":"none-05","request":"Explain the difference between TCP and UDP.","expected_skill":null}
+  ],
+  "gates": {
+    "baseline_problem_rate_percent": 20.0,
+    "minimum_accuracy_gain_points": 10.0,
+    "maximum_quality_regression_points": 2.0,
+    "minimum_context_savings_percent": 15.0,
+    "maximum_p95_latency_ms": 2500.0,
+    "maximum_average_input_tokens": 1800.0
+  }
+}

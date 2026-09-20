@@ -142,8 +142,10 @@ fn google_base_url_uses_gemini_environment_with_explicit_precedence() {
 fn anthropic_api_key_login_is_exposed_with_the_native_runtime() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args([
             "--workspace",
             workspace.path().to_str().expect("workspace path"),
@@ -163,16 +165,25 @@ fn anthropic_api_key_login_is_exposed_with_the_native_runtime() {
 #[test]
 fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
     let workspace = TempDir::new().expect("workspace");
-    let state = TempDir::new().expect("state");
-    let common = [
+    let first_state = TempDir::new().expect("first state");
+    let second_state = TempDir::new().expect("second state");
+    let home = TempDir::new().expect("home");
+    let first = [
         "--workspace",
         workspace.path().to_str().expect("workspace path"),
         "--state-dir",
-        state.path().to_str().expect("state path"),
+        first_state.path().to_str().expect("state path"),
+    ];
+    let second = [
+        "--workspace",
+        workspace.path().to_str().expect("workspace path"),
+        "--state-dir",
+        second_state.path().to_str().expect("state path"),
     ];
     Command::cargo_bin("mimir")
         .expect("binary")
-        .args(common)
+        .env("HOME", home.path())
+        .args(first)
         .args(["login", "openai", "--api-key-stdin"])
         .write_stdin("cli-super-secret\n")
         .assert()
@@ -180,7 +191,8 @@ fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
         .stdout(predicate::str::contains("cli-super-secret").not());
     Command::cargo_bin("mimir")
         .expect("binary")
-        .args(common)
+        .env("HOME", home.path())
+        .args(second)
         .args(["auth", "status"])
         .assert()
         .success()
@@ -188,11 +200,61 @@ fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
         .stdout(predicate::str::contains("cli-super-secret").not());
     Command::cargo_bin("mimir")
         .expect("binary")
-        .args(common)
+        .env("HOME", home.path())
+        .args(first)
         .args(["logout", "openai"])
         .assert()
         .success()
         .stdout(predicate::str::contains("logged_out"));
+    assert!(!first_state.path().join("auth.json").exists());
+    assert!(!second_state.path().join("auth.json").exists());
+    assert!(home.path().join(".mimir/auth.json").exists());
+}
+
+#[test]
+fn implicit_provider_uses_global_login_order_across_state_directories() {
+    let workspace = TempDir::new().expect("workspace");
+    let login_state = TempDir::new().expect("login state");
+    let runtime_state = TempDir::new().expect("runtime state");
+    let home = TempDir::new().expect("home");
+    for (provider, key) in [("openai", "first-key"), ("anthropic", "second-key")] {
+        Command::cargo_bin("mimir")
+            .expect("binary")
+            .env("HOME", home.path())
+            .args([
+                "--workspace",
+                workspace.path().to_str().expect("workspace path"),
+                "--state-dir",
+                login_state.path().to_str().expect("login state path"),
+                "login",
+                provider,
+                "--api-key-stdin",
+            ])
+            .write_stdin(format!("{key}\n"))
+            .assert()
+            .success();
+    }
+
+    Command::cargo_bin("mimir")
+        .expect("binary")
+        .env("HOME", home.path())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_OAUTH_TOKEN")
+        .args([
+            "--workspace",
+            workspace.path().to_str().expect("workspace path"),
+            "--state-dir",
+            runtime_state.path().to_str().expect("runtime state path"),
+            "doctor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("provider: openai"))
+        .stdout(predicate::str::contains("model: gpt-5-mini"));
+
+    assert!(!login_state.path().join("auth.json").exists());
+    assert!(!runtime_state.path().join("auth.json").exists());
 }
 
 #[test]
@@ -337,8 +399,10 @@ fn json_mode_emits_versioned_machine_readable_events() {
 fn doctor_never_requires_or_prints_the_api_key() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .env("OPENAI_API_KEY", "super-secret-test-value")
         .args([
             "--provider",
@@ -364,6 +428,7 @@ fn doctor_never_requires_or_prints_the_api_key() {
 fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     let common = [
         "--workspace",
         workspace.path().to_str().expect("workspace path"),
@@ -372,6 +437,7 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
     ];
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["login", "openai", "--api-key-stdin"])
         .write_stdin("stored-secret\n")
@@ -379,6 +445,7 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
         .success();
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args(["--provider", "openai", "doctor"])
@@ -390,6 +457,7 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
         ));
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args(["--provider", "fake", "doctor"])
@@ -403,8 +471,10 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
 fn anthropic_provider_requires_an_api_key_before_runtime_execution() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_OAUTH_TOKEN")
         .args([
@@ -1718,11 +1788,13 @@ fn legacy_rpc_heartbeat_catalog_is_scoped_to_the_owned_session() {
 fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     let workspace_path = workspace.path().to_str().expect("workspace path");
     let state_path = state.path().to_str().expect("state path");
 
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .current_dir(workspace.path())
         .args([
             "--workspace",
@@ -1755,6 +1827,7 @@ fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
     ];
     let output = Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .current_dir(workspace.path())
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_OAUTH_TOKEN")
@@ -2225,6 +2298,7 @@ fn mcp_builtin_remote_entries_surface_transport_and_oauth_metadata() {
 fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secrets() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     let common = [
         "--workspace",
         workspace.path().to_str().expect("workspace path"),
@@ -2233,6 +2307,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
     ];
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args([
             "mcp",
@@ -2247,6 +2322,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
         .success();
 
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "login", "acme", "--api-key-stdin"])
         .stdin(Stdio::piped())
@@ -2271,6 +2347,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
 
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "status", "acme"])
         .assert()
@@ -2280,6 +2357,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
 
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "logout", "acme"])
         .assert()
@@ -2288,6 +2366,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
 
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "status", "acme"])
         .assert()
@@ -2299,6 +2378,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
 fn mcp_oauth_builtin_rejects_api_keys_without_echoing_the_secret() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let home = TempDir::new().expect("home");
     let common = [
         "--workspace",
         workspace.path().to_str().expect("workspace path"),
@@ -2307,6 +2387,7 @@ fn mcp_oauth_builtin_rejects_api_keys_without_echoing_the_secret() {
     ];
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "add", "notion", "--builtin"])
         .assert()
@@ -2314,6 +2395,7 @@ fn mcp_oauth_builtin_rejects_api_keys_without_echoing_the_secret() {
 
     Command::cargo_bin("mimir")
         .expect("binary")
+        .env("HOME", home.path())
         .args(common)
         .args(["mcp", "login", "notion", "--api-key-stdin"])
         .write_stdin("must-never-be-printed\n")

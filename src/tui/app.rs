@@ -397,6 +397,10 @@ impl Default for AppPreferenceState {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent TUI activity, escape-prefix, and exit flags do not form one state machine"
+)]
 pub struct App {
     prompt: String,
     cursor_chars: usize,
@@ -429,6 +433,7 @@ pub struct App {
     resource_snapshot: TuiResourceSnapshot,
     preferences: AppPreferenceState,
     bindings: Vec<InputBinding>,
+    escape_prefix_pending: bool,
     should_quit: bool,
 }
 
@@ -467,6 +472,7 @@ impl App {
             resource_snapshot: TuiResourceSnapshot::default(),
             preferences: AppPreferenceState::default(),
             bindings: config.bindings,
+            escape_prefix_pending: false,
             should_quit: false,
         }
     }
@@ -1569,6 +1575,14 @@ impl App {
         reason = "keyboard dispatch keeps all mutually exclusive overlay interactions explicit"
     )]
     pub fn apply_key(&mut self, event: KeyEvent) {
+        let escaped_return = self.escape_prefix_pending && matches!(event.code, KeyCode::Enter);
+        self.escape_prefix_pending =
+            matches!(self.overlay, Overlay::None) && matches!(event.code, KeyCode::Esc);
+        if escaped_return {
+            self.apply_action(Action::InsertNewline);
+            return;
+        }
+
         if let Some(action) = self
             .bindings
             .iter()
@@ -1667,6 +1681,13 @@ impl App {
             return;
         }
 
+        if matches!(self.overlay, Overlay::None)
+            && matches!(event.code, KeyCode::Enter)
+            && self.replace_previous_backslash_with_newline()
+        {
+            return;
+        }
+
         match (&self.overlay, &event.code) {
             (
                 Overlay::Selector(_)
@@ -1707,6 +1728,14 @@ impl App {
             ) => {
                 self.apply_action(Action::CloseOverlay);
             }
+            // iTerm's Shift+Enter mapping sends ESC followed by Return, which
+            // Crossterm reports as Alt+Enter.
+            (Overlay::None, KeyCode::Enter) if event.shift || event.alt => {
+                self.apply_action(Action::InsertNewline);
+            }
+            (Overlay::None, KeyCode::Enter | KeyCode::Char('j')) if event.ctrl => {
+                self.apply_action(Action::InsertNewline);
+            }
             (Overlay::None, KeyCode::Enter) => self.apply_action(Action::SubmitPrompt),
             (Overlay::None, KeyCode::Char('p')) if event.ctrl => self.cycle_scoped_model(),
             (Overlay::None, KeyCode::Up) => self.apply_action(Action::HistoryPrev),
@@ -1739,6 +1768,7 @@ impl App {
             Action::Confirm => self.confirm_overlay(),
             Action::SelectNext => self.move_selection(1),
             Action::SelectPrev => self.move_selection(-1),
+            Action::InsertNewline => self.insert_char('\n'),
             Action::SubmitPrompt => self.submit_prompt(),
             Action::HistoryPrev => self.history_prev(),
             Action::HistoryNext => self.history_next(),
@@ -2433,6 +2463,20 @@ impl App {
         let byte = byte_index(&self.prompt, self.cursor_chars);
         self.prompt.insert(byte, ch);
         self.cursor_chars += 1;
+    }
+
+    /// Recognizes the `\\` + Return newline form used by several terminal key maps.
+    fn replace_previous_backslash_with_newline(&mut self) -> bool {
+        if self.cursor_chars == 0 {
+            return false;
+        }
+        let current = byte_index(&self.prompt, self.cursor_chars);
+        let previous = byte_index(&self.prompt, self.cursor_chars - 1);
+        if self.prompt.get(previous..current) != Some("\\") {
+            return false;
+        }
+        self.prompt.replace_range(previous..current, "\n");
+        true
     }
 
     fn remove_prev_char(&mut self) {

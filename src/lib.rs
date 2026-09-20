@@ -29,8 +29,10 @@ pub mod session;
 pub mod session_compat;
 pub mod session_integrity;
 pub mod session_tree;
+pub mod skill_evaluation;
 pub mod skills;
 pub mod tools;
 pub mod tui;
+pub mod typesafe;
 
 mod atomic;

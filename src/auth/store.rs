@@ -7,6 +7,7 @@ use std::{
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -124,14 +125,56 @@ impl fmt::Debug for ResolvedCredential {
     }
 }
 
-#[derive(Clone)]
+const AUTH_FILE_SCHEMA_VERSION: u16 = 2;
+
+#[derive(Debug, Clone)]
 pub struct AuthStore {
     root: PathBuf,
     path: PathBuf,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthFile {
+    schema_version: u16,
+    order: Vec<String>,
+    credentials: BTreeMap<String, AuthCredential>,
+}
+
+#[derive(Default)]
+struct StoredAuth {
+    order: Vec<String>,
+    credentials: BTreeMap<String, AuthCredential>,
+}
+
 impl AuthStore {
-    /// Opens the durable auth store rooted under the selected state directory.
+    /// Opens the one user-global durable auth store at `$HOME/.mimir/auth.json`.
+    ///
+    /// Authentication is intentionally independent from workspace and state-directory
+    /// selection so a login remains available from every directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when no absolute user home is available, or an
+    /// I/O error when the global auth directory cannot be created.
+    pub fn global() -> Result<Self> {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                MimirError::Configuration(
+                    "a global login requires HOME or USERPROFILE to be an absolute path".into(),
+                )
+            })?;
+        Self::new(&home.join(".mimir"))
+    }
+
+    /// Opens an explicitly rooted auth store.
+    ///
+    /// Normal application code should use [`Self::global`]. This constructor exists for
+    /// isolated tests and migration tooling that must inspect a specific auth artifact.
     ///
     /// # Errors
     ///
@@ -153,7 +196,7 @@ impl AuthStore {
     ///
     /// Returns a persistence or deserialization error for an unreadable or malformed auth store.
     pub async fn get(&self, provider: &str) -> Result<Option<AuthCredential>> {
-        Ok(self.load().await?.remove(provider))
+        Ok(self.load().await?.credentials.remove(provider))
     }
 
     /// Stores an API-key credential for one provider.
@@ -194,8 +237,9 @@ impl AuthStore {
         let lock = path_lock(&self.path);
         let _guard = lock.lock().await;
         let mut data = self.load_unlocked().await?;
-        let removed = data.remove(provider).is_some();
+        let removed = data.credentials.remove(provider).is_some();
         if removed {
+            data.order.retain(|candidate| candidate != provider);
             self.persist_unlocked(&data).await?;
         }
         Ok(removed)
@@ -208,11 +252,15 @@ impl AuthStore {
     /// Returns a persistence or deserialization error for an unreadable or malformed auth store.
     pub async fn statuses(&self) -> Result<Vec<AuthStatus>> {
         let now = now_ms();
-        Ok(self
-            .load()
-            .await?
-            .into_iter()
-            .map(|(provider, credential)| match credential {
+        let mut data = self.load().await?;
+        let mut statuses = Vec::with_capacity(data.order.len());
+        for provider in data.order {
+            let credential = data.credentials.remove(&provider).ok_or_else(|| {
+                MimirError::Configuration(format!(
+                    "auth file order references missing provider: {provider}"
+                ))
+            })?;
+            statuses.push(match credential {
                 AuthCredential::ApiKey { .. } => AuthStatus {
                     provider,
                     auth_type: "api_key".into(),
@@ -225,8 +273,9 @@ impl AuthStore {
                     expired: value.is_expired(now),
                     source: AuthSource::Stored,
                 },
-            })
-            .collect())
+            });
+        }
+        Ok(statuses)
     }
 
     async fn update(&self, provider: &str, credential: Option<AuthCredential>) -> Result<()> {
@@ -235,28 +284,80 @@ impl AuthStore {
         let _guard = lock.lock().await;
         let mut data = self.load_unlocked().await?;
         if let Some(credential) = credential {
-            data.insert(provider.into(), credential);
+            if !data.credentials.contains_key(provider) {
+                data.order.push(provider.into());
+            }
+            data.credentials.insert(provider.into(), credential);
         } else {
-            data.remove(provider);
+            data.credentials.remove(provider);
+            data.order.retain(|candidate| candidate != provider);
         }
         self.persist_unlocked(&data).await
     }
 
-    async fn load(&self) -> Result<BTreeMap<String, AuthCredential>> {
+    async fn load(&self) -> Result<StoredAuth> {
         let lock = path_lock(&self.path);
         let _guard = lock.lock().await;
         self.load_unlocked().await
     }
 
-    async fn load_unlocked(&self) -> Result<BTreeMap<String, AuthCredential>> {
+    async fn load_unlocked(&self) -> Result<StoredAuth> {
         prepare_state_path(&self.root, &self.path).await?;
-        Ok(read_json(&self.path).await?.unwrap_or_default())
+        let Some(value): Option<Value> = read_json(&self.path).await? else {
+            return Ok(StoredAuth::default());
+        };
+        let data = if value.get("schema_version").is_some() {
+            let file: AuthFile = serde_json::from_value(value)?;
+            if file.schema_version != AUTH_FILE_SCHEMA_VERSION {
+                return Err(MimirError::Configuration(format!(
+                    "unsupported auth file schema version {}",
+                    file.schema_version
+                )));
+            }
+            StoredAuth {
+                order: file.order,
+                credentials: file.credentials,
+            }
+        } else {
+            let credentials: BTreeMap<String, AuthCredential> = serde_json::from_value(value)?;
+            StoredAuth {
+                order: credentials.keys().cloned().collect(),
+                credentials,
+            }
+        };
+        validate_stored_auth(data)
     }
 
-    async fn persist_unlocked(&self, data: &BTreeMap<String, AuthCredential>) -> Result<()> {
+    async fn persist_unlocked(&self, data: &StoredAuth) -> Result<()> {
         prepare_state_path(&self.root, &self.path).await?;
         write_private_credentials(&self.path, data).await
     }
+}
+
+fn validate_stored_auth(data: StoredAuth) -> Result<StoredAuth> {
+    let mut seen = std::collections::BTreeSet::new();
+    for provider in &data.order {
+        validate_provider(provider)?;
+        if !seen.insert(provider.as_str()) {
+            return Err(MimirError::Configuration(format!(
+                "auth file contains duplicate provider order entry: {provider}"
+            )));
+        }
+        if !data.credentials.contains_key(provider) {
+            return Err(MimirError::Configuration(format!(
+                "auth file order references missing provider: {provider}"
+            )));
+        }
+    }
+    for provider in data.credentials.keys() {
+        validate_provider(provider)?;
+        if !seen.contains(provider.as_str()) {
+            return Err(MimirError::Configuration(format!(
+                "auth file credential is missing from provider order: {provider}"
+            )));
+        }
+    }
+    Ok(data)
 }
 
 /// Resolves a provider credential from environment variables or the durable auth store.
@@ -348,10 +449,7 @@ fn now_ms() -> u64 {
         })
 }
 
-async fn write_private_credentials(
-    path: &Path,
-    data: &BTreeMap<String, AuthCredential>,
-) -> Result<()> {
+async fn write_private_credentials(path: &Path, data: &StoredAuth) -> Result<()> {
     let parent = path.parent().ok_or_else(|| MimirError::Session {
         path: path.to_owned(),
         message: "auth state path has no parent".into(),
@@ -359,7 +457,11 @@ async fn write_private_credentials(
     tokio::fs::create_dir_all(parent).await?;
     let temporary = parent.join(format!(".auth-{}.tmp", Uuid::new_v4()));
     let mut file = create_private_file(&temporary)?;
-    let bytes = serde_json::to_vec_pretty(data)?;
+    let bytes = serde_json::to_vec_pretty(&AuthFile {
+        schema_version: AUTH_FILE_SCHEMA_VERSION,
+        order: data.order.clone(),
+        credentials: data.credentials.clone(),
+    })?;
     if let Err(error) = async {
         file.write_all(&bytes).await?;
         file.write_all(b"\n").await?;

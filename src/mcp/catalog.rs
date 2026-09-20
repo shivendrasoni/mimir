@@ -419,9 +419,19 @@ impl McpServerCatalog {
 
 impl McpAuthCoordinator {
     pub fn new(state_root: &Path) -> Result<Self> {
+        Self::with_auth_store(state_root, AuthStore::new(state_root)?)
+    }
+
+    /// Creates a coordinator whose credentials come from the user-global auth file.
+    pub fn global(state_root: &Path) -> Result<Self> {
+        Self::with_auth_store(state_root, AuthStore::global()?)
+    }
+
+    /// Creates a coordinator with an explicit credential store for isolated embedding and tests.
+    pub fn with_auth_store(state_root: &Path, store: AuthStore) -> Result<Self> {
         Ok(Self {
             catalog: McpServerCatalog::new(state_root)?,
-            store: AuthStore::new(state_root)?,
+            store,
             oauth_metadata: McpOAuthClientMetadataStore::new(state_root)?,
         })
     }

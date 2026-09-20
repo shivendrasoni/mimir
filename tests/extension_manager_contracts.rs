@@ -91,12 +91,14 @@ async fn manager_materializes_and_executes_registered_extension_surfaces() {
     let binary = compile_fixture(fixture.path());
     write_manifest(workspace.path(), &binary);
     let mut catalog = ExtensionCatalog::new(workspace.path(), state.path()).expect("catalog");
+    let auth = AuthStore::new(state.path()).expect("auth store");
     let manager = Arc::new(
-        ExtensionManager::load(
+        ExtensionManager::load_with_auth_store(
             catalog.reload().await.expect("catalog entries"),
             workspace.path(),
             state.path(),
             RuntimeLimits::default(),
+            auth.clone(),
         )
         .await
         .expect("manager"),
@@ -105,9 +107,7 @@ async fn manager_materializes_and_executes_registered_extension_surfaces() {
     assert_eq!(manager.tools()[0].name, "fixture_tool");
     assert_eq!(manager.commands()[0].name, "fixture_command");
     assert_eq!(manager.providers()[0].name, "fixture_provider");
-    AuthStore::new(state.path())
-        .expect("auth store")
-        .set_api_key("fixture_provider", "fixture-secret")
+    auth.set_api_key("fixture_provider", "fixture-secret")
         .await
         .expect("provider credential");
     manager
@@ -221,6 +221,7 @@ async fn agent_runtime_dispatches_lifecycle_and_surfaces_extension_ui() {
         budget: Budget::default(),
         provider_aware_token_budget: false,
         provider_timeout: std::time::Duration::from_secs(2),
+        typesafe: mimir::typesafe::TypeSafeConfig::default(),
     };
     let runtime = AgentRuntime::resume(
         provider,

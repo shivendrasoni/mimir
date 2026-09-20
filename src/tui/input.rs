@@ -5,6 +5,7 @@ pub enum Action {
     Confirm,
     SelectNext,
     SelectPrev,
+    InsertNewline,
     SubmitPrompt,
     HistoryPrev,
     HistoryNext,

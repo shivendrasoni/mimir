@@ -12,7 +12,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode as CrosstermKeyCode,
-        KeyEventKind, KeyModifiers,
+        KeyEventKind, KeyModifiers, ModifierKeyCode,
     },
     execute, queue,
     terminal::{
@@ -658,12 +658,14 @@ pub async fn run_tui(
     initial_model: String,
     initial_session: String,
 ) -> Result<()> {
+    let session_root = state_root.clone();
     run_tui_with_autonomous(
         runtime,
         runtime_factory,
         models,
         sessions,
         state_root,
+        session_root,
         initial_model,
         initial_session,
         None,
@@ -687,6 +689,7 @@ pub async fn run_tui_with_autonomous(
     models: Vec<String>,
     sessions: Vec<String>,
     state_root: PathBuf,
+    session_root: PathBuf,
     initial_model: String,
     initial_session: String,
     autonomous_limits: Option<AutonomousLimits>,
@@ -750,6 +753,7 @@ pub async fn run_tui_with_autonomous(
     let mut side_questions = SideQuestionSession::default();
     let mut frame_cache = TerminalFrameCache::default();
     let mut last_ctrl_c_press = None;
+    let mut shift_held = false;
 
     loop {
         render_frame(&app, &mut frame_cache)?;
@@ -777,9 +781,17 @@ pub async fn run_tui_with_autonomous(
             continue;
         }
 
-        if let Some(Event::Key(key)) = terminal_event
-            && key.kind != KeyEventKind::Release
-        {
+        if let Some(Event::Key(mut key)) = terminal_event {
+            if is_shift_modifier(&key) {
+                shift_held = key.kind != KeyEventKind::Release;
+                continue;
+            }
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            if shift_held && matches!(key.code, CrosstermKeyCode::Enter) {
+                key.modifiers.insert(KeyModifiers::SHIFT);
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, CrosstermKeyCode::Char('v' | 'V'))
             {
@@ -956,9 +968,10 @@ pub async fn run_tui_with_autonomous(
                             .map_or_else(String::new, |key| key.0.clone())
                     });
                     let session = selected_session.unwrap_or_else(|| {
-                        runtime_key
-                            .as_ref()
-                            .map_or_else(|| "default".into(), |key| key.1.clone())
+                        runtime_key.as_ref().map_or_else(
+                            || format!("session-{}", Uuid::new_v4().simple()),
+                            |key| key.1.clone(),
+                        )
                     });
                     let selected_key = (model.clone(), session.clone());
                     if runtime_needs_refresh || runtime_key.as_ref() != Some(&selected_key) {
@@ -979,7 +992,7 @@ pub async fn run_tui_with_autonomous(
                                         .before_session_switch(
                                             SessionSwitchReason::Resume,
                                             Some(
-                                                state_root
+                                                session_root
                                                     .join("sessions")
                                                     .join(format!("{session}.jsonl"))
                                                     .display()
@@ -996,7 +1009,7 @@ pub async fn run_tui_with_autonomous(
                                     continue;
                                 }
                                 let previous = runtime_key.as_ref().map(|(_, current)| {
-                                    state_root
+                                    session_root
                                         .join("sessions")
                                         .join(format!("{current}.jsonl"))
                                         .display()
@@ -1110,6 +1123,7 @@ pub async fn run_tui_with_autonomous(
                         &mut runtime_key,
                         &app,
                         &state_root,
+                        &session_root,
                         &autonomous,
                         &mut side_questions,
                         &mut terminal_guard,
@@ -1463,6 +1477,7 @@ async fn dispatch_coordinator_action(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     autonomous: &Arc<Mutex<AutonomousState>>,
     side_questions: &mut SideQuestionSession,
     terminal_guard: &mut TerminalGuard,
@@ -1591,6 +1606,7 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
                 session,
             )
             .await
@@ -1602,12 +1618,13 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
                 (name.as_deref(), prompt.as_deref()),
             )
             .await
         }
         TuiAction::SetSessionName { name } => {
-            update_tui_session_name(runtime_key.as_ref(), state_root, name.as_deref()).await
+            update_tui_session_name(runtime_key.as_ref(), session_root, name.as_deref()).await
         }
         TuiAction::Clone => {
             clone_tui_session(
@@ -1616,6 +1633,7 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
             )
             .await
         }
@@ -1626,6 +1644,7 @@ async fn dispatch_coordinator_action(
                 runtime_key.as_ref(),
                 app,
                 state_root,
+                session_root,
             )
             .await
         }
@@ -1638,13 +1657,13 @@ async fn dispatch_coordinator_action(
             Ok(message)
         }
         TuiAction::ShowSessionInfo => {
-            show_tui_session_info(runtime, runtime_key.as_ref(), state_root)
+            show_tui_session_info(runtime, runtime_key.as_ref(), session_root)
                 .await
                 .map(Some)
         }
         TuiAction::CopyLastMessage => copy_last_assistant_message(runtime).await.map(Some),
         TuiAction::ShowSessionTree => {
-            open_tui_tree_selector(runtime_key.as_ref(), app, state_root).await
+            open_tui_tree_selector(runtime_key.as_ref(), app, session_root).await
         }
         TuiAction::ContinueAt { entry_id } => {
             continue_tui_session(
@@ -1653,11 +1672,12 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
                 *entry_id,
             )
             .await
         }
-        TuiAction::Fork => open_tui_fork_selector(runtime_key.as_ref(), app, state_root).await,
+        TuiAction::Fork => open_tui_fork_selector(runtime_key.as_ref(), app, session_root).await,
         TuiAction::ForkAt { entry_id } => {
             fork_tui_session(
                 runtime,
@@ -1665,6 +1685,7 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
                 *entry_id,
             )
             .await
@@ -1672,7 +1693,7 @@ async fn dispatch_coordinator_action(
         TuiAction::Mcp(command) => handle_tui_mcp(state_root, app, command).await,
         TuiAction::ExportSession { path } => {
             let session = active_session(runtime_key.as_ref())?;
-            export_tui_session(state_root, session, path.as_deref())
+            export_tui_session(session_root, session, path.as_deref())
                 .await
                 .map(Some)
         }
@@ -1683,6 +1704,7 @@ async fn dispatch_coordinator_action(
                 runtime_key,
                 app,
                 state_root,
+                session_root,
                 path,
             )
             .await
@@ -1803,11 +1825,11 @@ async fn dispatch_coordinator_action(
         }
         TuiAction::ShareSession => {
             let session = active_session(runtime_key.as_ref())?;
-            preview_tui_share(state_root, session).await.map(Some)
+            preview_tui_share(session_root, session).await.map(Some)
         }
         TuiAction::Traces { arguments } => {
             let session = active_session(runtime_key.as_ref())?;
-            preview_tui_traces(state_root, session, arguments.as_deref())
+            preview_tui_traces(session_root, session, arguments.as_deref())
                 .await
                 .map(Some)
         }
@@ -2329,6 +2351,7 @@ async fn import_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     requested_path: &str,
 ) -> Result<Option<String>> {
     if runtime.is_running() {
@@ -2363,7 +2386,7 @@ async fn import_tui_session(
     let imported_state = imported.state;
     let imported_model = imported_state.model;
     let imported_thinking = imported_state.thinking_level;
-    let store = FileSessionStore::create(state_root, &session).await?;
+    let store = FileSessionStore::create(session_root, &session).await?;
     runtime
         .before_session_switch(
             SessionSwitchReason::Resume,
@@ -3298,13 +3321,15 @@ async fn continue_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     entry_id: Uuid,
 ) -> Result<Option<String>> {
-    let (source_session, catalog) = load_session_catalog(runtime_key.as_ref(), state_root).await?;
+    let (source_session, catalog) =
+        load_session_catalog(runtime_key.as_ref(), session_root).await?;
     runtime.before_session_tree(&entry_id.to_string()).await?;
     let derivation = catalog.clone_at(entry_id, &source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
-    let destination = FileSessionStore::create(state_root, &session).await?;
+    let destination = FileSessionStore::create(session_root, &session).await?;
     for record in derivation.records {
         destination.append(record).await?;
     }
@@ -3317,7 +3342,7 @@ async fn continue_tui_session(
         .start_extension_session(
             SessionStartReason::Fork,
             Some(
-                FileSessionStore::create(state_root, &source_session)
+                FileSessionStore::create(session_root, &source_session)
                     .await?
                     .path()
                     .display()
@@ -3366,15 +3391,17 @@ async fn fork_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     entry_id: Uuid,
 ) -> Result<Option<String>> {
-    let (source_session, catalog) = load_session_catalog(runtime_key.as_ref(), state_root).await?;
+    let (source_session, catalog) =
+        load_session_catalog(runtime_key.as_ref(), session_root).await?;
     runtime
         .before_session_fork(&entry_id.to_string(), SessionForkPosition::Before)
         .await?;
     let derivation = catalog.fork_before_user_message(entry_id, &source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
-    let destination = FileSessionStore::create(state_root, &session).await?;
+    let destination = FileSessionStore::create(session_root, &session).await?;
     for record in derivation.records {
         destination.append(record).await?;
     }
@@ -3386,7 +3413,7 @@ async fn fork_tui_session(
         .start_extension_session(
             SessionStartReason::Fork,
             Some(
-                FileSessionStore::create(state_root, &source_session)
+                FileSessionStore::create(session_root, &source_session)
                     .await?
                     .path()
                     .display()
@@ -3412,7 +3439,7 @@ async fn handle_tui_mcp(
     app: &Arc<Mutex<App>>,
     command: &super::McpCommand,
 ) -> Result<Option<String>> {
-    let coordinator = McpAuthCoordinator::new(state_root)?;
+    let coordinator = McpAuthCoordinator::global(state_root)?;
     match command {
         super::McpCommand::List => {
             let statuses = coordinator.list_statuses().await?;
@@ -3484,9 +3511,10 @@ async fn resume_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     session: &str,
 ) -> Result<Option<String>> {
-    if !FileSessionStore::list_ids(state_root)
+    if !FileSessionStore::list_ids(session_root)
         .await?
         .iter()
         .any(|candidate| candidate == session)
@@ -3496,7 +3524,7 @@ async fn resume_tui_session(
         )));
     }
     let model = current_model(runtime, runtime_key.as_ref()).await;
-    let target = FileSessionStore::create(state_root, session)
+    let target = FileSessionStore::create(session_root, session)
         .await?
         .path()
         .display()
@@ -3515,7 +3543,7 @@ async fn resume_tui_session(
         .start_extension_session(
             SessionStartReason::Resume,
             (!previous.is_empty()).then(|| {
-                state_root
+                session_root
                     .join("sessions")
                     .join(format!("{previous}.jsonl"))
                     .display()
@@ -3539,6 +3567,7 @@ async fn start_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
     details: (Option<&str>, Option<&str>),
 ) -> Result<Option<String>> {
     let (name, prompt) = details;
@@ -3549,7 +3578,7 @@ async fn start_tui_session(
         .before_session_switch(
             SessionSwitchReason::New,
             Some(
-                state_root
+                session_root
                     .join("sessions")
                     .join(format!("{session}.jsonl"))
                     .display()
@@ -3559,7 +3588,7 @@ async fn start_tui_session(
         .await?;
     let next_runtime =
         build_runtime_with_preferences(runtime_factory, &model, &session, state_root).await?;
-    let store = FileSessionStore::create(state_root, &session).await?;
+    let store = FileSessionStore::create(session_root, &session).await?;
     store
         .append(SessionRecord::new(SessionPayload::RuntimeEvent {
             name: "session_created".into(),
@@ -3574,7 +3603,7 @@ async fn start_tui_session(
         .start_extension_session(
             SessionStartReason::New,
             previous.map(|previous| {
-                state_root
+                session_root
                     .join("sessions")
                     .join(format!("{previous}.jsonl"))
                     .display()
@@ -3633,6 +3662,7 @@ async fn clone_tui_session(
     runtime_key: &mut Option<(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
 ) -> Result<Option<String>> {
     let Some((model, source_session)) = runtime_key.as_ref() else {
         return Err(crate::error::MimirError::Configuration(
@@ -3641,7 +3671,7 @@ async fn clone_tui_session(
     };
     let model = model.clone();
     let source_session = source_session.clone();
-    let source = FileSessionStore::create(state_root, &source_session).await?;
+    let source = FileSessionStore::create(session_root, &source_session).await?;
     let catalog = SessionBranchCatalog::from_records(source.load().await?.records)?;
     let derivation = catalog.clone_active(&source_session)?;
     let session = format!("session-{}", Uuid::new_v4().simple());
@@ -3649,7 +3679,7 @@ async fn clone_tui_session(
         .before_session_switch(
             SessionSwitchReason::New,
             Some(
-                state_root
+                session_root
                     .join("sessions")
                     .join(format!("{session}.jsonl"))
                     .display()
@@ -3657,7 +3687,7 @@ async fn clone_tui_session(
             ),
         )
         .await?;
-    let destination = FileSessionStore::create(state_root, &session).await?;
+    let destination = FileSessionStore::create(session_root, &session).await?;
     for record in derivation.records {
         destination.append(record).await?;
     }
@@ -3686,6 +3716,7 @@ async fn reload_tui_runtime(
     runtime_key: Option<&(String, String)>,
     app: &Arc<Mutex<App>>,
     state_root: &Path,
+    session_root: &Path,
 ) -> Result<Option<String>> {
     let Some((model, session)) = runtime_key else {
         return Err(crate::error::MimirError::Configuration(
@@ -3699,7 +3730,7 @@ async fn reload_tui_runtime(
         .start_extension_session(
             SessionStartReason::Reload,
             Some(
-                state_root
+                session_root
                     .join("sessions")
                     .join(format!("{session}.jsonl"))
                     .display()
@@ -3924,7 +3955,19 @@ fn bounded_context_label(value: &str) -> String {
 ///
 /// Returns configuration, authentication, persistence, or OAuth transport errors.
 pub async fn handle_ui_request(state_root: &Path, request: UiRequest) -> Result<String> {
-    let store = AuthStore::new(state_root)?;
+    handle_ui_request_with_auth_store(state_root, request, AuthStore::global()?).await
+}
+
+/// Applies a typed credential request with an explicit auth store for isolated embedding and tests.
+///
+/// # Errors
+///
+/// Returns configuration, authentication, persistence, or OAuth transport errors.
+pub async fn handle_ui_request_with_auth_store(
+    state_root: &Path,
+    request: UiRequest,
+    store: AuthStore,
+) -> Result<String> {
     match request {
         UiRequest::Logout { provider } => {
             let removed = store.logout(&provider).await?;
@@ -3935,7 +3978,7 @@ pub async fn handle_ui_request(state_root: &Path, request: UiRequest) -> Result<
             })
         }
         UiRequest::McpApiKey { server, api_key } => {
-            McpAuthCoordinator::new(state_root)?
+            McpAuthCoordinator::with_auth_store(state_root, store.clone())?
                 .store_api_key(&server, &api_key)
                 .await?;
             Ok(format!("Connected MCP server {server}"))
@@ -4023,6 +4066,7 @@ fn render_frame(app: &Arc<Mutex<App>>, frame_cache: &mut TerminalFrameCache) -> 
         let cursor_x = prompt_cursor_x(
             usize::from(width),
             usize::from(state.editor_padding_x()),
+            state.prompt(),
             state.cursor_chars(),
         );
         (body, state.show_hardware_cursor(), cursor_x)
@@ -4064,11 +4108,24 @@ fn render_frame(app: &Arc<Mutex<App>>, frame_cache: &mut TerminalFrameCache) -> 
     stdout.flush()
 }
 
-fn prompt_cursor_x(width: usize, padding: usize, cursor_chars: usize) -> usize {
+fn prompt_cursor_x(width: usize, padding: usize, prompt: &str, cursor_chars: usize) -> usize {
+    let cursor_chars = cursor_chars.min(prompt.chars().count());
+    let before_cursor = prompt.chars().take(cursor_chars).collect::<String>();
+    let column = before_cursor
+        .rsplit('\n')
+        .next()
+        .map_or(0, |line| line.chars().count());
     padding
         .saturating_add("❯ ".chars().count())
-        .saturating_add(cursor_chars)
+        .saturating_add(column)
         % width.max(1)
+}
+
+fn is_shift_modifier(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(
+        key.code,
+        CrosstermKeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+    )
 }
 
 fn convert_key(key: crossterm::event::KeyEvent) -> Option<KeyEvent> {
@@ -4313,9 +4370,25 @@ mod local_command_tests {
 
     #[test]
     fn hardware_cursor_column_tracks_wrapped_prompt_text() {
-        assert_eq!(prompt_cursor_x(10, 3, 0), 5);
-        assert_eq!(prompt_cursor_x(10, 3, 15), 0);
-        assert_eq!(prompt_cursor_x(0, 3, 15), 0);
+        assert_eq!(prompt_cursor_x(10, 3, "", 0), 5);
+        assert_eq!(prompt_cursor_x(10, 3, "012345678901234", 15), 0);
+        assert_eq!(prompt_cursor_x(10, 3, "first\n", 6), 5);
+        assert_eq!(prompt_cursor_x(0, 3, "012345678901234", 15), 0);
+    }
+
+    #[test]
+    fn recognizes_both_physical_shift_keys() {
+        let left = crossterm::event::KeyEvent::new(
+            CrosstermKeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::NONE,
+        );
+        let right = crossterm::event::KeyEvent::new(
+            CrosstermKeyCode::Modifier(ModifierKeyCode::RightShift),
+            KeyModifiers::NONE,
+        );
+
+        assert!(is_shift_modifier(&left));
+        assert!(is_shift_modifier(&right));
     }
 
     #[test]
@@ -4812,6 +4885,7 @@ mod local_command_tests {
             &factory,
             &mut runtime_key,
             &app,
+            state.path(),
             state.path(),
             source.to_str().expect("UTF-8 path"),
         )

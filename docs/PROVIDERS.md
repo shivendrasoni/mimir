@@ -16,6 +16,8 @@ printf '%s\n' "$ANTHROPIC_API_KEY" | mimir login anthropic --api-key-stdin
 
 Inside the TUI, use `/login`; credentials are masked while entered.
 
+All logins are user-global and live in `$HOME/.mimir/auth.json`. `--workspace`, the current directory, and `--state-dir` do not select a different auth file. When no provider is passed explicitly, Mimir uses the first runnable provider in the order persisted by that file.
+
 ## Provider behavior
 
 ChatGPT Codex OAuth uses the native Codex Responses transport. Anthropic is native and distinguishes API-key authentication (`x-api-key`) from OAuth bearer authentication; the two credential types are not interchangeable.

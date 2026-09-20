@@ -7,7 +7,7 @@ use mimir::{
         McpAuthCoordinator, McpCatalogHttp, McpCatalogServer, McpClient, McpHttpConfig,
         McpOAuthAuthorization, McpOAuthClient, McpOAuthClientMetadataStore, McpOAuthCodeReceiver,
         McpServerCatalog, McpServerConfig, McpToolCallOutput, builtin_mcp_catalog,
-        connect_catalog_client,
+        connect_catalog_client_with_auth_store,
     },
 };
 use serde_json::{Value, json};
@@ -271,13 +271,14 @@ async fn catalog_connector_applies_stored_credentials_without_exposing_them() {
         )
         .await
         .expect("persist");
-    McpAuthCoordinator::new(state.path())
-        .expect("auth")
+    let auth = AuthStore::new(state.path()).expect("auth");
+    McpAuthCoordinator::with_auth_store(state.path(), auth.clone())
+        .expect("coordinator")
         .store_api_key("remote", "stored-secret")
         .await
         .expect("store key");
 
-    let client = connect_catalog_client(&catalog, state.path(), "remote")
+    let client = connect_catalog_client_with_auth_store(&catalog, state.path(), "remote", auth)
         .await
         .expect("connect");
     assert_eq!(client.server_info().name, "remote");

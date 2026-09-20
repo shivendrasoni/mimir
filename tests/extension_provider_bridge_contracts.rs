@@ -97,7 +97,8 @@ export default function activate(pi) {
 "#,
     )
     .expect("module");
-    let manager = ExtensionManager::load(
+    let auth = AuthStore::new(state.path()).expect("auth store");
+    let manager = ExtensionManager::load_with_auth_store(
         vec![CatalogEntry {
             manifest: manifest(&module),
             root_dir: extension.path().to_owned(),
@@ -107,6 +108,7 @@ export default function activate(pi) {
         workspace.path(),
         state.path(),
         limits(),
+        auth.clone(),
     )
     .await
     .expect("manager");
@@ -124,28 +126,25 @@ export default function activate(pi) {
         .respond_ui(&id, json!("code-123"))
         .await
         .expect("resume OAuth");
-    let stored = AuthStore::new(state.path())
-        .expect("auth store")
+    let stored = auth
         .get("custom-oauth")
         .await
         .expect("credential")
         .expect("stored OAuth");
     assert!(matches!(stored, AuthCredential::OAuth(_)));
 
-    AuthStore::new(state.path())
-        .expect("auth store")
-        .set_oauth(
-            "custom-oauth",
-            OAuthCredential {
-                access: "old-access".into(),
-                refresh: "refresh-old".into(),
-                expires_at_ms: 1,
-                account_id: None,
-                enterprise_url: None,
-            },
-        )
-        .await
-        .expect("expired credential");
+    auth.set_oauth(
+        "custom-oauth",
+        OAuthCredential {
+            access: "old-access".into(),
+            refresh: "refresh-old".into(),
+            expires_at_ms: 1,
+            account_id: None,
+            enterprise_url: None,
+        },
+    )
+    .await
+    .expect("expired credential");
     let (provider, _) = manager
         .activate_provider("custom-oauth", "custom-model")
         .await
@@ -170,8 +169,7 @@ export default function activate(pi) {
         events.0.lock().expect("events").as_slice(),
         [ProviderEvent::TextDelta("bridge-ok".into())]
     );
-    let refreshed = AuthStore::new(state.path())
-        .expect("auth store")
+    let refreshed = auth
         .get("custom-oauth")
         .await
         .expect("credential")

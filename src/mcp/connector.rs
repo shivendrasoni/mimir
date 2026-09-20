@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::{
-    auth::AuthCredential,
+    auth::{AuthCredential, AuthStore},
     error::{MimirError, Result},
     mcp::{McpAuthCoordinator, McpClient, McpOAuthClient, McpServerCatalog},
 };
@@ -20,6 +20,21 @@ pub async fn connect_catalog_client(
     catalog: &McpServerCatalog,
     state_root: &Path,
     server: &str,
+) -> Result<McpClient> {
+    connect_catalog_client_with_auth_store(catalog, state_root, server, AuthStore::global()?).await
+}
+
+/// Connects a catalog client with an explicit credential store for isolated embedding and tests.
+///
+/// # Errors
+///
+/// Returns the same catalog, authentication, refresh, transport, and protocol errors as
+/// [`connect_catalog_client`].
+pub async fn connect_catalog_client_with_auth_store(
+    catalog: &McpServerCatalog,
+    state_root: &Path,
+    server: &str,
+    auth_store: AuthStore,
 ) -> Result<McpClient> {
     let config = catalog
         .resolve(server)
@@ -51,7 +66,7 @@ pub async fn connect_catalog_client(
         return McpClient::connect_with_bearer(&config, Some(&bearer)).await;
     }
 
-    let coordinator = McpAuthCoordinator::new(state_root)?;
+    let coordinator = McpAuthCoordinator::with_auth_store(state_root, auth_store)?;
     let credential = coordinator.store().get(&config.provider_id()).await?;
     let bearer = match credential {
         Some(AuthCredential::ApiKey { key }) => Some(key),

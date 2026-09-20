@@ -3,6 +3,8 @@ use std::{fs, path::Path, process::Command, thread, time::Duration};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use mimir::learning::project_session_root;
+
 fn binary() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("mimir"))
 }
@@ -30,6 +32,12 @@ fn fake_run(workspace: &Path, state: &Path, session: &str, prompt: &str) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn project_sessions(state: &Path, workspace: &Path) -> std::path::PathBuf {
+    project_session_root(state, workspace)
+        .expect("project session root")
+        .join("sessions")
 }
 
 #[test]
@@ -285,7 +293,8 @@ fn continue_resume_and_fork_select_durable_sessions() {
         "{}",
         String::from_utf8_lossy(&continued.stderr)
     );
-    let beta = fs::read_to_string(state.join("sessions/beta.jsonl")).expect("beta transcript");
+    let sessions = project_sessions(&state, workspace.path());
+    let beta = fs::read_to_string(sessions.join("beta.jsonl")).expect("beta transcript");
     assert!(beta.contains("beta-two"));
 
     let resumed = binary()
@@ -333,7 +342,7 @@ fn continue_resume_and_fork_select_durable_sessions() {
         "{}",
         String::from_utf8_lossy(&forked.stderr)
     );
-    let fork = fs::read_dir(state.join("sessions"))
+    let fork = fs::read_dir(sessions)
         .expect("sessions")
         .filter_map(Result::ok)
         .find(|entry| entry.file_name().to_string_lossy().starts_with("fork-"))
@@ -372,7 +381,8 @@ fn bare_resume_selects_the_latest_durable_session() {
         "{}",
         String::from_utf8_lossy(&resumed.stderr)
     );
-    let beta = fs::read_to_string(state.join("sessions/beta.jsonl")).expect("beta transcript");
+    let beta = fs::read_to_string(project_sessions(&state, workspace.path()).join("beta.jsonl"))
+        .expect("beta transcript");
     assert!(beta.contains("latest-session"));
 }
 
@@ -435,7 +445,9 @@ fn positional_dash_and_file_prompts_are_composed_safely() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let transcript = fs::read_to_string(state.join("sessions/composed.jsonl")).expect("transcript");
+    let transcript =
+        fs::read_to_string(project_sessions(&state, workspace.path()).join("composed.jsonl"))
+            .expect("transcript");
     assert!(transcript.contains("bounded attachment"));
     assert!(transcript.contains("&lt;") || transcript.contains("<file"));
     assert!(transcript.contains("explain this - carefully"));
@@ -476,7 +488,9 @@ fn explicit_prompt_templates_load_even_when_discovery_is_disabled() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let transcript = fs::read_to_string(state.join("sessions/template.jsonl")).expect("transcript");
+    let transcript =
+        fs::read_to_string(project_sessions(&state, workspace.path()).join("template.jsonl"))
+            .expect("transcript");
     assert!(transcript.contains("Hello Codex from Codex"));
 }
 
@@ -706,10 +720,10 @@ fn startup_goal_creates_a_new_root_with_the_requested_budget() {
     assert_eq!(value["objective"], "finish migration");
     assert_eq!(value["token_budget"], 1234);
     assert!(
-        fs::read_dir(state.join("sessions"))
+        fs::read_dir(project_sessions(&state, workspace.path()))
             .expect("sessions")
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("goal-"))
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("session-"))
     );
 }
 

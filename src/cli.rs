@@ -90,6 +90,7 @@ use crate::{
         AutonomousLimits, AutonomousState, TuiResourceSnapshot, TuiRuntimeFactory,
         load_tui_agent_mode, load_tui_fast_mode, load_tui_rlm_max_depth, run_tui_with_autonomous,
     },
+    typesafe::{TypeSafeConfig, TypeSafeMode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -129,6 +130,21 @@ enum AgentModeArg {
     Default,
     Plan,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TypeSafeModeArg {
+    Off,
+    On,
+}
+
+impl From<TypeSafeModeArg> for TypeSafeMode {
+    fn from(value: TypeSafeModeArg) -> Self {
+        match value {
+            TypeSafeModeArg::Off => Self::Off,
+            TypeSafeModeArg::On => Self::On,
+        }
+    }
 }
 
 impl From<AgentModeArg> for AgentMode {
@@ -173,6 +189,16 @@ fn default_state_dir() -> PathBuf {
         .map_or_else(|| PathBuf::from(".mimir"), |home| home.join(".mimir"))
 }
 
+fn fresh_session_id() -> String {
+    format!("session-{}", Uuid::new_v4().simple())
+}
+
+fn ensure_fresh_session(cli: &mut Cli) {
+    if cli.session.is_empty() {
+        cli.session = fresh_session_id();
+    }
+}
+
 #[derive(Debug, Parser)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -190,7 +216,12 @@ pub struct Cli {
     workspace: PathBuf,
     #[arg(long, env = "MIMIR_STATE_DIR", default_value_os_t = default_state_dir())]
     state_dir: PathBuf,
-    #[arg(long, default_value = "default")]
+    #[arg(
+        long,
+        default_value = "",
+        hide_default_value = true,
+        conflicts_with = "no_session"
+    )]
     session: String,
     #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "fork", "no_session"])]
     continue_session: bool,
@@ -228,6 +259,14 @@ pub struct Cli {
     no_context_files: bool,
     #[arg(long)]
     no_skills: bool,
+    #[arg(
+        long,
+        env = "MIMIR_TYPESAFE",
+        value_enum,
+        default_value = "off",
+        help = "Enable or disable TypeSafe-backed features"
+    )]
+    typesafe: TypeSafeModeArg,
     #[arg(long)]
     no_prompt_templates: bool,
     #[arg(long)]
@@ -372,6 +411,7 @@ struct RuntimeBuildConfig {
     no_extensions: bool,
     no_context_files: bool,
     no_skills: bool,
+    typesafe: TypeSafeConfig,
     no_prompt_templates: bool,
     no_themes: bool,
     skill_paths: Vec<PathBuf>,
@@ -394,6 +434,7 @@ struct RuntimeBuildConfig {
     provider_explicit: bool,
     model_explicit: bool,
     default_thinking_level: ThinkingLevel,
+    auth_store: Option<AuthStore>,
 }
 
 impl RuntimeBuildConfig {
@@ -422,6 +463,10 @@ impl RuntimeBuildConfig {
             no_extensions: cli.no_extensions,
             no_context_files: cli.no_context_files,
             no_skills: cli.no_skills,
+            typesafe: TypeSafeConfig {
+                mode: cli.typesafe.into(),
+                ..TypeSafeConfig::default()
+            },
             no_prompt_templates: cli.no_prompt_templates,
             no_themes: cli.no_themes,
             skill_paths: cli.skill.clone(),
@@ -444,7 +489,12 @@ impl RuntimeBuildConfig {
             provider_explicit: cli.provider.is_some(),
             model_explicit: cli.model.is_some(),
             default_thinking_level: ThinkingLevel::Off,
+            auth_store: None,
         }
+    }
+
+    fn auth_store(&self) -> Result<AuthStore> {
+        self.auth_store.clone().map_or_else(AuthStore::global, Ok)
     }
 }
 
@@ -1524,11 +1574,6 @@ fn validate_run_options(cli: &Cli) -> Result<()> {
             "--autonomous is only supported by text/json run modes".into(),
         ));
     }
-    if cli.no_session && cli.session != "default" {
-        return Err(MimirError::Configuration(
-            "--no-session cannot be combined with --session".into(),
-        ));
-    }
     if (cli.no_session && cli.output == OutputMode::Rpc)
         || (cli.session_dir.is_some() && matches!(cli.output, OutputMode::Rpc | OutputMode::Acp))
     {
@@ -1539,6 +1584,20 @@ fn validate_run_options(cli: &Cli) -> Result<()> {
     if cli.goal.as_ref().is_some_and(|goal| goal.trim().is_empty()) {
         return Err(MimirError::Configuration(
             "--goal requires a non-empty objective".into(),
+        ));
+    }
+    if cli.prompt_segments.iter().any(|segment| {
+        matches!(
+            segment.as_str(),
+            "--typesafe-skill-selection"
+                | "--typesafe-assist-rollout-percent"
+                | "--typesafe-model"
+                | "--typesafe-timeout-ms"
+        )
+    }) {
+        return Err(MimirError::Configuration(
+            "legacy TypeSafe feature flags were removed; use --typesafe on or --typesafe off"
+                .into(),
         ));
     }
     if cli.goal.is_some()
@@ -1823,9 +1882,6 @@ async fn prepare_run_session(cli: &mut Cli) -> Result<()> {
         cli.session = destination_id;
     }
     if let Some(goal) = cli.goal.as_deref() {
-        if cli.session == "default" {
-            cli.session = format!("goal-{}", Uuid::new_v4().simple());
-        }
         GoalStore::new(&state)
             .create(goal, cli.goal_token_budget)
             .await?;
@@ -1852,6 +1908,7 @@ pub async fn entrypoint() -> Result<()> {
         cli.command = None;
         cli.resume = Some(agent);
     }
+    ensure_fresh_session(&mut cli);
     if let Some(command) = &cli.command {
         return run_management(&cli, command).await;
     }
@@ -2055,15 +2112,12 @@ async fn dispatch_run(
             let (initial_provider, initial_model, _) = runtime.model_selection().await;
             let initial_selection = tui_model_key(&initial_provider, &initial_model);
             let mut models = tui_model_options(&initial_provider, &initial_model);
-            let mut sessions = Vec::new();
-            if let Ok(state) = resolve_state_dir(&cli.state_dir) {
-                let build = RuntimeBuildConfig::from_cli(cli);
-                let session_root = resolve_session_root(&build, &state)?;
-                sessions = list_run_session_ids(&build, &session_root)
-                    .await
-                    .unwrap_or_default();
-            }
             let state = resolve_state_dir(&cli.state_dir)?;
+            let tui_build = RuntimeBuildConfig::from_cli(cli);
+            let session_root = resolve_session_root(&tui_build, &state)?;
+            let mut sessions = list_run_session_ids(&tui_build, &session_root)
+                .await
+                .unwrap_or_default();
             let migrated = MigratedRuntimeState::load(&state)?;
             models.extend(
                 migrated
@@ -2083,7 +2137,6 @@ async fn dispatch_run(
             if !sessions.iter().any(|session| session == &cli.session) {
                 sessions.insert(0, cli.session.clone());
             }
-            let tui_build = RuntimeBuildConfig::from_cli(cli);
             let tui_bash_runner = build_bash_runner(&tui_build)?;
             let autonomous_limits = tui_build
                 .autonomous_limits
@@ -2099,6 +2152,7 @@ async fn dispatch_run(
                 models,
                 sessions,
                 state,
+                session_root,
                 initial_selection,
                 cli.session.clone(),
                 autonomous_limits,
@@ -2117,7 +2171,14 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
     if matches!(command, Command::Doctor) {
         return doctor(cli).await;
     }
-    let state = resolve_state_dir(&cli.state_dir)?;
+    let state = if matches!(
+        command,
+        Command::Login { .. } | Command::Logout { .. } | Command::Auth { .. }
+    ) {
+        cli.state_dir.clone()
+    } else {
+        resolve_state_dir(&cli.state_dir)?
+    };
     match command {
         Command::Doctor => doctor(cli).await,
         Command::Login {
@@ -2126,7 +2187,7 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
             api_key_stdin,
             enterprise_domain,
         } => {
-            let store = AuthStore::new(&state)?;
+            let store = AuthStore::global()?;
             let api_key = match (api_key.as_deref(), *api_key_stdin) {
                 (Some(_), true) => {
                     return Err(MimirError::Configuration(
@@ -2287,14 +2348,14 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
             }
         }
         Command::Logout { provider } => {
-            let store = AuthStore::new(&state)?;
+            let store = AuthStore::global()?;
             let logged_out = store.logout(provider).await?;
             print_json(&json!({"provider": provider, "logged_out": logged_out}))
         }
         Command::Auth {
             action: AuthCommand::Status,
         } => {
-            let store = AuthStore::new(&state)?;
+            let store = AuthStore::global()?;
             print_json(&json!({
                 "schema_version": 1,
                 "credentials": store.statuses().await?
@@ -2411,11 +2472,19 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
         Command::Migrate { action } => run_migration_management(action, &state).await,
         Command::Session {
             action: SessionCommand::List,
-        } => print_json(&json!({
-            "schema_version": 1,
-            "sessions": FileSessionStore::list_ids(&state).await?,
-        })),
-        Command::Session { action } => run_session_management(cli, action, &state).await,
+        } => {
+            let build = RuntimeBuildConfig::from_cli(cli);
+            let session_root = resolve_session_root(&build, &state)?;
+            print_json(&json!({
+                "schema_version": 1,
+                "sessions": list_run_session_ids(&build, &session_root).await?,
+            }))
+        }
+        Command::Session { action } => {
+            let build = RuntimeBuildConfig::from_cli(cli);
+            let session_root = resolve_session_root(&build, &state)?;
+            run_session_management(cli, action, &build, &session_root).await
+        }
         Command::Diagnose { action } => run_diagnose_management(action, &state).await,
         Command::Learning { action } => run_learning_management(cli, action, &state).await,
         Command::Mcp { action } => run_mcp_management(action, &state).await,
@@ -2761,7 +2830,7 @@ async fn run_top_level_shutdown(cli: &Cli, state: &Path, force: bool) -> Result<
             return print_json(&json!({"shutdown": false, "cancelled": true}));
         }
     }
-    let config = daemon_config(state);
+    let config = daemon_config(state, &cli.workspace)?;
     let socket = cli.socket.as_deref().unwrap_or(&config.socket_path);
     let Ok(mut client) = DaemonClient::connect(socket).await else {
         return print_json(&json!({
@@ -2779,7 +2848,7 @@ async fn run_top_level_shutdown(cli: &Cli, state: &Path, force: bool) -> Result<
 }
 
 async fn run_top_level_list(cli: &Cli, state: &Path, all: bool) -> Result<()> {
-    let config = daemon_config(state);
+    let config = daemon_config(state, &cli.workspace)?;
     let socket = cli.socket.as_deref().unwrap_or(&config.socket_path);
     let mut data = if DaemonClient::connect(socket).await.is_ok() {
         public_daemon_request(cli, state, json!({"type": "list"})).await?
@@ -2792,13 +2861,14 @@ async fn run_top_level_list(cli: &Cli, state: &Path, all: bool) -> Result<()> {
         )));
     };
     if all {
-        data["savedSessions"] = serde_json::to_value(FileSessionStore::list_ids(state).await?)?;
+        data["savedSessions"] =
+            serde_json::to_value(FileSessionStore::list_ids(&config.state_root).await?)?;
     }
     print_json(&data)
 }
 
 async fn run_top_level_status(cli: &Cli, state: &Path) -> Result<()> {
-    let config = daemon_config(state);
+    let config = daemon_config(state, &cli.workspace)?;
     let socket = cli.socket.as_deref().unwrap_or(&config.socket_path);
     let Ok(mut client) = DaemonClient::connect(socket).await else {
         return print_json(&json!({
@@ -2823,10 +2893,11 @@ async fn run_public_daemon_command(cli: &Cli, state: &Path, command: Value) -> R
 #[cfg(unix)]
 async fn public_daemon_request(cli: &Cli, state: &Path, command: Value) -> Result<Value> {
     const MAX_PUBLIC_FRAME_BYTES: usize = 1024 * 1024;
-    let socket = cli
-        .socket
-        .clone()
-        .unwrap_or_else(|| daemon_config(state).socket_path);
+    let socket = if let Some(socket) = &cli.socket {
+        socket.clone()
+    } else {
+        daemon_config(state, &cli.workspace)?.socket_path
+    };
     let stream = tokio::net::UnixStream::connect(&socket)
         .await
         .map_err(|error| {
@@ -2991,11 +3062,16 @@ async fn run_package_management(
 
 const MAX_SESSION_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 
-async fn run_session_management(cli: &Cli, action: &SessionCommand, state: &Path) -> Result<()> {
+async fn run_session_management(
+    cli: &Cli,
+    action: &SessionCommand,
+    build: &RuntimeBuildConfig,
+    session_root: &Path,
+) -> Result<()> {
     match action {
         SessionCommand::List => unreachable!("session list is handled by the caller"),
         SessionCommand::Show => {
-            let store = FileSessionStore::create(state, &cli.session).await?;
+            let store = create_run_session_store(build, session_root, &cli.session).await?;
             let loaded = store.load().await?;
             print_json(&json!({
                 "schema_version": 1,
@@ -3004,11 +3080,12 @@ async fn run_session_management(cli: &Cli, action: &SessionCommand, state: &Path
                 "records": loaded.records,
             }))
         }
-        SessionCommand::Export { output } => export_session(cli, state, output).await,
+        SessionCommand::Export { output } => export_session(cli, build, session_root, output).await,
         SessionCommand::Import { input, cwd } => {
             let bytes = read_bounded_regular_file(input, MAX_SESSION_IMPORT_BYTES).await?;
             let plan = prepare_switch_session(input, &bytes, cwd.as_deref())?;
-            let store = FileSessionStore::create(state, &plan.target_session_id).await?;
+            let store =
+                create_run_session_store(build, session_root, &plan.target_session_id).await?;
             if tokio::fs::try_exists(store.path()).await? {
                 return Err(MimirError::Configuration(format!(
                     "session already exists: {}",
@@ -3139,8 +3216,13 @@ async fn run_diagnose_management(action: &DiagnoseCommand, state: &Path) -> Resu
     }
 }
 
-async fn export_session(cli: &Cli, state: &Path, output: &Path) -> Result<()> {
-    let store = FileSessionStore::create(state, &cli.session).await?;
+async fn export_session(
+    cli: &Cli,
+    build: &RuntimeBuildConfig,
+    session_root: &Path,
+    output: &Path,
+) -> Result<()> {
+    let store = create_run_session_store(build, session_root, &cli.session).await?;
     let loaded = store.load().await?;
     if output.extension().and_then(std::ffi::OsStr::to_str) == Some("html") {
         let html = render_session_messages_html(loaded.records.iter().filter_map(|record| {
@@ -3317,7 +3399,7 @@ async fn run_mcp_management(action: &McpCommand, state: &Path) -> Result<()> {
         McpCommand::Add { .. } => add_mcp_server(&catalog, action).await,
         McpCommand::Remove { server } => {
             if catalog.get(server).await?.is_some() {
-                McpAuthCoordinator::new(state)?.logout(server).await?;
+                McpAuthCoordinator::global(state)?.logout(server).await?;
             }
             let removed = catalog.remove(server).await?;
             print_json(&json!({"schema_version": 1, "server": server, "removed": removed}))
@@ -3341,7 +3423,7 @@ async fn run_mcp_management(action: &McpCommand, state: &Path) -> Result<()> {
             .await
         }
         McpCommand::Logout { server } => {
-            let logged_out = McpAuthCoordinator::new(state)?.logout(server).await?;
+            let logged_out = McpAuthCoordinator::global(state)?.logout(server).await?;
             print_json(&json!({"schema_version":1,"server":server,"logged_out":logged_out}))
         }
         McpCommand::Tools { server } => list_mcp_tools(&catalog, state, server).await,
@@ -3471,7 +3553,7 @@ async fn login_mcp(
     api_key_stdin: bool,
     redirect_uri: &str,
 ) -> Result<()> {
-    let coordinator = McpAuthCoordinator::new(state)?;
+    let coordinator = McpAuthCoordinator::global(state)?;
     let entry = coordinator
         .catalog()
         .get(server)
@@ -3607,7 +3689,7 @@ async fn call_mcp_tool(
 }
 
 async fn print_mcp_status(state: &Path, server: Option<&str>) -> Result<()> {
-    let coordinator = McpAuthCoordinator::new(state)?;
+    let coordinator = McpAuthCoordinator::global(state)?;
     let statuses =
         match server {
             Some(server) => vec![coordinator.status(server).await?.ok_or_else(|| {
@@ -6229,9 +6311,12 @@ impl PromptHandler for RuntimePromptHandler {
     ) -> std::result::Result<AgentMessageDelivery, DaemonError> {
         let state = resolve_state_dir(&self.build.state_dir)
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        let store = FileSessionStore::create(&state, &request.target_session_id)
-            .await
+        let session_root = resolve_session_root(&self.build, &state)
             .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        let store =
+            create_run_session_store(&self.build, &session_root, &request.target_session_id)
+                .await
+                .map_err(|error| DaemonError::Protocol(error.to_string()))?;
         if !tokio::fs::try_exists(store.path())
             .await
             .map_err(DaemonError::Io)?
@@ -6313,7 +6398,7 @@ async fn run_daemon_management(
     action: &DaemonCommand,
     state: &std::path::Path,
 ) -> Result<()> {
-    let mut config = daemon_config(state);
+    let mut config = daemon_config(state, &cli.workspace)?;
     if let Some(socket) = &cli.socket {
         config.socket_path.clone_from(socket);
     }
@@ -6423,7 +6508,7 @@ async fn start_daemon_process(
     for flag in &build.extension_flags {
         command.arg("--extension-flag").arg(flag);
     }
-    if config.socket_path != daemon_config(&config.state_root).socket_path {
+    if config.socket_path != config.state_root.join("daemon/mimir.sock") {
         command.arg("--socket").arg(&config.socket_path);
     }
     if !build.allowed_programs.is_empty() {
@@ -6467,17 +6552,18 @@ async fn start_daemon_process(
 }
 
 async fn ensure_rpc_daemon(context: &RpcSessionContext, state: &std::path::Path) -> Result<()> {
-    let config = daemon_config(state);
+    let config = daemon_config(state, &context.build.workspace)?;
     if DaemonClient::connect(&config.socket_path).await.is_err() {
         start_daemon_process(&context.build, &context.session_id, &config).await?;
     }
     Ok(())
 }
 
-fn daemon_config(state: &std::path::Path) -> DaemonConfig {
-    DaemonConfig {
-        state_root: state.to_owned(),
-        socket_path: state.join("daemon/mimir.sock"),
+fn daemon_config(state: &std::path::Path, workspace: &Path) -> Result<DaemonConfig> {
+    let project_state = learning::project_session_root(state, workspace)?;
+    Ok(DaemonConfig {
+        socket_path: project_state.join("daemon/mimir.sock"),
+        state_root: project_state,
         server_name: "mimir".into(),
         lease_ttl: std::time::Duration::from_secs(30),
         supported_capabilities: BTreeSet::from([
@@ -6486,7 +6572,7 @@ fn daemon_config(state: &std::path::Path) -> DaemonConfig {
             "session_catalog".into(),
             "shutdown".into(),
         ]),
-    }
+    })
 }
 
 fn daemon_error(error: DaemonError) -> MimirError {
@@ -6534,7 +6620,10 @@ async fn doctor(cli: &Cli) -> Result<()> {
     })?;
     let state = resolve_state_dir(&cli.state_dir)?;
     let registry = ProviderRegistry::builtin();
-    let provider_id = resolved_cli_provider(cli);
+    let store = AuthStore::global()?;
+    let selected =
+        activate_first_stored_provider(&RuntimeBuildConfig::from_cli(cli), &store).await?;
+    let provider_id = selected.provider;
     let (credential_status, credential_source, runtime_support) = if provider_id == "fake" {
         (
             "not_required".to_owned(),
@@ -6545,7 +6634,6 @@ async fn doctor(cli: &Cli) -> Result<()> {
         let provider = registry
             .get(&provider_id)
             .ok_or_else(|| MimirError::Configuration(format!("unknown provider: {provider_id}")))?;
-        let store = AuthStore::new(&state)?;
         let (credential_status, credential_source) =
             if let Some(stored) = store.get(&provider_id).await? {
                 let source = match stored {
@@ -6567,7 +6655,7 @@ async fn doctor(cli: &Cli) -> Result<()> {
     println!("workspace: {}", workspace.display());
     println!("state: {}", state.display());
     println!("provider: {provider_id}");
-    println!("model: {}", resolved_cli_model(cli, &provider_id));
+    println!("model: {}", selected.model);
     let base_url_source = if cli.base_url.is_some() {
         "command_line"
     } else if matches!(provider_id.as_str(), "openai" | "openai-codex")
@@ -6658,10 +6746,48 @@ async fn restored_runtime_build(
 }
 
 fn resolve_session_root(build: &RuntimeBuildConfig, state: &Path) -> Result<PathBuf> {
-    build
-        .session_dir
-        .as_deref()
-        .map_or_else(|| Ok(state.to_owned()), resolve_state_dir)
+    if let Some(session_dir) = build.session_dir.as_deref() {
+        return resolve_state_dir(session_dir);
+    }
+    for quarantined in quarantine_legacy_session_state(state)? {
+        eprintln!(
+            "warning: legacy cross-project session state was quarantined at {}",
+            quarantined.display()
+        );
+    }
+    learning::project_session_root(state, &build.workspace)
+}
+
+fn quarantine_legacy_session_state(state: &Path) -> Result<Vec<PathBuf>> {
+    let mut quarantined = Vec::new();
+    for (source, label) in [
+        (state.join("sessions"), "global-sessions-v1"),
+        (state.join("harness/sessions"), "global-session-learning-v1"),
+    ] {
+        let Ok(metadata) = std::fs::symlink_metadata(&source) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(MimirError::Configuration(format!(
+                "legacy session state must be a real directory before quarantine: {}",
+                source.display()
+            )));
+        }
+        let quarantine_root = state.join("quarantine");
+        std::fs::create_dir_all(&quarantine_root)?;
+        let mut destination = quarantine_root.join(label);
+        if destination.exists() {
+            destination = quarantine_root.join(format!("{label}-{}", Uuid::new_v4().simple()));
+        }
+        match std::fs::rename(&source, &destination) {
+            Ok(()) => quarantined.push(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Another process completed the same one-time quarantine.
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(quarantined)
 }
 
 fn activate_migrated_preferences(
@@ -6705,43 +6831,36 @@ fn activate_migrated_preferences(
     activated
 }
 
-/// Uses an unambiguous saved login when the caller did not choose a provider.
+/// Uses the first saved runnable login when the caller did not choose a provider.
 ///
 /// The CLI historically defaulted to `OpenAI` before consulting the auth store,
 /// which made `mimir login anthropic` insufficient for a bare `mimir` launch.
 /// A command-line provider and migrated preferences retain precedence; this
-/// fallback applies only when one stored credential can run natively.
-async fn activate_single_stored_provider(
+/// fallback follows the explicit order persisted in the global auth file.
+async fn activate_first_stored_provider(
     build: &RuntimeBuildConfig,
-    state: &std::path::Path,
+    auth: &AuthStore,
 ) -> Result<RuntimeBuildConfig> {
     if build.provider_explicit {
         return Ok(build.clone());
     }
     let registry = ProviderRegistry::builtin();
-    let mut providers = AuthStore::new(state)?
-        .statuses()
-        .await?
-        .into_iter()
-        .filter_map(|status| {
-            registry
-                .get(&status.provider)
-                .filter(|provider| provider.supports_runtime())
-                .map(|_| status.provider)
-        })
-        .collect::<Vec<_>>();
-    providers.sort();
-    providers.dedup();
-    let [provider] = providers.as_slice() else {
+    let provider = auth.statuses().await?.into_iter().find_map(|status| {
+        registry
+            .get(&status.provider)
+            .filter(|provider| provider.supports_runtime())
+            .map(|_| status.provider)
+    });
+    let Some(provider) = provider else {
         return Ok(build.clone());
     };
 
     let mut activated = build.clone();
-    activated.provider.clone_from(provider);
+    activated.provider.clone_from(&provider);
     activated.base_url = None;
     if !activated.model_explicit {
         registry
-            .get(provider)
+            .get(&provider)
             .and_then(|definition| definition.default_model)
             .unwrap_or("gpt-5-mini")
             .clone_into(&mut activated.model);
@@ -6896,7 +7015,7 @@ async fn build_provider_for_runtime(
             build.provider
         )));
     }
-    let auth = AuthStore::new(state)?;
+    let auth = build.auth_store()?;
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "the migrated provider type is intentionally private outside its module"
@@ -7375,7 +7494,8 @@ async fn build_runtime_for_session(
     let state = resolve_state_dir(&build.state_dir)?;
     let session_root = resolve_session_root(build, &state)?;
     let activation = MigratedRuntimeState::load(&state)?;
-    let stored_provider_build = activate_single_stored_provider(build, &state).await?;
+    let auth = build.auth_store()?;
+    let stored_provider_build = activate_first_stored_provider(build, &auth).await?;
     let activated_build = activate_migrated_preferences(&stored_provider_build, &activation);
     let (effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
@@ -7390,6 +7510,7 @@ async fn build_runtime_for_session(
         &workspace,
         &state,
         RuntimeLimits::default(),
+        auth.clone(),
     )
     .await?;
     let discovered_resources = if build.agent_mode.is_plan() {
@@ -7505,7 +7626,7 @@ async fn build_runtime_for_session(
     }
     if !build.no_builtin_tools && !build.agent_mode.is_plan() {
         tool_registry
-            .register_remember_tool(&state, session)
+            .register_remember_tool(&state, &session_root, session)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
     if build.no_builtin_tools && !build.agent_mode.is_plan() {
@@ -7570,7 +7691,7 @@ async fn build_runtime_for_session(
         // level remains below the configured recursion bound.
         let child_tools = tool_registry.snapshot_for_child_runtime();
         let catalog: Arc<dyn AuthenticatedModelCatalog> = Arc::new(
-            AuthStoreModelCatalog::new(AuthStore::new(&state)?)
+            AuthStoreModelCatalog::new(auth.clone())
                 .with_additional_models(activation.models().to_vec()),
         );
         let provider_factory: Arc<dyn RlmProviderFactory> = Arc::new(CliRlmProviderFactory {
@@ -7615,6 +7736,11 @@ async fn build_runtime_for_session(
             .register_rlm_runtime(rlm_runtime)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
+    if build.typesafe.mode == TypeSafeMode::On && !build.agent_mode.is_plan() {
+        tool_registry
+            .register_tool_search()
+            .map_err(|error| MimirError::Tool(error.to_string()))?;
+    }
     if let Some(allowed) = &build.tool_allowlist
         && !build.agent_mode.is_plan()
     {
@@ -7639,6 +7765,7 @@ async fn build_runtime_for_session(
         LimitValue::resolve,
     );
     config.provider_aware_token_budget = build.max_run_tokens.is_none();
+    config.typesafe.clone_from(&build.typesafe);
     config.budget.max_context_tokens = u64::from(model_context_window_tokens);
     let mut system_parts = Vec::new();
     if let Some(prompt) = build
@@ -8368,7 +8495,7 @@ async fn runtime_available_models(
     runtime: &AgentRuntime,
 ) -> Result<Vec<ModelDefinition>> {
     let state = resolve_state_dir(&build.state_dir)?;
-    let auth = AuthStore::new(&state)?;
+    let auth = build.auth_store()?;
     let (current_provider, current_model, _) = runtime.model_selection().await;
     let registry = ProviderRegistry::builtin();
     let mut configured = BTreeSet::new();
@@ -8753,14 +8880,17 @@ async fn request_rpc_daemon(
 ) -> Result<ServerResponse> {
     let state = resolve_state_dir(&context.build.state_dir)?;
     ensure_rpc_daemon(context, &state).await?;
-    let mut client = DaemonClient::connect(&daemon_config(&state).socket_path)
-        .await
-        .map_err(daemon_error)?;
+    let mut client =
+        DaemonClient::connect(&daemon_config(&state, &context.build.workspace)?.socket_path)
+            .await
+            .map_err(daemon_error)?;
     if let ClientRequest::SendMessage {
         target_session_id, ..
     } = &request
     {
-        let target = FileSessionStore::create(&state, target_session_id).await?;
+        let session_root = resolve_session_root(&context.build, &state)?;
+        let target =
+            create_run_session_store(&context.build, &session_root, target_session_id).await?;
         if !tokio::fs::try_exists(target.path()).await? {
             return Err(MimirError::Protocol(format!(
                 "unknown target session: {target_session_id}"
@@ -8844,7 +8974,11 @@ async fn start_legacy_observation(
         Ok(state) => state,
         Err(error) => return legacy_error(id, "observe", &error.to_string()),
     };
-    let observer = SessionObserver::new(&state);
+    let session_root = match resolve_session_root(&context.build, &state) {
+        Ok(root) => root,
+        Err(error) => return legacy_error(id, "observe", &error.to_string()),
+    };
+    let observer = SessionObserver::new(session_root);
     let observation = match observer.start(&target_session_id).await {
         Ok(observation) => observation,
         Err(error) => return legacy_error(id, "observe", &error.to_string()),
@@ -8940,7 +9074,8 @@ async fn observed_session_messages(
     session_id: &str,
 ) -> Result<Vec<Message>> {
     let state = resolve_state_dir(&context.build.state_dir)?;
-    let mut snapshot = SessionObserver::new(state).start(session_id).await?;
+    let session_root = resolve_session_root(&context.build, &state)?;
+    let mut snapshot = SessionObserver::new(session_root).start(session_id).await?;
     let messages = snapshot.messages().to_vec();
     snapshot.stop().await?;
     Ok(messages)
@@ -9955,7 +10090,8 @@ fn push_html_escaped(output: &mut String, input: &str) {
 
 async fn current_session_store(context: &RpcSessionContext) -> Result<FileSessionStore> {
     let state = resolve_state_dir(&context.build.state_dir)?;
-    FileSessionStore::create(&state, &context.session_id).await
+    let session_root = resolve_session_root(&context.build, &state)?;
+    create_run_session_store(&context.build, &session_root, &context.session_id).await
 }
 
 async fn legacy_session_name(context: &RpcSessionContext) -> Result<Option<String>> {
@@ -10052,12 +10188,13 @@ async fn clone_legacy_session(context: &mut RpcSessionContext) -> Result<()> {
     let records = source.load().await?.records;
     let session_id = format!("session-{}", Uuid::new_v4().simple());
     let state = resolve_state_dir(&context.build.state_dir)?;
+    let session_root = resolve_session_root(&context.build, &state)?;
     context
         .runtime
         .before_session_switch(
             SessionSwitchReason::New,
             Some(
-                state
+                session_root
                     .join("sessions")
                     .join(format!("{session_id}.jsonl"))
                     .display()
@@ -10065,7 +10202,7 @@ async fn clone_legacy_session(context: &mut RpcSessionContext) -> Result<()> {
             ),
         )
         .await?;
-    let destination = FileSessionStore::create(&state, &session_id).await?;
+    let destination = create_run_session_store(&context.build, &session_root, &session_id).await?;
     for record in records {
         destination.append(record).await?;
     }
@@ -10114,7 +10251,8 @@ async fn fork_legacy_session(context: &mut RpcSessionContext, entry_id: &str) ->
         .await?;
     let session_id = format!("session-{}", Uuid::new_v4().simple());
     let state = resolve_state_dir(&context.build.state_dir)?;
-    let destination = FileSessionStore::create(&state, &session_id).await?;
+    let session_root = resolve_session_root(&context.build, &state)?;
+    let destination = create_run_session_store(&context.build, &session_root, &session_id).await?;
     for record in records.into_iter().take(index) {
         destination.append(record).await?;
     }
@@ -10141,12 +10279,13 @@ async fn fork_legacy_session(context: &mut RpcSessionContext, entry_id: &str) ->
 async fn new_legacy_session(context: &mut RpcSessionContext, parent: Option<&str>) -> Result<()> {
     let session_id = format!("session-{}", Uuid::new_v4().simple());
     let state = resolve_state_dir(&context.build.state_dir)?;
+    let session_root = resolve_session_root(&context.build, &state)?;
     context
         .runtime
         .before_session_switch(
             SessionSwitchReason::New,
             Some(
-                state
+                session_root
                     .join("sessions")
                     .join(format!("{session_id}.jsonl"))
                     .display()
@@ -10185,7 +10324,8 @@ async fn switch_legacy_session(context: &mut RpcSessionContext, path: &str) -> R
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| MimirError::Protocol("sessionPath has no valid session id".into()))?;
     let state = resolve_state_dir(&context.build.state_dir)?;
-    let store = FileSessionStore::create(&state, session_id).await?;
+    let session_root = resolve_session_root(&context.build, &state)?;
+    let store = create_run_session_store(&context.build, &session_root, session_id).await?;
     if !tokio::fs::try_exists(store.path()).await? {
         return Err(MimirError::Protocol(format!(
             "session does not exist: {session_id}"
@@ -10271,11 +10411,12 @@ mod tui_model_selection_tests {
     use super::{
         AutonomousLimitOverrides, Cli, Command, ConfigCommand, LimitValue, OutputMode,
         PackageCommand, RuntimeBuildConfig, RuntimePromptHandler, ScheduleCommand, UpdateAction,
-        activate_single_stored_provider, autonomous_status_value, build_runtime_for_session,
-        daemon_runtime_error, parse_recovered_goal_create, parse_recovered_refine_args,
-        resolve_autonomous_limits, resolve_extension_flags, resolve_runtime_thinking_level,
-        resolve_tui_model_selection, run_once_autonomous, run_self_update,
-        runtime_model_definition, send_public_command, tui_model_options, validate_run_options,
+        activate_first_stored_provider, autonomous_status_value, build_runtime_for_session,
+        daemon_runtime_error, ensure_fresh_session, parse_recovered_goal_create,
+        parse_recovered_refine_args, resolve_autonomous_limits, resolve_extension_flags,
+        resolve_runtime_thinking_level, resolve_session_root, resolve_tui_model_selection,
+        run_once_autonomous, run_self_update, runtime_model_definition, send_public_command,
+        tui_model_options, validate_run_options,
     };
 
     #[test]
@@ -10303,6 +10444,101 @@ mod tui_model_selection_tests {
         let overridden = Cli::try_parse_from(["mimir", "--provider-timeout-seconds", "1800"])
             .expect("timeout override");
         assert_eq!(overridden.provider_timeout_seconds, 1_800);
+    }
+
+    #[test]
+    fn bare_cli_creates_a_fresh_session_instead_of_reusing_default() {
+        let mut first = Cli::try_parse_from(["mimir"]).expect("first");
+        let mut second = Cli::try_parse_from(["mimir"]).expect("second");
+        ensure_fresh_session(&mut first);
+        ensure_fresh_session(&mut second);
+        assert!(first.session.starts_with("session-"));
+        assert!(second.session.starts_with("session-"));
+        assert_ne!(first.session, second.session);
+        assert_ne!(first.session, "default");
+    }
+
+    #[test]
+    fn no_session_remains_usable_without_an_implicit_session_argument() {
+        assert!(Cli::try_parse_from(["mimir", "--no-session"]).is_ok());
+        assert!(Cli::try_parse_from(["mimir", "--no-session", "--session", "named"]).is_err());
+    }
+
+    #[test]
+    fn project_session_root_quarantines_legacy_cross_project_state() {
+        let state = tempfile::TempDir::new().expect("state");
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        std::fs::create_dir(workspace.path().join(".git")).expect("git root");
+        std::fs::create_dir_all(state.path().join("sessions")).expect("legacy sessions");
+        std::fs::write(
+            state.path().join("sessions/default.jsonl"),
+            "legacy transcript\n",
+        )
+        .expect("legacy transcript");
+        std::fs::create_dir_all(state.path().join("harness/sessions/default"))
+            .expect("legacy learning");
+        std::fs::write(
+            state
+                .path()
+                .join("harness/sessions/default/harness_state.json"),
+            "{}",
+        )
+        .expect("legacy harness");
+        let mut config = build("fake", "fake-model");
+        config.workspace = workspace.path().to_owned();
+        config.state_dir = state.path().to_owned();
+
+        let root = resolve_session_root(&config, state.path()).expect("project root");
+
+        assert!(
+            root.starts_with(
+                state
+                    .path()
+                    .canonicalize()
+                    .expect("canonical state")
+                    .join("projects")
+            )
+        );
+        assert!(!state.path().join("sessions").exists());
+        assert!(!state.path().join("harness/sessions").exists());
+        assert!(
+            state
+                .path()
+                .join("quarantine/global-sessions-v1/default.jsonl")
+                .exists()
+        );
+        assert!(
+            state
+                .path()
+                .join("quarantine/global-session-learning-v1/default/harness_state.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn typesafe_is_off_by_default_and_has_one_on_switch() {
+        let defaults =
+            RuntimeBuildConfig::from_cli(&Cli::try_parse_from(["mimir"]).expect("defaults"));
+        assert_eq!(defaults.typesafe.mode, crate::typesafe::TypeSafeMode::Off);
+        assert_eq!(
+            defaults.typesafe.timeout,
+            std::time::Duration::from_millis(2_000)
+        );
+        assert_eq!(defaults.typesafe.model, "jev-latest");
+
+        let enabled = Cli::try_parse_from(["mimir", "--typesafe", "on"]).expect("TypeSafe option");
+        let enabled = RuntimeBuildConfig::from_cli(&enabled);
+        assert_eq!(enabled.typesafe.mode, crate::typesafe::TypeSafeMode::On);
+        assert_eq!(
+            enabled.typesafe.timeout,
+            std::time::Duration::from_millis(2_000)
+        );
+        assert_eq!(enabled.typesafe.model, "jev-latest");
+
+        assert!(Cli::try_parse_from(["mimir", "--typesafe", "shadow"]).is_err());
+        let legacy = Cli::try_parse_from(["mimir", "--typesafe-assist-rollout-percent", "25"])
+            .expect("legacy flag is parsed as a prompt segment");
+        assert!(validate_run_options(&legacy).is_err());
     }
 
     #[test]
@@ -10739,32 +10975,34 @@ mod tui_model_selection_tests {
     }
 
     #[tokio::test]
-    async fn sole_stored_anthropic_oauth_login_becomes_the_implicit_provider() {
+    async fn first_stored_runnable_login_becomes_the_implicit_provider() {
         let state = tempfile::TempDir::new().expect("state");
-        AuthStore::new(state.path())
-            .expect("auth store")
-            .set_oauth(
-                "anthropic",
-                OAuthCredential {
-                    access: "test-access".into(),
-                    refresh: "test-refresh".into(),
-                    expires_at_ms: u64::MAX,
-                    account_id: None,
-                    enterprise_url: None,
-                },
-            )
+        let auth = AuthStore::new(state.path()).expect("auth store");
+        auth.set_api_key("openai", "test-key")
             .await
-            .expect("stored OAuth");
+            .expect("stored API key");
+        auth.set_oauth(
+            "anthropic",
+            OAuthCredential {
+                access: "test-access".into(),
+                refresh: "test-refresh".into(),
+                expires_at_ms: u64::MAX,
+                account_id: None,
+                enterprise_url: None,
+            },
+        )
+        .await
+        .expect("stored OAuth");
         let mut config = build("openai", "gpt-5-mini");
         config.provider_explicit = false;
         config.model_explicit = false;
 
-        let selected = activate_single_stored_provider(&config, state.path())
+        let selected = activate_first_stored_provider(&config, &auth)
             .await
             .expect("implicit provider");
 
-        assert_eq!(selected.provider, "anthropic");
-        assert_eq!(selected.model, "claude-sonnet-5");
+        assert_eq!(selected.provider, "openai");
+        assert_eq!(selected.model, "gpt-5-mini");
     }
 
     #[test]
@@ -10843,6 +11081,7 @@ mod tui_model_selection_tests {
             no_extensions: false,
             no_context_files: false,
             no_skills: false,
+            typesafe: crate::typesafe::TypeSafeConfig::default(),
             no_prompt_templates: false,
             no_themes: false,
             skill_paths: Vec::new(),
@@ -10865,6 +11104,7 @@ mod tui_model_selection_tests {
             provider_explicit: true,
             model_explicit: true,
             default_thinking_level: ThinkingLevel::Off,
+            auth_store: None,
         }
     }
 
@@ -11218,9 +11458,8 @@ export default function activate(pi) {
             .expect("manifest json"),
         )
         .expect("manifest");
-        crate::auth::AuthStore::new(state.path())
-            .expect("auth store")
-            .set_api_key("bridge", "test-only-key")
+        let auth = crate::auth::AuthStore::new(state.path()).expect("auth store");
+        auth.set_api_key("bridge", "test-only-key")
             .await
             .expect("credential");
 
@@ -11232,6 +11471,7 @@ export default function activate(pi) {
         config.no_extensions = true;
         config.extension_paths = vec![extension_root];
         config.extension_flags = vec!["trace=true".into()];
+        config.auth_store = Some(auth);
         let runtime = build_runtime_for_session(&config, "custom-provider")
             .await
             .expect("custom extension provider runtime");

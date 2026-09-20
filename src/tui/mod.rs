@@ -22,9 +22,9 @@ pub use autonomous::{
 pub use commands::{McpCommand, SlashCommand, parse_slash_command};
 pub use driver::{
     RlmMaxDepthStatus, TuiRuntimeFactory, dispatch_persistent_action, dispatch_runtime_action,
-    export_tui_session, handle_ui_request, load_tui_agent_mode, load_tui_fast_mode,
-    load_tui_rlm_max_depth, load_tui_rlm_max_depth_status, preview_tui_share, preview_tui_traces,
-    run_tui, run_tui_with_autonomous, set_tui_rlm_max_depth,
+    export_tui_session, handle_ui_request, handle_ui_request_with_auth_store, load_tui_agent_mode,
+    load_tui_fast_mode, load_tui_rlm_max_depth, load_tui_rlm_max_depth_status, preview_tui_share,
+    preview_tui_traces, run_tui, run_tui_with_autonomous, set_tui_rlm_max_depth,
 };
 pub use input::{Action, InputBinding, KeyCode, KeyEvent};
 pub use render::{RenderOptions, TerminalSize};

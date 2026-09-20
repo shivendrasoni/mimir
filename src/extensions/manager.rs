@@ -74,7 +74,7 @@ struct ResourceDiscoveryOutput {
 #[derive(Debug)]
 pub struct ExtensionManager {
     workspace_root: PathBuf,
-    state_root: PathBuf,
+    auth_store: AuthStore,
     runtimes: BTreeMap<String, Arc<ExtensionRuntime>>,
     tools: BTreeMap<String, (String, ToolDescriptor)>,
     commands: BTreeMap<String, (String, CommandDescriptor)>,
@@ -154,13 +154,19 @@ impl ExtensionManager {
         workspace_root: &Path,
         state_root: &Path,
         limits: RuntimeLimits,
+        auth_store: AuthStore,
     ) -> Result<Arc<Self>> {
         type Cache = tokio::sync::Mutex<BTreeMap<String, Weak<ExtensionManager>>>;
         static CACHE: OnceLock<Cache> = OnceLock::new();
         let workspace =
             std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
         let state = std::fs::canonicalize(state_root).unwrap_or_else(|_| state_root.to_path_buf());
-        let key = format!("{}\0{}", workspace.display(), state.display());
+        let key = format!(
+            "{}\0{}\0{}",
+            workspace.display(),
+            state.display(),
+            auth_store.path().display()
+        );
         let mut cache = CACHE
             .get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
             .lock()
@@ -168,7 +174,9 @@ impl ExtensionManager {
         if let Some(manager) = cache.get(&key).and_then(Weak::upgrade) {
             return Ok(manager);
         }
-        let manager = Arc::new(Self::load(entries, &workspace, &state, limits).await?);
+        let manager = Arc::new(
+            Self::load_with_auth_store(entries, &workspace, &state, limits, auth_store).await?,
+        );
         cache.insert(key, Arc::downgrade(&manager));
         Ok(manager)
     }
@@ -179,9 +187,27 @@ impl ExtensionManager {
         state_root: &Path,
         limits: RuntimeLimits,
     ) -> Result<Self> {
+        Self::load_with_auth_store(
+            entries,
+            workspace_root,
+            state_root,
+            limits,
+            AuthStore::global()?,
+        )
+        .await
+    }
+
+    /// Loads extensions with an explicit credential store for isolated embedding and tests.
+    pub async fn load_with_auth_store(
+        entries: Vec<CatalogEntry>,
+        workspace_root: &Path,
+        state_root: &Path,
+        limits: RuntimeLimits,
+        auth_store: AuthStore,
+    ) -> Result<Self> {
         let mut manager = Self {
             workspace_root: workspace_root.to_path_buf(),
-            state_root: state_root.to_path_buf(),
+            auth_store,
             runtimes: BTreeMap::new(),
             tools: BTreeMap::new(),
             commands: BTreeMap::new(),
@@ -274,9 +300,7 @@ impl ExtensionManager {
             .begin_provider_oauth_login(name)
             .await?;
         if let Some(credential) = continuation.oauth_credential {
-            AuthStore::new(&self.state_root)?
-                .set_oauth(name, credential)
-                .await?;
+            self.auth_store.set_oauth(name, credential).await?;
             return Ok(None);
         }
         let request = continuation.next_request.ok_or_else(|| {
@@ -397,7 +421,7 @@ impl ExtensionManager {
         let credential = if let Some(credential) = environment_credential {
             credential
         } else {
-            match AuthStore::new(&self.state_root)?.get(name).await? {
+            match self.auth_store.get(name).await? {
                 Some(AuthCredential::ApiKey { key }) => key,
                 Some(AuthCredential::OAuth(mut oauth)) => {
                     let now = std::time::SystemTime::now()
@@ -413,9 +437,7 @@ impl ExtensionManager {
                             oauth = runtime.refresh_provider_oauth(name, oauth).await.map_err(
                                 |error| redacted_extension_error(&error, &[&access, &refresh]),
                             )?;
-                            AuthStore::new(&self.state_root)?
-                                .set_oauth(name, oauth.clone())
-                                .await?;
+                            self.auth_store.set_oauth(name, oauth.clone()).await?;
                         }
                         let access = oauth.access.clone();
                         let refresh = oauth.refresh.clone();
@@ -692,9 +714,7 @@ impl ExtensionManager {
                     "extension returned OAuth credentials for a non-OAuth interaction".into(),
                 )
             })?;
-            AuthStore::new(&self.state_root)?
-                .set_oauth(&provider, credential)
-                .await?;
+            self.auth_store.set_oauth(&provider, credential).await?;
         }
         Ok(continuation.command_result)
     }

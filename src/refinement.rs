@@ -25,7 +25,8 @@ const MAX_REMEMBER_BYTES: usize = 4 * 1024;
 const REFINEMENT_SYSTEM_PROMPT: &str = r#"You are Mimir's continual harness refinement subsystem.
 Return JSON only with this shape:
 {"summary":"one sentence","rationale":"evidence","expectedOutcome":"outcome","edits":[{"action":"create|update|delete","kind":"prompt|memory|skill|subagent","id":"optional for create","title":"required except delete","content":"required except delete","path":"optional","reference":{},"arguments":{},"metadata":{},"reason":"why"}]}
-Make only small evidence-backed edits. Never rewrite a base system prompt. Skill creates and updates require reference.type=python, a Python import, a callable or call_pattern, and an arguments object."#;
+Make only small evidence-backed edits. Never rewrite a base system prompt. Skill creates and updates require reference.type=python, a Python import, a callable or call_pattern, and an arguments object.
+For user scope, create only stable cross-project preferences, procedures, safety rules, or tooling heuristics. Never store project status, phases, branches, commits, releases, versions, paths, current implementation facts, or completion claims in user scope. Every user-scope create or update must set metadata.portability to preference, procedure, safety_rule, or tooling_heuristic."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HarnessScope {
@@ -428,6 +429,10 @@ pub async fn remember(
             metadata: Some(BTreeMap::from([
                 ("origin".into(), serde_json::json!("explicit_user_memory")),
                 ("priority".into(), serde_json::json!(50)),
+                (
+                    "portability".into(),
+                    serde_json::json!(portable_memory_class(memory)),
+                ),
             ])),
             reason: Some("Explicit natural-language remember request".into()),
         }],
@@ -452,6 +457,28 @@ pub async fn remember(
         ));
     }
     Ok(result)
+}
+
+fn portable_memory_class(memory: &str) -> &'static str {
+    let memory = memory.to_ascii_lowercase();
+    if ["security", "safety", "never expose", "credential", "secret"]
+        .iter()
+        .any(|marker| memory.contains(marker))
+    {
+        "safety_rule"
+    } else if ["workflow", "procedure", "before ", "after ", "when "]
+        .iter()
+        .any(|marker| memory.contains(marker))
+    {
+        "procedure"
+    } else if ["tool", "clippy", "formatter", "linter", "compiler"]
+        .iter()
+        .any(|marker| memory.contains(marker))
+    {
+        "tooling_heuristic"
+    } else {
+        "preference"
+    }
 }
 
 fn remembered_title(memory: &str) -> String {
@@ -569,16 +596,18 @@ pub async fn load_harness_context_for_workspace(
     validate_options(session_id, &RefineOptions::default())?;
     let root = canonical_state_root(state_root);
     let project_root = learning::discover_project_root(workspace)?;
-    let user = load_state(
+    let mut user = load_state(
         &root,
         &harness_state_path(&root, &project_root, session_id, HarnessScope::User),
     )
     .await?;
-    let session = load_state(
-        &root,
-        &harness_state_path(&root, &project_root, session_id, HarnessScope::Session),
-    )
-    .await?;
+    retain_portable_user_entries(&mut user.entries);
+    let session_path = harness_state_path(&root, &project_root, session_id, HarnessScope::Session);
+    let session = if session_path.exists() {
+        load_state(&project_root, &session_path).await?
+    } else {
+        HarnessState::default()
+    };
     let project_path = harness_state_path(&root, &project_root, session_id, HarnessScope::Project);
     let project = if project_path.exists() {
         load_state(&project_root, &project_path).await?
@@ -694,7 +723,7 @@ async fn load_inherited_state(
         HarnessScope::Fleet => &[],
     };
     for scope in scopes {
-        let state = if *scope == HarnessScope::Fleet {
+        let mut state = if *scope == HarnessScope::Fleet {
             learning::load_active_fleet_pack(root)
                 .await?
                 .map_or_else(HarnessState::default, |pack| {
@@ -704,6 +733,9 @@ async fn load_inherited_state(
             let path = harness_state_path(root, project_root, session_id, *scope);
             load_state(storage_root_for_scope(root, project_root, *scope), &path).await?
         };
+        if *scope == HarnessScope::User {
+            retain_portable_user_entries(&mut state.entries);
+        }
         merge_entries(&mut inherited.entries, state.entries);
     }
     Ok((!harness_entries_empty(&inherited.entries)).then_some(inherited))
@@ -715,8 +747,8 @@ fn storage_root_for_scope<'a>(
     scope: HarnessScope,
 ) -> &'a Path {
     match scope {
-        HarnessScope::Project => project_root,
-        HarnessScope::Session | HarnessScope::User | HarnessScope::Fleet => state_root,
+        HarnessScope::Session | HarnessScope::Project => project_root,
+        HarnessScope::User | HarnessScope::Fleet => state_root,
     }
 }
 
@@ -1003,7 +1035,7 @@ fn apply_edit(
         str::to_owned,
     );
     let mut result = applied_shell(edit, id.clone());
-    if let Some(error) = validate_edit(edit, &id) {
+    if let Some(error) = validate_edit(edit, &id, scope) {
         result.error = Some(error);
         return result;
     }
@@ -1106,7 +1138,7 @@ fn applied_shell(edit: &RefinementEdit, id: String) -> AppliedRefinementEdit {
     }
 }
 
-fn validate_edit(edit: &RefinementEdit, id: &str) -> Option<String> {
+fn validate_edit(edit: &RefinementEdit, id: &str, scope: HarnessScope) -> Option<String> {
     if edit.action == RefinementAction::Unknown {
         return Some("unsupported action".into());
     }
@@ -1127,6 +1159,12 @@ fn validate_edit(edit: &RefinementEdit, id: &str) -> Option<String> {
             || edit.content.as_deref().is_none_or(str::is_empty))
     {
         return Some(format!("{:?} requires title and content", edit.action).to_lowercase());
+    }
+    if scope == HarnessScope::User
+        && edit.action != RefinementAction::Delete
+        && let Some(error) = validate_portable_user_edit(edit)
+    {
+        return Some(error);
     }
     if edit.action != RefinementAction::Delete && edit.kind == RefinementKind::Skill {
         let Some(reference) = &edit.reference else {
@@ -1156,6 +1194,126 @@ fn validate_edit(edit: &RefinementEdit, id: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn validate_portable_user_edit(edit: &RefinementEdit) -> Option<String> {
+    let portability = edit
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("portability"))
+        .and_then(serde_json::Value::as_str);
+    if !matches!(
+        portability,
+        Some("preference" | "procedure" | "safety_rule" | "tooling_heuristic")
+    ) {
+        return Some(
+            "user-scope edits require metadata.portability set to preference, procedure, safety_rule, or tooling_heuristic"
+                .into(),
+        );
+    }
+    validate_portable_user_text(
+        edit.title.as_deref().unwrap_or_default(),
+        edit.content.as_deref().unwrap_or_default(),
+        edit.path.as_deref().unwrap_or_default(),
+    )
+}
+
+fn validate_portable_user_text(title: &str, content: &str, path: &str) -> Option<String> {
+    let text = format!("{title} {content} {path}").to_ascii_lowercase();
+    let normative_cues = [
+        "always ", "never ", "prefer ", "should ", "must ", "when ", "before ", "after ", "use ",
+        "avoid ", "do not ", "explain ", "ask ", "keep ",
+    ];
+    if !normative_cues.iter().any(|cue| text.contains(cue)) {
+        return Some(
+            "user scope accepts normative portable guidance, not descriptive project facts".into(),
+        );
+    }
+    let episodic_phrases = [
+        "phase 1",
+        "phase 2",
+        "phase 3",
+        "phase one",
+        "phase two",
+        "phase three",
+        "current phase",
+        "currently implementing",
+        "we are now",
+        "we have ",
+        "this project",
+        "the project is",
+        "already ",
+        "currently ",
+        " completed",
+        " finished",
+        " implemented",
+        " migrated",
+        " reached",
+        "already completed",
+        "has been completed",
+        "release status",
+        "current release",
+        "current branch",
+        "on branch",
+        "commit:",
+        "version:",
+    ];
+    if episodic_phrases.iter().any(|phrase| text.contains(phrase)) || contains_revision_fact(&text)
+    {
+        return Some(
+            "user scope accepts only stable portable guidance, not project status, phases, branches, commits, releases, or versions"
+                .into(),
+        );
+    }
+    let local_path_markers = ["/users/", "/home/", "$workspace/", ".git/", "\\users\\"];
+    if local_path_markers
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return Some("user-scope edits must not contain local or project paths".into());
+    }
+    None
+}
+
+fn contains_revision_fact(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
+        .collect::<Vec<_>>();
+    words.windows(2).any(|pair| match pair[0] {
+        "version" => pair[1]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit() || character == 'v'),
+        "commit" => {
+            pair[1].len() >= 7
+                && pair[1]
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        }
+        _ => false,
+    })
+}
+
+fn retain_portable_user_entries(entries: &mut HarnessEntries) {
+    for kind in [
+        RefinementKind::Prompt,
+        RefinementKind::Memory,
+        RefinementKind::Skill,
+        RefinementKind::Subagent,
+    ] {
+        entries.records_mut(kind).retain(|_, entry| {
+            let classified = matches!(
+                entry
+                    .metadata
+                    .get("portability")
+                    .and_then(serde_json::Value::as_str),
+                Some("preference" | "procedure" | "safety_rule" | "tooling_heuristic")
+            );
+            classified
+                && validate_portable_user_text(&entry.title, &entry.content, &entry.path).is_none()
+        });
+    }
 }
 
 fn strip_scope_prefix(id: &str) -> &str {
@@ -1314,7 +1472,8 @@ async fn load_all_history(
             upsert_history(&mut history, result);
         }
     }
-    let session = FileSessionStore::create(root, session_id).await?;
+    let session_root = learning::project_session_root(root, project_root)?;
+    let session = FileSessionStore::create(&session_root, session_id).await?;
     for record in session.load().await?.records {
         let SessionPayload::RuntimeEvent { name, detail } = record.payload else {
             continue;
@@ -1421,7 +1580,11 @@ fn refinement_history_path(
 
 fn harness_dir(root: &Path, project_root: &Path, session_id: &str, scope: HarnessScope) -> PathBuf {
     match scope {
-        HarnessScope::Session => root.join("harness/sessions").join(session_id),
+        HarnessScope::Session => project_harness_path(project_root)
+            .parent()
+            .unwrap_or(project_root)
+            .join("sessions")
+            .join(session_id),
         HarnessScope::Project => project_harness_path(project_root)
             .parent()
             .unwrap_or(project_root)

@@ -255,7 +255,7 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     composer.push(StyledLine::plain(rule, muted));
     composer.push(StyledLine::plain(
         format!(
-            "{} · {} · mode:{} · /help · @ paths · ctrl+v image · ctrl+c clear/cancel · twice exit",
+            "{} · {} · mode:{} · /help · shift+enter newline · ctrl+v image · ctrl+c clear/cancel · twice exit",
             app.selected_model().unwrap_or("model unset"),
             app.selected_effort().as_str(),
             app.agent_mode().as_str()
@@ -265,14 +265,21 @@ pub fn render(app: &App, size: TerminalSize, options: RenderOptions) -> String {
     if let Some(hint) = app.command_parameter_hint() {
         composer.push(StyledLine::plain(format!("↳ {hint}"), muted));
     }
-    composer.push(StyledLine::plain(
-        format!(
-            "{}❯ {}",
-            " ".repeat(usize::from(app.editor_padding_x())),
-            app.prompt()
-        ),
-        TextStyle::new(Tone::Prompt),
-    ));
+    let prompt_style = TextStyle::new(Tone::Prompt);
+    let prompt_padding = " ".repeat(usize::from(app.editor_padding_x()));
+    for (index, line) in app.prompt().split('\n').enumerate() {
+        let prefix = if index == 0 {
+            format!("{prompt_padding}❯ ")
+        } else {
+            format!("{prompt_padding}  ")
+        };
+        let mut prompt_line = StyledLine::plain(format!("{prefix}{line}"), prompt_style);
+        prompt_line.continuation = vec![StyledSpan {
+            text: " ".repeat(prefix.chars().count()),
+            style: prompt_style,
+        }];
+        composer.push(prompt_line);
+    }
 
     let wrapped = wrap_lines(&lines, size.width);
     let composer_lines = wrap_lines(&composer, size.width);

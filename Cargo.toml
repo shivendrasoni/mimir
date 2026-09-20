@@ -1,6 +1,6 @@
 [package]
 name = "mimir-ai"
-version = "0.14.0"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.97"
 description = "A fast, memory-efficient agentic harness"
@@ -48,6 +48,7 @@ tokio = { version = "1.47", features = ["fs", "io-std", "io-util", "macros", "ne
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+typesafe-client = "0.1"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
 
@@ -58,6 +59,7 @@ nix = { version = "0.30", features = ["process", "signal"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 proptest = "1.7"
+typesafe-client = { version = "0.1", features = ["fake"] }
 
 [profile.release]
 lto = "thin"

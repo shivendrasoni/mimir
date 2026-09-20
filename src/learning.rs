@@ -337,7 +337,18 @@ pub fn discover_project_root(workspace: &Path) -> Result<PathBuf> {
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
         MimirError::Configuration(format!("workspace is inaccessible: {error}"))
     })?;
+    // A marker outside the nearest repository cannot describe that repository.
+    // This prevents an umbrella checkout from claiming nested, independent repos.
+    let git_root = workspace
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf);
     for ancestor in workspace.ancestors() {
+        if let Some(git_root) = git_root.as_deref()
+            && !ancestor.starts_with(git_root)
+        {
+            break;
+        }
         let marker = ancestor.join(".mimir/project.json");
         match std::fs::symlink_metadata(&marker) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -356,8 +367,35 @@ pub fn discover_project_root(workspace: &Path) -> Result<PathBuf> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        if Some(ancestor) == git_root.as_deref() {
+            break;
+        }
     }
-    Ok(workspace)
+    Ok(git_root.unwrap_or(workspace))
+}
+
+/// Returns a stable, non-identifying namespace for project-owned session data.
+///
+/// The canonical project path is hashed rather than copied into global state.
+/// Moving a checkout intentionally creates a new isolation boundary; explicit
+/// session export/import remains the portability mechanism.
+pub fn project_storage_key(project_root: &Path) -> Result<String> {
+    let root = discover_project_root(project_root)?;
+    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    Ok(digest[..16]
+        .iter()
+        .fold(String::with_capacity(32), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        }))
+}
+
+/// Resolves the global-state namespace used for one project's transcripts.
+pub fn project_session_root(state_root: &Path, workspace: &Path) -> Result<PathBuf> {
+    let state_root = canonical_state_root(state_root);
+    Ok(state_root
+        .join("projects")
+        .join(project_storage_key(workspace)?))
 }
 
 pub async fn ensure_project_marker(project_root: &Path) -> Result<ProjectMarker> {

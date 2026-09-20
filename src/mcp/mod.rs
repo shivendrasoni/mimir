@@ -15,7 +15,7 @@ pub use catalog::{
 };
 pub use client::{McpClient, McpServerInfo, McpToolCallOutput, McpToolDescriptor};
 pub use config::{McpHttpConfig, McpServerConfig, McpStdioConfig};
-pub use connector::connect_catalog_client;
+pub use connector::{connect_catalog_client, connect_catalog_client_with_auth_store};
 pub use oauth::{
     McpAuthorizationChallenge, McpOAuthAuthorization, McpOAuthClient, McpOAuthClientMetadata,
     McpOAuthClientMetadataStore, McpOAuthCodeReceiver, McpOAuthCredentialBundle,

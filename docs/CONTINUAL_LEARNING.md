@@ -4,16 +4,16 @@ Mimir's continual learning changes bounded harness context, not model weights. R
 
 ## Scope and storage
 
-The nearest ancestor containing `.mimir/project.json` defines the project boundary. `mimir learning init` creates that marker and `.mimir/learning/state.json`; in Git repositories it adds those two paths to the repository-local exclude file so project identity and learned state remain untracked by default.
+The nearest ancestor containing `.mimir/project.json` defines the project boundary, but discovery never crosses the nearest Git repository root. An umbrella marker therefore cannot claim a nested repository. `mimir learning init` creates the marker and `.mimir/learning/state.json`; in Git repositories it adds those two paths to the repository-local exclude file so project identity and learned state remain untracked by default.
 
 Schema v2 has four scopes, ordered from most to least specific:
 
-1. `session`: existing per-session state under the configured Mimir state root.
+1. `session`: `.mimir/learning/sessions/<session-id>/` beneath the discovered project root.
 2. `project`: `.mimir/learning/` beneath the discovered marker.
 3. `user`: existing global harness state under the configured Mimir state root.
 4. `fleet`: read-only signed packs cached under `<state-root>/learning/fleet/`.
 
-The old serialized `local` and `global` names and the `--global` CLI option remain accepted as aliases for `session` and `user`. Existing files remain readable, and refinement history still contains the before/after records required for rollback.
+The old serialized `local` and `global` names and the `--global` CLI option remain accepted as aliases for `session` and `user`. Refinement history retains the before/after records required for rollback. Legacy global session transcripts and session-learning directories are quarantined under `<state-root>/quarantine/` instead of being attached to whichever project starts next.
 
 At runtime, applicable entries are deduplicated with session over project over user over fleet precedence. Selection scores scope, explicit priority, query relevance, and recency, then enforces a 24-entry, 12 KiB context ceiling. Loading context is read-only and does not initialize a project.
 
@@ -31,7 +31,7 @@ Candidate validation rejects unknown kinds, base-prompt changes, permission expa
 
 The parent agent has a built-in `remember` tool. When the user explicitly says “remember this”, “always remember”, or otherwise asks Mimir to retain guidance, the model converts that request into a concise standalone memory and invokes the tool. The tool writes through the same versioned refinement coordinator as `/refine`, so the result is bounded, scoped, visible in harness context, and reversible with `/refine rollback <refinement-id>`.
 
-Project is the default scope. Session scope is used only for explicitly temporary guidance, and user scope only when the user explicitly asks for the memory to apply across projects. The tool is unavailable in plan mode and is not inherited by RLM children. It must not infer remembrance from incidental conversation or store credentials, source code, paths, or tool payloads.
+Project is the default scope. Session scope is used only for explicitly temporary guidance. User scope requires explicit global or across-project wording in the current persisted user turn; the host verifies that evidence rather than trusting the model's tool arguments. User memories are classified as portable preferences, procedures, safety rules, or tooling heuristics. Project status, phases, branches, commits, releases, versions, completion claims, and local paths are rejected. Ambiguous legacy global entries without a portable classification remain on disk for rollback but are excluded from assembled context. The tool is unavailable in plan mode and is not inherited by RLM children.
 
 For precise manual control, `/refine --scope session|project|user <instructions>` remains available.
 

@@ -2,7 +2,9 @@
 
 ## State
 
-State defaults to the global `$HOME/.mimir/` directory and uses versioned JSON and JSONL formats. Set `MIMIR_STATE_DIR` or pass `--state-dir` to use an isolated state directory.
+Global configuration, fleet packs, and caches default to `$HOME/.mimir/`. Provider and MCP credentials are always read from the user-global `$HOME/.mimir/auth.json`; changing the state directory never changes or duplicates login state.
+
+Durable transcripts, daemon state, and the daemon socket are stored under `<state-root>/projects/<project-hash>/`, where the hash identifies the canonical nearest Git project without exposing its path. Session learning is stored under `<project>/.mimir/learning/sessions/`. Ordinary launches create a fresh session; use `--continue`, `--resume`, or an explicit `--session` to restore one from the current project. Legacy cross-project `<state-root>/sessions/` and `<state-root>/harness/sessions/` directories are atomically moved under `<state-root>/quarantine/` on first use.
 
 ## Management commands
 

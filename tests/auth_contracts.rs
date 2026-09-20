@@ -5,6 +5,7 @@ use mimir::{
     model::ThinkingLevel,
     provider::registry::{AuthKind, ProviderRegistry, RuntimeSupport, model_catalog},
 };
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -36,6 +37,40 @@ async fn auth_store_round_trips_redacted_credentials_and_logout() {
             .expect("get after logout")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn auth_store_persists_login_order_across_updates() {
+    let root = TempDir::new().expect("auth root");
+    let store = AuthStore::new(root.path()).expect("auth store");
+
+    store
+        .set_api_key("openai", "first-key")
+        .await
+        .expect("first login");
+    store
+        .set_api_key("anthropic", "second-key")
+        .await
+        .expect("second login");
+    store
+        .set_api_key("openai", "updated-first-key")
+        .await
+        .expect("updated login");
+
+    let providers = store
+        .statuses()
+        .await
+        .expect("statuses")
+        .into_iter()
+        .map(|status| status.provider)
+        .collect::<Vec<_>>();
+    assert_eq!(providers, ["openai", "anthropic"]);
+
+    let file: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(store.path()).await.expect("auth file"))
+            .expect("auth JSON");
+    assert_eq!(file["schema_version"], 2);
+    assert_eq!(file["order"], json!(["openai", "anthropic"]));
 }
 
 #[test]

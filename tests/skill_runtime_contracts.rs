@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use mimir::{
     budget::Budget,
+    extensions::ExtensionHostAction,
     model::{Content, Message, ModelResponse, StopReason, ToolCall},
     provider::FakeProvider,
     resources::{MAX_SKILL_BODY_BYTES, ResourceLoader},
@@ -10,8 +11,10 @@ use mimir::{
     skills::SkillRuntime,
     tools::{ToolPolicy, ToolRegistry},
     tui::{Action, App, AppConfig},
+    typesafe::{TypeSafeConfig, TypeSafeMode, TypeSafeSkillSelector},
 };
 use tempfile::TempDir;
+use typesafe_client::fake::FakeSystemOne;
 
 fn response(text: &str) -> ModelResponse {
     ModelResponse {
@@ -42,6 +45,41 @@ fn write_skill(root: &std::path::Path, name: &str, description: &str, body: &str
         format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
     )
     .expect("skill file");
+}
+
+fn two_test_skills(root: &std::path::Path) -> SkillRuntime {
+    write_skill(
+        root,
+        "brainstorming",
+        "Explore product ideas before implementation",
+        "Ask focused questions before selecting a design.",
+    );
+    write_skill(
+        root,
+        "api-design",
+        "Design stable service interfaces",
+        "Define the interface contract.",
+    );
+    let resources = ResourceLoader::new(root, root)
+        .expect("resource loader")
+        .load()
+        .expect("resources");
+    SkillRuntime::new(resources.skills)
+}
+
+fn typesafe_tool_diagnostics(records: &[mimir::session::SessionRecord]) -> String {
+    records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            mimir::session::SessionPayload::RuntimeEvent { name, detail }
+                if name.starts_with("typesafe_tool_") =>
+            {
+                Some(detail.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -149,6 +187,313 @@ async fn model_can_discover_then_ephemerally_activate_a_skill() {
     let serialized = serde_json::to_string(&loaded.records).expect("serialize records");
     assert!(serialized.contains("brainstorming"));
     assert!(!serialized.contains("Ask focused questions before selecting a design."));
+}
+
+#[tokio::test]
+async fn typesafe_on_loads_a_confident_skill_and_records_redacted_outcomes() {
+    let workspace = TempDir::new().expect("workspace");
+    write_skill(
+        workspace.path(),
+        "brainstorming",
+        "Explore product ideas before implementation",
+        "Ask focused questions before selecting a design.",
+    );
+    write_skill(
+        workspace.path(),
+        "api-design",
+        "Design stable service interfaces",
+        "Define the interface contract.",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![response("assisted")]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = runtime_with_skills(workspace.path(), provider.clone(), store.clone()).await;
+    let typesafe = Arc::new(FakeSystemOne::new());
+    typesafe.set_noul("skill_applies", 0.96);
+    typesafe.set_choice_probabilities(
+        "best_skill",
+        [("brainstorming", 0.95), ("api-design", 0.05)],
+    );
+    runtime
+        .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            typesafe,
+        ))
+        .await;
+
+    let prompt = "Help me shape this feature";
+    assert_eq!(
+        runtime
+            .run(prompt, &VecEventSink::default())
+            .await
+            .expect("assisted run"),
+        "assisted"
+    );
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .system_prompt
+            .contains("<active_skill name=\"brainstorming\"")
+    );
+    assert!(requests[0].system_prompt.contains("Ask focused questions"));
+    let loaded = store.load().await.expect("session");
+    let diagnostics = loaded
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            mimir::session::SessionPayload::RuntimeEvent { name, detail }
+                if name.starts_with("typesafe_skill_") =>
+            {
+                Some(detail.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|detail| detail.contains("\"decision\":\"activated\""))
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|detail| detail.contains("task_succeeded"))
+    );
+    assert!(diagnostics.iter().all(|detail| !detail.contains(prompt)));
+}
+
+#[tokio::test]
+async fn typesafe_shortlists_tools_and_search_tools_recovers_an_omission() {
+    let workspace = TempDir::new().expect("workspace");
+    let skills = two_test_skills(workspace.path());
+    let mut tools =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
+    tools
+        .register_skill_search(&skills)
+        .expect("skill search tool");
+    tools.register_tool_search().expect("tool recovery search");
+
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response(
+            "hidden-tool",
+            "write_file",
+            serde_json::json!({"path": "should-not-exist.txt", "content": "blocked"}),
+        ),
+        tool_response(
+            "recover-tool",
+            "search_tools",
+            serde_json::json!({"query": "write_file", "limit": 1}),
+        ),
+        response("recovered"),
+    ]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(tools),
+        store.clone(),
+        RuntimeConfig {
+            model: "fake-model".into(),
+            system_prompt: "base system".into(),
+            budget: Budget::default(),
+            provider_timeout: Duration::from_secs(2),
+            ..RuntimeConfig::default_for_model("fake-model")
+        },
+    )
+    .await
+    .expect("runtime");
+    runtime.attach_skill_runtime(skills);
+
+    let typesafe = Arc::new(FakeSystemOne::new());
+    typesafe.set_noul("skill_applies", 0.96);
+    typesafe.set_choice_probabilities(
+        "best_skill",
+        [("brainstorming", 0.95), ("api-design", 0.05)],
+    );
+    // BTreeMap definition order: edit_file, list_files, read_file, search, write_file.
+    for (id, probability) in [
+        ("tool_needed_0", 0.02),
+        ("tool_needed_1", 0.02),
+        ("tool_needed_2", 0.94),
+        ("tool_needed_3", 0.91),
+        ("tool_needed_4", 0.02),
+    ] {
+        typesafe.set_noul(id, probability);
+    }
+    runtime
+        .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            typesafe,
+        ))
+        .await;
+
+    let prompt = "Inspect the workspace and prepare the requested change";
+    assert_eq!(
+        runtime
+            .run(prompt, &VecEventSink::default())
+            .await
+            .expect("shortlisted run"),
+        "recovered"
+    );
+
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 3);
+    let first = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(first.contains(&"read_file"));
+    assert!(first.contains(&"search"));
+    assert!(first.contains(&"search_tools"));
+    assert!(!first.contains(&"write_file"));
+    assert!(!workspace.path().join("should-not-exist.txt").exists());
+    assert!(
+        requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "write_file")
+    );
+
+    let records = store.load().await.expect("session").records;
+    let serialized = typesafe_tool_diagnostics(&records);
+    assert!(serialized.contains("typesafe_tool_selection"));
+    assert!(serialized.contains("typesafe_tool_recovery"));
+    assert!(!serialized.contains(prompt));
+}
+
+#[tokio::test]
+async fn typesafe_tool_uncertainty_keeps_the_complete_pool() {
+    let workspace = TempDir::new().expect("workspace");
+    let mut tools =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
+    tools.register_tool_search().expect("tool recovery search");
+    let provider = Arc::new(FakeProvider::new(vec![response("full pool")]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(tools),
+        store.clone(),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+    let typesafe = Arc::new(FakeSystemOne::new());
+    // BTreeMap definition order: edit_file, list_files, read_file, search, write_file.
+    for (id, probability) in [
+        ("tool_needed_0", 0.57),
+        ("tool_needed_1", 0.02),
+        ("tool_needed_2", 0.94),
+        ("tool_needed_3", 0.02),
+        ("tool_needed_4", 0.02),
+    ] {
+        typesafe.set_noul(id, probability);
+    }
+    runtime
+        .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            typesafe,
+        ))
+        .await;
+
+    runtime
+        .run("Read the configuration", &VecEventSink::default())
+        .await
+        .expect("fallback run");
+
+    let requests = provider.requests().await;
+    let names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "edit_file",
+        "list_files",
+        "read_file",
+        "search",
+        "write_file",
+        "search_tools",
+    ] {
+        assert!(names.contains(&expected));
+    }
+    let diagnostics = store
+        .load()
+        .await
+        .expect("session")
+        .records
+        .into_iter()
+        .filter_map(|record| match record.payload {
+            mimir::session::SessionPayload::RuntimeEvent { name, detail }
+                if name == "typesafe_tool_selection" =>
+            {
+                Some(detail)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|detail| detail.contains("fallback_uncertain"))
+    );
+}
+
+#[tokio::test]
+async fn typesafe_tool_shortlist_is_disabled_when_recovery_is_inactive() {
+    let workspace = TempDir::new().expect("workspace");
+    let mut tools =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
+    tools.register_tool_search().expect("tool recovery search");
+    let provider = Arc::new(FakeProvider::new(vec![response("extension pool")]));
+    let runtime = AgentRuntime::resume(
+        provider.clone(),
+        Arc::new(tools),
+        Arc::new(InMemorySessionStore::default()),
+        RuntimeConfig::default_for_model("fake-model"),
+    )
+    .await
+    .expect("runtime");
+    runtime
+        .apply_extension_actions(&[ExtensionHostAction::SetActiveTools {
+            names: vec!["read_file".into(), "write_file".into()],
+        }])
+        .await
+        .expect("active tool override");
+    let typesafe = Arc::new(FakeSystemOne::new());
+    runtime
+        .attach_typesafe_skill_selector(TypeSafeSkillSelector::with_transport(
+            TypeSafeConfig {
+                mode: TypeSafeMode::On,
+                ..TypeSafeConfig::default()
+            },
+            typesafe.clone(),
+        ))
+        .await;
+
+    runtime
+        .run("Update the file", &VecEventSink::default())
+        .await
+        .expect("run");
+
+    assert_eq!(typesafe.request_count(), 0);
+    let requests = provider.requests().await;
+    let names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["read_file", "write_file"]);
 }
 
 #[tokio::test]

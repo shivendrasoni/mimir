@@ -5,10 +5,11 @@ use mimir::tui::{
     Action, App, AppConfig, AppPreferenceState, ImageAttachment, InputBinding, KeyCode, KeyEvent,
     McpCommand, Overlay, OverlayKind, RenderOptions, SlashCommand, StreamEvent,
     TerminalCapabilities, TerminalSize, ThemeName, TreeFilterMode, TuiAction, UiRequest,
-    dispatch_persistent_action, dispatch_runtime_action, export_tui_session, handle_ui_request,
-    parse_slash_command,
+    dispatch_persistent_action, dispatch_runtime_action, export_tui_session,
+    handle_ui_request_with_auth_store, parse_slash_command,
 };
 use mimir::{
+    auth::AuthStore,
     mcp::{McpAuthCoordinator, McpCatalogServer, McpCatalogStdio, McpServerCatalog},
     orchestration::HeartbeatManagementAction,
     provider::FakeProvider,
@@ -38,6 +39,75 @@ fn fresh_tui_shows_a_cursor_and_supports_editing_in_the_middle() {
     app.apply_key(KeyEvent::plain(KeyCode::Left));
     app.apply_key(KeyEvent::plain(KeyCode::Char('l')));
     assert_eq!(app.prompt(), "hello");
+}
+
+#[test]
+fn shift_enter_inserts_a_newline_without_submitting() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("first");
+    app.apply_key(KeyEvent {
+        code: KeyCode::Enter,
+        ctrl: false,
+        alt: false,
+        shift: true,
+    });
+    app.apply_key(KeyEvent::plain(KeyCode::Char('s')));
+
+    assert_eq!(app.prompt(), "first\ns");
+    assert_eq!(app.pending_submission(), None);
+
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+    assert_eq!(app.pending_submission(), Some("first\ns".into()));
+}
+
+#[test]
+fn iterm_shift_enter_encoding_inserts_a_newline_without_submitting() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("first");
+    app.apply_key(KeyEvent {
+        code: KeyCode::Enter,
+        ctrl: false,
+        alt: true,
+        shift: false,
+    });
+
+    assert_eq!(app.prompt(), "first\n");
+    assert_eq!(app.pending_submission(), None);
+}
+
+#[test]
+fn escape_then_return_inserts_a_newline_without_submitting() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("first");
+    app.apply_key(KeyEvent::plain(KeyCode::Esc));
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+
+    assert_eq!(app.prompt(), "first\n");
+    assert_eq!(app.pending_submission(), None);
+}
+
+#[test]
+fn backslash_then_return_inserts_a_newline_without_submitting() {
+    let mut app = App::new(AppConfig::default());
+    app.set_prompt("first\\");
+    app.apply_key(KeyEvent::plain(KeyCode::Enter));
+
+    assert_eq!(app.prompt(), "first\n");
+    assert_eq!(app.pending_submission(), None);
+}
+
+#[test]
+fn ctrl_j_is_a_terminal_safe_newline_fallback() {
+    let mut app = App::new(AppConfig::default());
+    app.apply_key(KeyEvent {
+        code: KeyCode::Char('j'),
+        ctrl: true,
+        alt: false,
+        shift: false,
+    });
+
+    assert_eq!(app.prompt(), "\n");
+    assert_eq!(app.pending_submission(), None);
 }
 
 #[test]
@@ -114,6 +184,7 @@ fn parses_supported_slash_commands_and_arguments() {
 #[tokio::test]
 async fn mcp_api_key_request_persists_through_the_typed_coordinator() {
     let state = TempDir::new().expect("state");
+    let auth = AuthStore::new(state.path()).expect("auth");
     let catalog = McpServerCatalog::new(state.path()).expect("catalog");
     catalog
         .upsert(
@@ -129,12 +200,13 @@ async fn mcp_api_key_request_persists_through_the_typed_coordinator() {
         )
         .await
         .expect("persist server");
-    let message = handle_ui_request(
+    let message = handle_ui_request_with_auth_store(
         state.path(),
         UiRequest::McpApiKey {
             server: "linear".into(),
             api_key: "mcp-test-secret".into(),
         },
+        auth,
     )
     .await
     .expect("store API key");

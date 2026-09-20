@@ -14,6 +14,9 @@ OPENAI_API_KEY=... mimir --model gpt-5-mini --print "inspect this repository"
 # Interactive full-screen TUI; /help lists commands and /quit exits
 mimir
 
+# Resume the newest session from this Git project only
+mimir --continue
+
 # Auto mode lets the agent run Bash commands and workspace edits without prompts
 mimir --agent-mode auto
 
@@ -38,7 +41,9 @@ The model has a workspace-rooted `bash` tool. In `default` mode every model-issu
 
 `/mode plan` limits the model to `read_file`, `list_files`, `search`, `ask_user`, and `write_plan`. It can inspect the repository, pause for a structured clarification, and create or revise one session-bound Markdown file under `plans/`; direct shell commands, extensions, MCP, IPython, child agents, and autonomous continuations are disabled. Plan mode supports native model providers only.
 
-Outside plan mode, an explicit request such as “remember that this project uses strict Clippy” can invoke the built-in `remember` tool. It stores a project-scoped memory by default through the same durable refinement history as `/refine`. Say that the memory is temporary to select session scope, or explicitly request that it apply across projects to select user scope.
+Outside plan mode, an explicit request such as “remember that this project uses strict Clippy” can invoke the built-in `remember` tool. It stores a project-scoped memory by default through the same durable refinement history as `/refine`. Say that the memory is temporary to select session scope. User scope requires explicit wording such as “remember this across all projects”; the host verifies that wording and rejects project phases, status, branches, commits, versions, paths, and completion claims from global memory.
+
+Each ordinary launch creates a fresh session. There is no implicit persistent `default` conversation. Sessions and the daemon socket are namespaced by the nearest Git project, and `--continue`, `--resume [SESSION]`, or an explicit `--session SESSION` are the only ways to restore continuity.
 
 When the plan is ready, enter standalone `implement` or `/implement [additional instructions]`. Mimir validates the artifact, switches to auto mode, and starts implementation from the accepted plan. The plan is never committed or pushed automatically.
 
@@ -47,6 +52,26 @@ When the plan is ready, enter standalone `implement` or `/implement [additional 
 Inside the TUI, type `@` anywhere in the composer to pick a file or folder from the active workspace. Continue typing to filter, use Up/Down or Tab to select, and press Enter to insert the workspace-relative reference.
 
 Referenced paths are validated against the workspace and are made explicit to the model. Folders are inspected selectively instead of being injected wholesale.
+
+## TypeSafe skill and tool-pool selection
+
+TypeSafe is one cohesive configuration and is off by default. Turn it on to send the current text request plus bounded skill and tool names/descriptions to Jev. One shared request can load a confident skill and independently judge which configured tools may be needed anywhere in the run. Parameter schemas are not sent to TypeSafe.
+
+The runtime applies a tool shortlist only when every omitted tool is below the calibrated uncertainty band and the reduction saves at least 256 estimated provider tokens. Invalid output, timeout, configuration, service failure, an uncertain omission, a small pool, or an unavailable recovery tool keeps the full configured pool. `search_tools` remains visible in an active shortlist and can discover and activate omitted built-in, extension, or MCP tools for the next model step. `search_skills` and autonomous `finish_task` also remain visible.
+
+```bash
+TYPESAFE_API_KEY=... mimir --typesafe on
+```
+
+There are only two states: `on` and `off`. There is no shadow mode, assist mode, or rollout-percentage flag. An explicit `/skill:<name>` invocation still wins for the skill decision while the same turn may use tool-pool shortlisting.
+
+```bash
+mimir --typesafe off
+```
+
+`MIMIR_TYPESAFE=on|off` is the environment equivalent. Model, timeout, and feature-specific policy live inside one `TypeSafeConfig`; they are intentionally not separate CLI flags, so future TypeSafe capabilities do not add unrelated top-level runtime fields.
+
+Selection diagnostics persist decisions, bounded probabilities, shared token usage, estimated TypeSafe cost, latency, tool counts, estimated context savings, request byte count, and request SHA-256—not the request text or API key. Outcome events record task completion, skill corrections, and tool recovery. The original request plus bounded skill and tool names/descriptions are sent to TypeSafe when the integration is on, so enable it only where that data transfer is acceptable.
 
 ## Process execution
 

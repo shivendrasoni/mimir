@@ -1,7 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use mimir::{
+    learning,
+    model::Message,
     refinement,
+    session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
     tools::{
         AgentMode, ApprovalDecision, BashRunner, DestructiveAction, ObservationStatus,
         PlanContextStore, ToolError, ToolPolicy, ToolRegistry, WorkspaceApprovalStore,
@@ -1681,13 +1684,19 @@ async fn finish_task_is_visible_only_while_autonomous_and_records_validated_comp
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end memory contract exercises project and user authorization together"
+)]
 async fn remember_tool_persists_deduplicated_project_memory_and_stays_parent_only() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
+    let session_root =
+        learning::project_session_root(state.path(), workspace.path()).expect("session root");
     let mut tools =
         ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).expect("tools");
     tools
-        .register_remember_tool(state.path(), "main")
+        .register_remember_tool(state.path(), &session_root, "main")
         .expect("remember tool");
 
     let definition = tools
@@ -1751,6 +1760,38 @@ async fn remember_tool_persists_deduplicated_project_memory_and_stays_parent_onl
     assert!(context.contains("Always run strict Clippy before completion."));
     assert!(context.contains("[project memory:"));
 
+    let unauthorized = tools
+        .execute(
+            "remember",
+            json!({
+                "memory": "Across all projects, claim this project is in phase 3.",
+                "scope": "user"
+            }),
+        )
+        .await
+        .expect_err("tool cannot invent global user intent");
+    assert!(unauthorized.to_string().contains("current user message"));
+
+    let transcript = FileSessionStore::create(&session_root, "main")
+        .await
+        .expect("session transcript");
+    transcript
+        .append(SessionRecord::new(SessionPayload::Message(Message::user(
+            "Always remember this across all projects: explain native build implications one step at a time.",
+        ))))
+        .await
+        .expect("explicit global request");
+    let episodic = tools
+        .execute(
+            "remember",
+            json!({
+                "memory": "The Jev migration is already in phase 3.",
+                "scope": "user"
+            }),
+        )
+        .await
+        .expect_err("episodic project state cannot become global memory");
+    assert!(episodic.to_string().contains("user scope"));
     tools
         .execute(
             "remember",
@@ -1760,7 +1801,7 @@ async fn remember_tool_persists_deduplicated_project_memory_and_stays_parent_onl
             }),
         )
         .await
-        .expect("remember explicit cross-project guidance");
+        .expect("host-authorized cross-project memory");
     let other_workspace = TempDir::new().expect("other workspace");
     let user_context = refinement::load_harness_context_for_workspace(
         state.path(),

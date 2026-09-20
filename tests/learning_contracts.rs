@@ -12,6 +12,7 @@ use mimir::{
         self, HarnessEntries, HarnessEntry, HarnessScope, HarnessState, RefinementAction,
         RefinementEdit, RefinementKind,
     },
+    session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use sha2::{Digest, Sha256};
@@ -142,6 +143,112 @@ async fn nearest_marker_owns_project_learning_and_projects_are_isolated() {
     assert!(!context_b.contains("Only project A sees this"));
 }
 
+#[test]
+fn parent_marker_does_not_claim_a_nested_git_repository() {
+    let umbrella = TempDir::new().expect("umbrella");
+    std::fs::create_dir(umbrella.path().join(".git")).expect("umbrella git");
+    let marker_dir = umbrella.path().join(".mimir");
+    std::fs::create_dir(&marker_dir).expect("marker dir");
+    std::fs::write(marker_dir.join("project.json"), r#"{"schema":2}"#).expect("marker");
+
+    let nested = umbrella.path().join("nested-repository");
+    let child = nested.join("crates/app");
+    std::fs::create_dir_all(nested.join(".git")).expect("nested git");
+    std::fs::create_dir_all(&child).expect("child");
+
+    assert_eq!(
+        learning::discover_project_root(&child).expect("nested root"),
+        nested.canonicalize().expect("canonical nested")
+    );
+}
+
+#[test]
+fn session_storage_namespaces_are_stable_and_project_isolated() {
+    let state = TempDir::new().expect("state");
+    let project_a = TempDir::new().expect("project a");
+    let project_b = TempDir::new().expect("project b");
+    std::fs::create_dir(project_a.path().join(".git")).expect("git a");
+    std::fs::create_dir(project_b.path().join(".git")).expect("git b");
+
+    let first = learning::project_session_root(state.path(), project_a.path()).expect("first");
+    let repeated =
+        learning::project_session_root(state.path(), project_a.path()).expect("repeated");
+    let second = learning::project_session_root(state.path(), project_b.path()).expect("second");
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, second);
+    let canonical_state = state.path().canonicalize().expect("canonical state");
+    assert!(first.starts_with(canonical_state.join("projects")));
+    let project_path = project_a.path().to_string_lossy();
+    assert!(!first.to_string_lossy().contains(project_path.as_ref()));
+}
+
+#[tokio::test]
+async fn identical_session_names_use_distinct_project_transcripts() {
+    let state = TempDir::new().expect("state");
+    let project_a = TempDir::new().expect("project a");
+    let project_b = TempDir::new().expect("project b");
+    std::fs::create_dir(project_a.path().join(".git")).expect("git a");
+    std::fs::create_dir(project_b.path().join(".git")).expect("git b");
+    let root_a = learning::project_session_root(state.path(), project_a.path()).expect("root a");
+    let root_b = learning::project_session_root(state.path(), project_b.path()).expect("root b");
+    let store_a = FileSessionStore::create(&root_a, "shared-name")
+        .await
+        .expect("store a");
+    store_a
+        .append(SessionRecord::new(SessionPayload::RuntimeEvent {
+            name: "project_a_only".into(),
+            detail: "phase data must remain here".into(),
+        }))
+        .await
+        .expect("record a");
+    let store_b = FileSessionStore::create(&root_b, "shared-name")
+        .await
+        .expect("store b");
+
+    assert_eq!(store_a.load().await.expect("load a").records.len(), 1);
+    assert!(store_b.load().await.expect("load b").records.is_empty());
+    assert_ne!(store_a.path(), store_b.path());
+}
+
+#[tokio::test]
+async fn same_session_id_does_not_share_session_learning_between_projects() {
+    let state = TempDir::new().expect("state");
+    let project_a = TempDir::new().expect("project a");
+    let project_b = TempDir::new().expect("project b");
+    std::fs::create_dir(project_a.path().join(".git")).expect("git a");
+    std::fs::create_dir(project_b.path().join(".git")).expect("git b");
+
+    refinement::remember(
+        state.path(),
+        project_a.path(),
+        "same-name",
+        HarnessScope::Session,
+        "Only project A may see this scratch memory.",
+    )
+    .await
+    .expect("remember session memory");
+
+    let context_a = refinement::load_harness_context_for_workspace(
+        state.path(),
+        project_a.path(),
+        "same-name",
+        None,
+    )
+    .await
+    .expect("project a context");
+    let context_b = refinement::load_harness_context_for_workspace(
+        state.path(),
+        project_b.path(),
+        "same-name",
+        None,
+    )
+    .await
+    .expect("project b context");
+    assert!(context_a.contains("Only project A"));
+    assert!(!context_b.contains("Only project A"));
+}
+
 #[tokio::test]
 async fn context_loading_is_read_only_and_precedence_is_token_bounded() {
     let state = TempDir::new().expect("state");
@@ -230,7 +337,7 @@ fn legacy_scope_names_deserialize_without_changing_meaning() {
 }
 
 #[tokio::test]
-async fn schema_one_global_harness_loads_without_rewriting_it() {
+async fn ambiguous_legacy_global_harness_is_quarantined_from_context_without_rewrite() {
     let state = TempDir::new().expect("state");
     let project = TempDir::new().expect("project");
     let old_path = state.path().join("harness/global/harness_state.json");
@@ -264,7 +371,7 @@ async fn schema_one_global_harness_loads_without_rewriting_it() {
         refinement::load_harness_context_for_workspace(state.path(), project.path(), "main", None)
             .await
             .expect("legacy context");
-    assert!(context.contains("Preserve the old global lesson"));
+    assert!(!context.contains("Preserve the old global lesson"));
     assert_eq!(std::fs::read(&old_path).expect("unchanged state"), original);
 }
 

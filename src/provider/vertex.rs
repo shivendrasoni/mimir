@@ -890,6 +890,7 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         input_tokens: prompt,
         output_tokens: candidates.saturating_add(thoughts),
         cached_tokens: cached,
+        cache_write_tokens: 0,
     }
 }
 

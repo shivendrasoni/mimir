@@ -5,7 +5,7 @@ use mimir::{
     extensions::ExtensionHostAction,
     model::{Content, Message, ModelResponse, StopReason, ToolCall},
     provider::FakeProvider,
-    resources::{MAX_SKILL_BODY_BYTES, ResourceLoader},
+    resources::ResourceLoader,
     runtime::{AgentRuntime, RuntimeConfig, VecEventSink},
     session::{InMemorySessionStore, SessionStore},
     skills::SkillRuntime,
@@ -578,19 +578,23 @@ async fn unknown_and_malformed_invocations_fail_before_provider_or_persistence()
 }
 
 #[test]
-fn loader_rejects_oversized_or_malformed_skills() {
-    let oversized = TempDir::new().expect("oversized workspace");
+fn loader_defers_large_bodies_to_activation_but_rejects_malformed_metadata() {
+    let large = TempDir::new().expect("large workspace");
     write_skill(
-        oversized.path(),
+        large.path(),
         "review",
         "Review changes",
-        &"x".repeat(MAX_SKILL_BODY_BYTES + 1),
+        &"x".repeat(80 * 1_024),
     );
-    let error = ResourceLoader::new(oversized.path(), oversized.path())
+    let resources = ResourceLoader::new(large.path(), large.path())
         .expect("loader")
         .load()
-        .expect_err("oversized skill");
-    assert!(error.to_string().contains("instructions exceed"));
+        .expect("large skill is discovered from metadata");
+    let context = SkillRuntime::new(resources.skills)
+        .context_for_messages(&[Message::user("/skill:review")])
+        .expect("large skill fits activation context")
+        .expect("active context");
+    assert!(context.contains(&"x".repeat(80 * 1_024)));
 
     let malformed = TempDir::new().expect("malformed workspace");
     write_skill(malformed.path(), "Bad_Name", "Review changes", "Review it.");
@@ -599,6 +603,168 @@ fn loader_rejects_oversized_or_malformed_skills() {
         .load()
         .expect_err("invalid skill name");
     assert!(error.to_string().contains("lowercase ASCII"));
+}
+
+#[test]
+fn skill_larger_than_active_context_is_listed_but_fails_on_activation() {
+    let workspace = TempDir::new().expect("workspace");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review changes",
+        &"x".repeat(100 * 1_024),
+    );
+    let resources = ResourceLoader::new(workspace.path(), workspace.path())
+        .expect("loader")
+        .load()
+        .expect("oversized instructions do not block discovery");
+    assert_eq!(resources.skills[0].name, "review");
+    let error = SkillRuntime::new(resources.skills)
+        .context_for_messages(&[Message::user("/skill:review")])
+        .expect_err("activation context remains bounded");
+    let message = error.to_string();
+    assert!(message.contains("would use"));
+    assert!(message.contains("98304-byte limit"));
+    assert!(message.contains("referenced files"));
+}
+
+#[test]
+fn deferred_skill_body_failures_do_not_block_catalog_discovery() {
+    let workspace = TempDir::new().expect("workspace");
+    let directory = workspace.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&directory).expect("skill directory");
+    let path = directory.join("SKILL.md");
+    let mut invalid_utf8 = b"---\nname: review\ndescription: Review changes\n---\n".to_vec();
+    invalid_utf8.extend_from_slice(&[0xff, 0xfe]);
+    std::fs::write(&path, invalid_utf8).expect("skill with invalid body encoding");
+
+    let resources = ResourceLoader::new(workspace.path(), workspace.path())
+        .expect("loader")
+        .load()
+        .expect("frontmatter-only discovery");
+    assert_eq!(resources.skills[0].name, "review");
+    let error = SkillRuntime::new(resources.skills)
+        .context_for_messages(&[Message::user("/skill:review")])
+        .expect_err("body encoding is validated at activation");
+    assert!(error.to_string().contains("must be UTF-8 text"));
+}
+
+#[test]
+fn activation_rejects_deleted_or_metadata_replaced_skill_sources() {
+    let deleted_workspace = TempDir::new().expect("deleted workspace");
+    write_skill(
+        deleted_workspace.path(),
+        "review",
+        "Review changes",
+        "Review it.",
+    );
+    let deleted_resources = ResourceLoader::new(deleted_workspace.path(), deleted_workspace.path())
+        .expect("loader")
+        .load()
+        .expect("resources");
+    std::fs::remove_file(
+        deleted_workspace
+            .path()
+            .join(".agents/skills/review/SKILL.md"),
+    )
+    .expect("remove discovered source");
+    let error = SkillRuntime::new(deleted_resources.skills)
+        .context_for_messages(&[Message::user("/skill:review")])
+        .expect_err("missing source is rejected");
+    assert!(error.to_string().contains("cannot activate skill `review`"));
+
+    let replaced_workspace = TempDir::new().expect("replaced workspace");
+    write_skill(
+        replaced_workspace.path(),
+        "review",
+        "Review changes",
+        "Review it.",
+    );
+    let replaced_resources =
+        ResourceLoader::new(replaced_workspace.path(), replaced_workspace.path())
+            .expect("loader")
+            .load()
+            .expect("resources");
+    write_skill(
+        replaced_workspace.path(),
+        "review",
+        "Different catalog description",
+        "Changed instructions.",
+    );
+    let error = SkillRuntime::new(replaced_resources.skills)
+        .context_for_messages(&[Message::user("/skill:review")])
+        .expect_err("stale catalog identity is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("metadata changed after discovery")
+    );
+}
+
+#[test]
+fn oversized_frontmatter_remains_a_discovery_error() {
+    let workspace = TempDir::new().expect("workspace");
+    let directory = workspace.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&directory).expect("skill directory");
+    std::fs::write(
+        directory.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: Review changes\nmetadata:\n  padding: {}\n---\nReview it.\n",
+            "x".repeat(17 * 1_024)
+        ),
+    )
+    .expect("oversized frontmatter");
+    let error = ResourceLoader::new(workspace.path(), workspace.path())
+        .expect("loader")
+        .load()
+        .expect_err("oversized frontmatter");
+    assert!(
+        error
+            .to_string()
+            .contains("frontmatter exceeds 16384 bytes")
+    );
+}
+
+#[tokio::test]
+async fn search_activation_reports_an_oversized_skill_without_loading_it() {
+    let workspace = TempDir::new().expect("workspace");
+    write_skill(
+        workspace.path(),
+        "review",
+        "Review changes",
+        &"x".repeat(100 * 1_024),
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response(
+            "activate-review",
+            "search_skills",
+            serde_json::json!({"name": "review"}),
+        ),
+        response("continued without the oversized skill"),
+    ]));
+    let store = Arc::new(InMemorySessionStore::default());
+    let runtime = runtime_with_skills(workspace.path(), provider.clone(), store).await;
+
+    assert_eq!(
+        runtime
+            .run("Review this change", &VecEventSink::default())
+            .await
+            .expect("tool error is recoverable"),
+        "continued without the oversized skill"
+    );
+    let requests = provider.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[1].system_prompt.contains("<active_skill"));
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(
+                content,
+                Content::ToolResult(result) if result.content.contains("98304-byte limit")
+            ))
+    );
 }
 
 #[test]
@@ -626,11 +792,7 @@ fn active_skill_batch_has_a_separate_combined_memory_bound() {
             Message::user("/skill:second"),
         ])
         .expect_err("combined skill limit");
-    assert!(
-        error
-            .to_string()
-            .contains("active skill instructions exceed")
-    );
+    assert!(error.to_string().contains("active skill context"));
 }
 
 #[cfg(unix)]

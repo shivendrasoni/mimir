@@ -713,6 +713,7 @@ fn parse_usage(value: Option<&Value>, previous: Usage) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or(previous.output_tokens),
         cached_tokens: 0,
+        cache_write_tokens: 0,
     }
 }
 

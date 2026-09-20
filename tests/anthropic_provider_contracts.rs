@@ -171,6 +171,7 @@ async fn native_messages_transport_uses_anthropic_headers_and_typed_blocks() {
     assert_eq!(response.message.usage.input_tokens, 16);
     assert_eq!(response.message.usage.output_tokens, 7);
     assert_eq!(response.message.usage.cached_tokens, 3);
+    assert_eq!(response.message.usage.cache_write_tokens, 2);
     assert_eq!(response.message.usage.uncached_input_tokens(), 13);
     assert!(matches!(
         &response.message.content[0],
@@ -245,6 +246,7 @@ async fn anthropic_stream_reassembles_tool_json_and_forwards_text_and_thinking()
     assert_eq!(response.message.usage.input_tokens, 14);
     assert_eq!(response.message.usage.output_tokens, 6);
     assert_eq!(response.message.usage.cached_tokens, 3);
+    assert_eq!(response.message.usage.cache_write_tokens, 2);
     assert_eq!(response.message.usage.uncached_input_tokens(), 11);
     assert_eq!(
         sink.0.lock().await.as_slice(),

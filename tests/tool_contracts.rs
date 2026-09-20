@@ -601,22 +601,20 @@ fn filesystem_tool_contracts_expose_the_effective_workspace_and_path_rules() {
             .find(|definition| definition.name == name)
             .unwrap_or_else(|| panic!("missing {name}"));
         assert!(
-            definition.description.contains("$WORKSPACE"),
-            "{} did not expose the stable workspace alias: {}",
-            name,
-            definition.description
-        );
-        assert!(
             !definition
                 .description
                 .contains(&canonical.display().to_string())
         );
-        assert!(definition.description.contains("relative"));
-        assert!(definition.description.contains("'..'"));
-        assert!(
-            definition.parameters["properties"]["path"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("$WORKSPACE"))
+        let path_description = definition.parameters["properties"]["path"]["description"]
+            .as_str()
+            .expect("path description");
+        assert!(path_description.contains("$WORKSPACE"));
+        assert!(path_description.contains("relative"));
+        assert!(path_description.contains("'..'"));
+        assert_eq!(
+            definition.description.matches("$WORKSPACE").count(),
+            0,
+            "path guidance belongs in the path schema, not the tool summary"
         );
     }
 

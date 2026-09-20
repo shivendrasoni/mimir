@@ -119,7 +119,7 @@ async fn applied_migration_activates_preferences_known_provider_models_and_legac
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "reviewer");
     assert_eq!(skills[0].description, "Migrated legacy skill reviewer");
-    assert!(skills[0].body.contains("Review the migration carefully."));
+    assert!(skills[0].path.ends_with("skills/reviewer/SKILL.md"));
 
     assert!(activation.blocked_extensions().is_empty());
     let mut extensions = ExtensionCatalog::new(workspace.path(), state.path()).expect("catalog");

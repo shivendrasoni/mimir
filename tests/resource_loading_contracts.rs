@@ -1,6 +1,10 @@
 use std::path::Path;
 
-use mimir::resources::{ResourceLoader, ResourceLoaderOptions, expand_prompt_template};
+use mimir::{
+    model::Message,
+    resources::{ResourceLoader, ResourceLoaderOptions, expand_prompt_template},
+    skills::SkillRuntime,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -213,6 +217,54 @@ fn shared_user_root_accepts_linked_and_namespaced_skills() {
     assert_eq!(resources.skills.len(), 1);
     assert_eq!(resources.skills[0].name, "platform-core:review");
     assert_eq!(resources.skills[0].description, "shared namespaced skill");
+}
+
+#[test]
+fn large_project_and_user_skills_share_the_same_activation_policy() {
+    let workspace = TempDir::new().expect("workspace");
+    let user = TempDir::new().expect("user");
+    write_skill(
+        workspace.path(),
+        ".agents/skills/project-review",
+        "project-review",
+        "Project review",
+    );
+    write_skill(
+        user.path(),
+        "skills/user-review",
+        "user-review",
+        "User review",
+    );
+    for path in [
+        workspace
+            .path()
+            .join(".agents/skills/project-review/SKILL.md"),
+        user.path().join("skills/user-review/SKILL.md"),
+    ] {
+        let content = std::fs::read_to_string(&path).expect("skill");
+        std::fs::write(path, format!("{content}\n{}", "x".repeat(80 * 1_024)))
+            .expect("large skill");
+    }
+
+    let resources = ResourceLoader::with_options(
+        workspace.path(),
+        workspace.path(),
+        ResourceLoaderOptions {
+            user_dir: Some(user.path().into()),
+            ..ResourceLoaderOptions::default()
+        },
+    )
+    .expect("loader")
+    .load()
+    .expect("large skills at both scopes");
+    let runtime = SkillRuntime::new(resources.skills);
+    for name in ["project-review", "user-review"] {
+        let context = runtime
+            .context_for_messages(&[Message::user(format!("/skill:{name}"))])
+            .expect("same activation policy")
+            .expect("skill context");
+        assert!(context.contains(&"x".repeat(80 * 1_024)));
+    }
 }
 
 #[cfg(unix)]

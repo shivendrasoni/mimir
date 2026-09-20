@@ -41,7 +41,7 @@ use crate::{
 
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
 const MAX_PENDING_AGENT_MESSAGES: usize = 20;
-const PROVENANCE_SYSTEM_GUIDANCE: &str = "Evidence rule: when write_file or edit_file content is derived from a source file, include provenance.required=true and one provenance.derivedFrom entry per source with its exact workspace-relative path. A successful read_file toolCallId may be included, but it is optional: omit an uncertain id and Mimir will safely bind the path to the latest successful matching read. Never reuse an id from another path or from a failed read. If evidence is unavailable, read the source successfully before retrying; the tool error returns valid evidence ids when available.";
+const PROVENANCE_SYSTEM_GUIDANCE: &str = "For source-derived writes or edits, set provenance.required=true and list every exact workspace-relative source path in derivedFrom. toolCallId is optional; omit uncertain ids. Read missing sources before retrying.";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

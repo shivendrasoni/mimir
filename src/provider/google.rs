@@ -498,6 +498,7 @@ fn parse_usage(value: Option<&Value>) -> Usage {
             .get("cachedContentTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        cache_write_tokens: 0,
     }
 }
 

@@ -102,7 +102,11 @@ impl ThinkingLevel {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-reported prompt-cache reads. This is a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Provider-reported prompt-cache writes. This is also included in `input_tokens`.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 impl Usage {
@@ -142,11 +146,13 @@ impl Usage {
         uncached_input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+        cache_write_tokens: u64,
     ) -> Self {
         Self {
             input_tokens: uncached_input_tokens.saturating_add(cached_tokens),
             output_tokens,
             cached_tokens,
+            cache_write_tokens,
         }
     }
 }

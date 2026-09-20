@@ -1404,6 +1404,7 @@ const BOOTSTRAP: &str = r#"
         input_tokens: usage.input_tokens === undefined ? (usage.inputTokens || 0) : usage.input_tokens,
         output_tokens: usage.output_tokens === undefined ? (usage.outputTokens || 0) : usage.output_tokens,
         cached_tokens: usage.cached_tokens === undefined ? (usage.cachedTokens || 0) : usage.cached_tokens,
+        cache_write_tokens: usage.cache_write_tokens === undefined ? (usage.cacheWriteTokens || 0) : usage.cache_write_tokens,
       },
       timestamp_ms: message.timestamp_ms === undefined ? (message.timestampMs || 0) : message.timestamp_ms,
     };
@@ -1539,13 +1540,17 @@ const BOOTSTRAP: &str = r#"
       throw new Error(`Custom provider returned unsupported content type: ${String(item.type)}`);
     });
     const usage = message.usage || {};
+    const cacheRead = Number(usage.cacheRead || 0);
+    const cacheWrite = Number(usage.cacheWrite || 0);
     const stopReason = { toolUse: "tool_use", stop: "stop", length: "length", error: "error", aborted: "aborted" }[message.stopReason] || "error";
     return {
       message: {
         role: "assistant", content, stop_reason: stopReason,
         usage: {
-          input_tokens: Number(usage.input || 0), output_tokens: Number(usage.output || 0),
-          cached_tokens: Number(usage.cacheRead || 0) + Number(usage.cacheWrite || 0),
+          input_tokens: Number(usage.input || 0) + cacheRead + cacheWrite,
+          output_tokens: Number(usage.output || 0),
+          cached_tokens: cacheRead,
+          cache_write_tokens: cacheWrite,
         },
         timestamp_ms: Number(message.timestamp || Date.now()),
       },

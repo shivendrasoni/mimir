@@ -29,8 +29,7 @@ impl WorkspacePathPolicy {
     /// Returns model-facing guidance for paths accepted by workspace tools.
     #[must_use]
     pub fn path_guidance(&self) -> String {
-        "Paths must be non-empty and relative to $WORKSPACE (for example, 'src/main.rs'). Absolute paths and '..' parent traversal are rejected."
-            .into()
+        "Non-empty $WORKSPACE-relative path; absolute paths and '..' are rejected.".into()
     }
 
     /// Rejects path-like process arguments that obviously escape the workspace contract.

@@ -81,6 +81,7 @@ fn response(text: &str, output_tokens: u64) -> ModelResponse {
         input_tokens: 2,
         output_tokens,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     ModelResponse {
         message,

@@ -1072,12 +1072,12 @@ fn resource_snapshot_drives_prompt_skill_and_custom_theme_selectors() {
             definition: serde_json::json!({"vars": {"accent": "#0088ff"}}),
             path: root.path().join("ocean.json"),
         }],
-        skills: vec![Skill {
-            name: "review".into(),
-            description: "Review code".into(),
-            body: "Review carefully".into(),
-            path: root.path().join("review/SKILL.md"),
-        }],
+        skills: vec![Skill::in_memory(
+            "review",
+            "Review code",
+            "Review carefully",
+            root.path().join("review/SKILL.md"),
+        )],
     });
 
     app.set_prompt("/audit src/runtime.rs");

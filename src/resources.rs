@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -26,12 +27,7 @@ pub enum ResourceError {
 
 pub const MAX_SKILL_NAME_BYTES: usize = 64;
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1_024;
-pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1_024;
-const MAX_SKILL_FILE_BYTES: u64 =
-    (MAX_SKILL_BODY_BYTES + MAX_SKILL_DESCRIPTION_BYTES + 8 * 1_024) as u64;
-const MAX_SHARED_SKILL_BODY_BYTES: usize = 128 * 1_024;
-const MAX_SHARED_SKILL_FILE_BYTES: u64 =
-    (MAX_SHARED_SKILL_BODY_BYTES + MAX_SKILL_DESCRIPTION_BYTES + 8 * 1_024) as u64;
+const MAX_SKILL_FRONTMATTER_BYTES: usize = 16 * 1_024;
 const MAX_MIGRATED_SKILLS: usize = 512;
 const MAX_RESOURCE_FILES: usize = 512;
 const MAX_RESOURCE_ROOTS: usize = 64;
@@ -50,8 +46,115 @@ const MIMIR_CONFIG_DIR: &str = ".mimir/agent";
 pub struct Skill {
     pub name: String,
     pub description: String,
-    pub body: String,
     pub path: PathBuf,
+    instructions: SkillInstructions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillInstructions {
+    File { allowed_root: PathBuf },
+    Inline(String),
+}
+
+impl Skill {
+    /// Creates an in-memory skill for embedders that do not load from a `SKILL.md` file.
+    #[must_use]
+    pub fn in_memory(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        body: impl Into<String>,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            path,
+            instructions: SkillInstructions::Inline(body.into()),
+        }
+    }
+
+    fn from_file(name: String, description: String, path: PathBuf, allowed_root: PathBuf) -> Self {
+        Self {
+            name,
+            description,
+            path,
+            instructions: SkillInstructions::File { allowed_root },
+        }
+    }
+
+    /// Loads and revalidates instructions only when the runtime activates this skill.
+    pub(crate) fn load_instructions(
+        &self,
+        max_instruction_bytes: usize,
+    ) -> Result<String, ResourceError> {
+        let SkillInstructions::File { allowed_root } = &self.instructions else {
+            let SkillInstructions::Inline(body) = &self.instructions else {
+                unreachable!("skill instruction source is exhaustive");
+            };
+            return Ok(body.clone());
+        };
+        let canonical = self.path.canonicalize()?;
+        let allowed_root = allowed_root.canonicalize()?;
+        if canonical != self.path || !canonical.starts_with(&allowed_root) {
+            return Err(skill_error(
+                &self.path,
+                "skill source changed or resolves outside its validated resource root",
+            ));
+        }
+        let metadata = canonical.metadata()?;
+        if !metadata.is_file() {
+            return Err(skill_error(
+                &self.path,
+                "skill source is not a regular file",
+            ));
+        }
+        let max_file_bytes = max_instruction_bytes
+            .saturating_add(MAX_SKILL_FRONTMATTER_BYTES)
+            .saturating_add(16);
+        let max_file_bytes_u64 = u64::try_from(max_file_bytes).unwrap_or(u64::MAX);
+        if metadata.len() > max_file_bytes_u64 {
+            return Err(skill_error(
+                &self.path,
+                &format!(
+                    "skill source is {} bytes and exceeds the bounded activation read of {max_file_bytes} bytes; keep SKILL.md concise and move detailed material into referenced files",
+                    metadata.len()
+                ),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(max_file_bytes.min(64 * 1024));
+        std::fs::File::open(&canonical)?
+            .take(max_file_bytes_u64.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > max_file_bytes {
+            return Err(skill_error(
+                &self.path,
+                &format!(
+                    "skill source exceeds the bounded activation read of {max_file_bytes} bytes; keep SKILL.md concise and move detailed material into referenced files"
+                ),
+            ));
+        }
+        let raw_content = String::from_utf8(bytes)
+            .map_err(|_| skill_error(&self.path, "skill source must be UTF-8 text"))?;
+        let normalized = raw_content
+            .contains("\r\n")
+            .then(|| raw_content.replace("\r\n", "\n"));
+        let content = normalized.as_deref().unwrap_or(&raw_content);
+        let (metadata, body) = parse_skill_document(&self.path, content)?;
+        let description = metadata
+            .description
+            .unwrap_or_else(|| format!("Migrated legacy skill {}", metadata.name));
+        if metadata.name != self.name || description != self.description {
+            return Err(skill_error(
+                &self.path,
+                "skill metadata changed after discovery; restart Mimir to reload the catalog",
+            ));
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(skill_error(&self.path, "instructions must not be blank"));
+        }
+        Ok(body.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,26 +285,10 @@ pub struct Resources {
     pub package_manifests: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillSourcePolicy {
     Strict,
     SharedUser,
-}
-
-impl SkillSourcePolicy {
-    const fn max_body_bytes(self) -> usize {
-        match self {
-            Self::Strict => MAX_SKILL_BODY_BYTES,
-            Self::SharedUser => MAX_SHARED_SKILL_BODY_BYTES,
-        }
-    }
-
-    const fn max_file_bytes(self) -> u64 {
-        match self {
-            Self::Strict => MAX_SKILL_FILE_BYTES,
-            Self::SharedUser => MAX_SHARED_SKILL_FILE_BYTES,
-        }
-    }
 }
 
 pub struct ResourceLoader {
@@ -589,12 +676,16 @@ impl ResourceLoader {
         };
         files.sort_by(|left, right| left.0.cmp(&right.0));
         for (file, allowed_root) in files {
-            let file =
-                checked_resource_file(&file, &allowed_root, policy.max_file_bytes(), "skill")?;
-            let skill = parse_skill(&file, policy)?;
+            let (file, allowed_root) = checked_skill_source(&file, &allowed_root)?;
+            let skill = discover_skill(&file, &allowed_root, policy)?;
             skills.insert(skill.name.clone(), skill);
             ensure_catalog_bound(skills.len(), "skill")?;
-            ensure_catalog_bytes(skills.values().map(|skill| skill.body.len()), "skill")?;
+            ensure_catalog_bytes(
+                skills
+                    .values()
+                    .map(|skill| skill.name.len().saturating_add(skill.description.len())),
+                "skill",
+            )?;
         }
         Ok(())
     }
@@ -786,6 +877,31 @@ fn checked_resource_file(
         ));
     }
     Ok(canonical)
+}
+
+fn checked_skill_source(path: &Path, root: &Path) -> Result<(PathBuf, PathBuf), ResourceError> {
+    if path.as_os_str().as_encoded_bytes().len() > MAX_RESOURCE_PATH_BYTES {
+        return Err(ResourceError::Path(format!(
+            "resource path exceeds {MAX_RESOURCE_PATH_BYTES} bytes"
+        )));
+    }
+    let root = root.canonicalize()?;
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(&root) {
+        return Err(ResourceError::Path(format!(
+            "{} resolves outside {}",
+            path.display(),
+            root.display()
+        )));
+    }
+    if !canonical.metadata()?.is_file() {
+        return Err(resource_error(
+            "skill",
+            path,
+            "resource is not a regular file",
+        ));
+    }
+    Ok((canonical, root))
 }
 
 fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>, ResourceError> {
@@ -1129,14 +1245,8 @@ pub fn load_migrated_skills(state_root: &std::path::Path) -> Result<Vec<Skill>, 
     }
     let mut skills = BTreeMap::new();
     for path in paths {
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(&root) {
-            return Err(ResourceError::Path(format!(
-                "{} escaped the migrated skill root",
-                path.display()
-            )));
-        }
-        let skill = parse_migrated_skill(&canonical)?;
+        let (canonical, allowed_root) = checked_skill_source(&path, &root)?;
+        let skill = discover_migrated_skill(&canonical, &allowed_root)?;
         if skills.insert(skill.name.clone(), skill).is_some() {
             return Err(ResourceError::Path(
                 "migrated skill catalog contains duplicate names".into(),
@@ -1147,38 +1257,19 @@ pub fn load_migrated_skills(state_root: &std::path::Path) -> Result<Vec<Skill>, 
 }
 
 #[derive(Deserialize)]
-struct SkillMetadata {
-    name: String,
-    description: String,
-}
-
-#[derive(Deserialize)]
-struct MigratedSkillMetadata {
+struct SkillDocumentMetadata {
     name: String,
     #[serde(default)]
     description: Option<String>,
 }
 
-fn parse_skill(path: &std::path::Path, policy: SkillSourcePolicy) -> Result<Skill, ResourceError> {
-    let max_file_bytes = policy.max_file_bytes();
-    if std::fs::metadata(path)?.len() > max_file_bytes {
-        return Err(skill_error(
-            path,
-            &format!("skill file exceeds {max_file_bytes} bytes"),
-        ));
-    }
-    let raw_content = std::fs::read_to_string(path)?;
-    let normalized = raw_content
-        .contains("\r\n")
-        .then(|| raw_content.replace("\r\n", "\n"));
-    let content = normalized.as_deref().unwrap_or(&raw_content);
-    let rest = content
-        .strip_prefix("---\n")
-        .ok_or_else(|| skill_error(path, "missing YAML frontmatter"))?;
-    let marker = rest
-        .find("\n---\n")
-        .ok_or_else(|| skill_error(path, "unterminated YAML frontmatter"))?;
-    let metadata: SkillMetadata = serde_yaml::from_str(&rest[..marker])
+fn discover_skill(
+    path: &Path,
+    allowed_root: &Path,
+    policy: SkillSourcePolicy,
+) -> Result<Skill, ResourceError> {
+    let frontmatter = read_skill_frontmatter(path)?;
+    let metadata: SkillDocumentMetadata = serde_yaml::from_str(&frontmatter)
         .map_err(|error| skill_error(path, &error.to_string()))?;
     let expected = path
         .parent()
@@ -1193,53 +1284,29 @@ fn parse_skill(path: &std::path::Path, policy: SkillSourcePolicy) -> Result<Skil
         &metadata.name,
         matches!(policy, SkillSourcePolicy::SharedUser),
     )?;
-    if metadata.description.trim().is_empty() {
+    let description = metadata
+        .description
+        .ok_or_else(|| skill_error(path, "description is required"))?;
+    if description.trim().is_empty() {
         return Err(skill_error(path, "description must not be blank"));
     }
-    if metadata.description.len() > MAX_SKILL_DESCRIPTION_BYTES {
+    if description.len() > MAX_SKILL_DESCRIPTION_BYTES {
         return Err(skill_error(
             path,
             &format!("description exceeds {MAX_SKILL_DESCRIPTION_BYTES} bytes"),
         ));
     }
-    let body = rest[marker + 5..].trim();
-    if body.is_empty() {
-        return Err(skill_error(path, "instructions must not be blank"));
-    }
-    let max_body_bytes = policy.max_body_bytes();
-    if body.len() > max_body_bytes {
-        return Err(skill_error(
-            path,
-            &format!("instructions exceed {max_body_bytes} bytes"),
-        ));
-    }
-    Ok(Skill {
-        name: metadata.name,
-        description: metadata.description,
-        body: body.to_owned(),
-        path: path.to_owned(),
-    })
+    Ok(Skill::from_file(
+        metadata.name,
+        description,
+        path.to_owned(),
+        allowed_root.to_owned(),
+    ))
 }
 
-fn parse_migrated_skill(path: &std::path::Path) -> Result<Skill, ResourceError> {
-    if std::fs::metadata(path)?.len() > MAX_SKILL_FILE_BYTES {
-        return Err(skill_error(
-            path,
-            &format!("skill file exceeds {MAX_SKILL_FILE_BYTES} bytes"),
-        ));
-    }
-    let raw_content = std::fs::read_to_string(path)?;
-    let normalized = raw_content
-        .contains("\r\n")
-        .then(|| raw_content.replace("\r\n", "\n"));
-    let content = normalized.as_deref().unwrap_or(&raw_content);
-    let rest = content
-        .strip_prefix("---\n")
-        .ok_or_else(|| skill_error(path, "missing YAML frontmatter"))?;
-    let marker = rest
-        .find("\n---\n")
-        .ok_or_else(|| skill_error(path, "unterminated YAML frontmatter"))?;
-    let metadata: MigratedSkillMetadata = serde_yaml::from_str(&rest[..marker])
+fn discover_migrated_skill(path: &Path, allowed_root: &Path) -> Result<Skill, ResourceError> {
+    let frontmatter = read_skill_frontmatter(path)?;
+    let metadata: SkillDocumentMetadata = serde_yaml::from_str(&frontmatter)
         .map_err(|error| skill_error(path, &error.to_string()))?;
     let expected = path
         .parent()
@@ -1256,19 +1323,74 @@ fn parse_migrated_skill(path: &std::path::Path) -> Result<Skill, ResourceError> 
     if description.trim().is_empty() || description.len() > MAX_SKILL_DESCRIPTION_BYTES {
         return Err(skill_error(path, "description is invalid"));
     }
-    let body = rest[marker + "\n---\n".len()..].to_owned();
-    if body.len() > MAX_SKILL_BODY_BYTES {
+    Ok(Skill::from_file(
+        metadata.name,
+        description,
+        path.to_owned(),
+        allowed_root.to_owned(),
+    ))
+}
+
+fn read_skill_frontmatter(path: &Path) -> Result<String, ResourceError> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    let mut total_bytes = reader.read_line(&mut line)?;
+    if line_without_ending(&line) != "---" {
+        return Err(skill_error(path, "missing YAML frontmatter"));
+    }
+    let mut frontmatter = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Err(skill_error(path, "unterminated YAML frontmatter"));
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        if total_bytes > MAX_SKILL_FRONTMATTER_BYTES {
+            return Err(skill_error(
+                path,
+                &format!("frontmatter exceeds {MAX_SKILL_FRONTMATTER_BYTES} bytes"),
+            ));
+        }
+        let content = line_without_ending(&line);
+        if content == "---" {
+            return Ok(frontmatter);
+        }
+        frontmatter.push_str(content);
+        frontmatter.push('\n');
+    }
+}
+
+fn line_without_ending(line: &str) -> &str {
+    let without_newline = line.strip_suffix('\n').unwrap_or(line);
+    without_newline
+        .strip_suffix('\r')
+        .unwrap_or(without_newline)
+}
+
+fn parse_skill_document<'a>(
+    path: &Path,
+    content: &'a str,
+) -> Result<(SkillDocumentMetadata, &'a str), ResourceError> {
+    let rest = content
+        .strip_prefix("---\n")
+        .ok_or_else(|| skill_error(path, "missing YAML frontmatter"))?;
+    let marker = rest
+        .find("\n---\n")
+        .ok_or_else(|| skill_error(path, "unterminated YAML frontmatter"))?;
+    let frontmatter_bytes = "---\n"
+        .len()
+        .saturating_add(marker)
+        .saturating_add("\n---\n".len());
+    if frontmatter_bytes > MAX_SKILL_FRONTMATTER_BYTES {
         return Err(skill_error(
             path,
-            &format!("skill body exceeds {MAX_SKILL_BODY_BYTES} bytes"),
+            &format!("frontmatter exceeds {MAX_SKILL_FRONTMATTER_BYTES} bytes"),
         ));
     }
-    Ok(Skill {
-        name: metadata.name,
-        description,
-        body,
-        path: path.to_path_buf(),
-    })
+    let metadata = serde_yaml::from_str(&rest[..marker])
+        .map_err(|error| skill_error(path, &error.to_string()))?;
+    Ok((metadata, &rest[marker + "\n---\n".len()..]))
 }
 
 fn validate_skill_name(

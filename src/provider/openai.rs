@@ -502,6 +502,7 @@ fn parse_response(body: &[u8]) -> Result<ModelResponse, ProviderError> {
             .pointer("/usage/prompt_tokens_details/cached_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        cache_write_tokens: 0,
     };
     let mut message = Message::assistant(content, stop_reason);
     message.usage = usage;

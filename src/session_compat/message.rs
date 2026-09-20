@@ -271,6 +271,10 @@ fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
     };
+    let input = value
+        .get("input")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     let cache_read = value
         .get("cacheRead")
         .and_then(Value::as_u64)
@@ -280,15 +284,13 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .unwrap_or_default();
     Usage {
-        input_tokens: value
-            .get("input")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+        input_tokens: input.saturating_add(cache_read).saturating_add(cache_write),
         output_tokens: value
             .get("output")
             .and_then(Value::as_u64)
             .unwrap_or_default(),
-        cached_tokens: cache_read.saturating_add(cache_write),
+        cached_tokens: cache_read,
+        cache_write_tokens: cache_write,
     }
 }
 

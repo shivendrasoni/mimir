@@ -3890,10 +3890,14 @@ async fn render_context_tree(runtime: &AgentRuntime) -> Result<String> {
             cached_tokens: usage
                 .cached_tokens
                 .saturating_add(message.usage.cached_tokens),
+            cache_write_tokens: usage
+                .cache_write_tokens
+                .saturating_add(message.usage.cache_write_tokens),
         });
     let input = usage.input_tokens;
     let output = usage.output_tokens;
     let cached = usage.cached_tokens;
+    let cache_write = usage.cache_write_tokens;
     let fresh_input = usage.uncached_input_tokens();
     let raw_total = usage.total();
     let operational_total = usage.budget_tokens();
@@ -3902,7 +3906,7 @@ async fn render_context_tree(runtime: &AgentRuntime) -> Result<String> {
         .map(|child| child.output_tokens)
         .fold(0_u64, u64::saturating_add);
     let mut tree = format!(
-        "Context Tree\n└─ main agent [active] {provider}/{model}\n   Messages: {}\n   Own/total usage: input {input}, cache read {cached}, fresh input {fresh_input}, output {output}\n   Raw total: {raw_total}; operational budget: {operational_total}\n   Tree output usage: {}\n   Cost: unavailable (provider pricing is not exposed by the native runtime)",
+        "Context Tree\n└─ main agent [active] {provider}/{model}\n   Messages: {}\n   Own/total usage: input {input}, cache read {cached}, cache write {cache_write}, fresh input {fresh_input}, output {output}\n   Raw total: {raw_total}; operational budget: {operational_total}\n   Tree output usage: {}\n   Cost: unavailable (provider pricing is not exposed by the native runtime)",
         messages.len(),
         output.saturating_add(child_output),
     );

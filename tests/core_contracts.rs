@@ -57,6 +57,7 @@ fn budget_names_the_first_exhausted_limit() {
             input_tokens: 20,
             output_tokens: 20,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
         .expect("first turn should fit");
     usage
@@ -64,6 +65,7 @@ fn budget_names_the_first_exhausted_limit() {
             input_tokens: 20,
             output_tokens: 20,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         })
         .expect("second turn should fit");
     assert_eq!(usage.check(&budget), Err(BudgetError::Turns { limit: 2 }));
@@ -75,14 +77,16 @@ fn normalized_usage_does_not_double_count_cached_input() {
         input_tokens: 120_000,
         output_tokens: 1_000,
         cached_tokens: 90_000,
+        cache_write_tokens: 5_000,
     };
     assert_eq!(inclusive.total(), 121_000);
 
-    let separate = Usage::from_separate_cached_input(30_000, 1_000, 90_000);
+    let separate = Usage::from_separate_cached_input(30_000, 1_000, 90_000, 5_000);
     assert_eq!(separate, inclusive);
     assert_eq!(separate.total(), 121_000);
     assert_eq!(separate.uncached_input_tokens(), 30_000);
     assert_eq!(separate.budget_tokens(), 31_000);
+    assert_eq!(separate.cache_write_tokens, 5_000);
 }
 
 #[test]
@@ -95,6 +99,7 @@ fn cached_context_replay_does_not_exhaust_the_operational_run_budget() {
     let cached_turn = Usage {
         input_tokens: 140_000,
         cached_tokens: 133_000,
+        cache_write_tokens: 0,
         output_tokens: 3_000,
     };
     let mut usage = BudgetUsage::default();
@@ -106,6 +111,7 @@ fn cached_context_replay_does_not_exhaust_the_operational_run_budget() {
     let snapshot = usage.snapshot();
     assert_eq!(snapshot.input_tokens, 980_000);
     assert_eq!(snapshot.cached_tokens, 931_000);
+    assert_eq!(snapshot.cache_write_tokens, 0);
     assert_eq!(snapshot.fresh_input_tokens, 49_000);
     assert_eq!(snapshot.output_tokens, 21_000);
     assert_eq!(snapshot.tokens, 70_000);
@@ -123,6 +129,7 @@ fn genuinely_fresh_usage_still_exhausts_the_operational_run_budget() {
     let fresh_turn = Usage {
         input_tokens: 140_000,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         output_tokens: 3_000,
     };
     let mut usage = BudgetUsage::default();

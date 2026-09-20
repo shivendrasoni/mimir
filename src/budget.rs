@@ -81,13 +81,14 @@ impl fmt::Display for BudgetPause {
         };
         write!(
             formatter,
-            "{exhausted} {} (turns={}, tool_calls={}, budget_tokens={}, input_tokens={}, cached_tokens={}, fresh_input_tokens={}, output_tokens={}, current_context_tokens={}, elapsed_ms={})",
+            "{exhausted} {} (turns={}, tool_calls={}, budget_tokens={}, input_tokens={}, cache_read_tokens={}, cache_write_tokens={}, fresh_input_tokens={}, output_tokens={}, current_context_tokens={}, elapsed_ms={})",
             self.limit,
             self.usage.turns,
             self.usage.tool_calls,
             self.usage.tokens,
             self.usage.input_tokens,
             self.usage.cached_tokens,
+            self.usage.cache_write_tokens,
             self.usage.fresh_input_tokens,
             self.usage.output_tokens,
             self.usage.current_context_tokens,
@@ -135,6 +136,8 @@ pub struct BudgetSnapshot {
     #[serde(default)]
     pub cached_tokens: u64,
     #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
     pub fresh_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
@@ -151,6 +154,7 @@ pub struct BudgetUsage {
     tokens: u64,
     input_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
     fresh_input_tokens: u64,
     output_tokens: u64,
     current_context_tokens: u64,
@@ -165,6 +169,7 @@ impl Default for BudgetUsage {
             tokens: 0,
             input_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             fresh_input_tokens: 0,
             output_tokens: 0,
             current_context_tokens: 0,
@@ -185,6 +190,9 @@ impl BudgetUsage {
         self.tokens = self.tokens.saturating_add(usage.budget_tokens());
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.cached_tokens = self.cached_tokens.saturating_add(usage.cached_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
         self.fresh_input_tokens = self.fresh_input_tokens.saturating_add(fresh_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.current_context_tokens = usage.input_tokens;
@@ -233,6 +241,7 @@ impl BudgetUsage {
             tokens: self.tokens,
             input_tokens: self.input_tokens,
             cached_tokens: self.cached_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             fresh_input_tokens: self.fresh_input_tokens,
             output_tokens: self.output_tokens,
             current_context_tokens: self.current_context_tokens,

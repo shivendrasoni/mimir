@@ -108,10 +108,7 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".into(),
-            description: format!(
-                "Write a UTF-8 file, creating missing parent directories. {}",
-                self.paths.path_guidance()
-            ),
+            description: "Write a UTF-8 file, creating missing parent directories.".into(),
             parameters: object_schema(
                 &json!({
                     "path": workspace_path_schema(&self.paths),
@@ -169,10 +166,7 @@ impl Tool for EditFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit_file".into(),
-            description: format!(
-                "Replace one exact text occurrence in a file. {}",
-                self.paths.path_guidance()
-            ),
+            description: "Replace one exact text occurrence in a file.".into(),
             parameters: object_schema(
                 &json!({
                     "path": workspace_path_schema(&self.paths),
@@ -237,10 +231,7 @@ impl Tool for ListFilesTool {
         definition(
             &self.paths,
             "list_files",
-            &format!(
-                "List files under a directory. Recursive discovery skips harness state, version-control metadata, dependencies, and generated outputs ({})",
-                DISCOVERY_EXCLUDED_DIRECTORIES.join(", ")
-            ),
+            "List files under a directory; recursive discovery skips harness state, VCS metadata, dependencies, and generated output",
             &[],
         )
     }
@@ -295,11 +286,8 @@ impl Tool for SearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search".into(),
-            description: format!(
-                "Search UTF-8 files with a regular expression. Recursive search skips harness state, version-control metadata, dependencies, and generated outputs ({}). Use read_file only when a specific internal file is deliberately needed. {}",
-                DISCOVERY_EXCLUDED_DIRECTORIES.join(", "),
-                self.paths.path_guidance()
-            ),
+            description: "Search UTF-8 files with a regular expression; recursive discovery skips harness state, VCS metadata, dependencies, and generated output."
+                .into(),
             parameters: object_schema(
                 &json!({
                     "pattern": {"type": "string"},
@@ -428,7 +416,7 @@ fn definition(
 ) -> ToolDefinition {
     ToolDefinition {
         name: name.into(),
-        description: format!("{description}. {}", paths.path_guidance()),
+        description: description.into(),
         parameters: object_schema(&json!({"path": workspace_path_schema(paths)}), required),
     }
 }
@@ -443,7 +431,7 @@ fn workspace_path_schema(paths: &WorkspacePathPolicy) -> Value {
 fn provenance_schema() -> Value {
     json!({
         "type": "object",
-        "description": "For source-derived content, cite each source path. Set required=true when the mutation must be faithful to those sources. toolCallId is optional: when omitted or unknown, Mimir safely binds the path to the latest successful matching read_file call. An explicitly failed read or a toolCallId/path mismatch is rejected.",
+        "description": "Source evidence for faithful writes or edits. List every source path and set required=true.",
         "additionalProperties": false,
         "properties": {
             "required": {"type": "boolean"},
@@ -455,11 +443,11 @@ fn provenance_schema() -> Value {
                     "properties": {
                         "toolCallId": {
                             "type": "string",
-                            "description": "Optional successful read_file call id. Omit it if unavailable; Mimir resolves the exact path from session evidence."
+                            "description": "Optional successful read_file call id; omit when uncertain."
                         },
                         "path": {
                             "type": "string",
-                            "description": "Exact workspace-relative source path passed to read_file."
+                            "description": "Exact workspace-relative source path."
                         }
                     },
                     "required": ["path"]

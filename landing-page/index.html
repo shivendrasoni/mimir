@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Mimir gives enterprises one operational layer for deploying, governing, measuring, and improving AI coding agents across every codebase."
+    />
+    <title>Mimir — Enterprise Control for AI Coding Agents</title>
+    <link rel="icon" href="assets/logo.webp" type="image/webp" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Geist+Pixel:ELSH@20&amp;display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://db.onlinewebfonts.com/c/8cb707a9b8a73f8a7403336b861c3074?family=BubbledotICG-FinePos"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+      integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkcmfRyVX3pBnMFcV7oQPJkl9QevSCWr3W6A=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+
+  <body>
+    <div class="bg" aria-hidden="true">
+      <video class="bg-video" autoplay muted loop playsinline>
+        <source
+          src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260809_012548_ef22562c-c0ae-4816-ad9d-f8922af4e6a7.mp4"
+          type="video/mp4"
+        />
+      </video>
+    </div>
+
+    <div class="page" id="home">
+      <header class="site-header">
+        <div class="header-inner">
+          <a class="logo" href="#home" aria-label="Home">
+            <img src="assets/logo.webp" alt="" width="52" height="52" />
+          </a>
+
+          <nav class="nav-pill desktop-nav" aria-label="Primary navigation">
+            <a class="nav-link active" href="#platform" data-nav-target="platform" aria-current="page">Platform</a>
+            <a class="nav-link" href="#governance" data-nav-target="governance">Governance</a>
+            <a class="nav-link" href="#learning" data-nav-target="learning">Learning</a>
+            <a class="nav-link" href="#benchmarks" data-nav-target="benchmarks">Benchmarks</a>
+            <a class="nav-link" href="#security" data-nav-target="security">Security</a>
+          </nav>
+
+          <a
+            class="sign-in desktop-sign-in"
+            href="#pilot"
+          >Request pilot</a>
+
+          <button
+            class="menu-toggle"
+            type="button"
+            aria-label="Open navigation"
+            aria-expanded="false"
+            aria-controls="mobile-menu"
+          >
+            <span></span>
+            <span></span>
+            <span></span>
+          </button>
+        </div>
+      </header>
+
+      <main class="hero">
+        <div class="trust-row anim" style="--d: 0.05s">
+          <div class="trust-avatar avatar-one" aria-label="Repository-aware">
+            <span><i class="fa-solid fa-code-branch" aria-hidden="true"></i></span>
+          </div>
+          <div class="trust-avatar avatar-two" aria-label="Policy-enforced">
+            <span><i class="fa-solid fa-shield-halved" aria-hidden="true"></i></span>
+          </div>
+          <div class="trust-avatar avatar-three" aria-label="Evidence-driven">
+            <span><i class="fa-solid fa-chart-line" aria-hidden="true"></i></span>
+          </div>
+          <div class="trust-pill">Enterprise Agent Operations</div>
+        </div>
+
+        <h1 class="headline anim">
+          <span class="headline-line line-one">AI Agents Your Enterprise</span>
+          <span class="headline-line line-two">Can Actually Operate</span>
+        </h1>
+
+        <p class="subhead anim" style="--d: 0.28s">
+          Mimir turns every codebase into a governed agent environment—ready for developers on day one,
+          aligned to each team, and measurable across the organization.
+        </p>
+
+        <div class="hero-actions anim" style="--d: 0.4s">
+          <a class="cta" href="#pilot">Request an Enterprise Pilot</a>
+          <a class="cta-secondary" href="#problem">See Why Mimir</a>
+        </div>
+      </main>
+
+      <footer class="stats" aria-label="Recorded harness benchmark results">
+        <div class="stat anim" style="--d: 0.5s">
+          <span class="stat-icon" aria-hidden="true">#</span>
+          <span
+            class="stat-value"
+            data-count="100"
+            data-suffix="%"
+            data-decimals="0"
+          >0%</span>
+          <span class="stat-label">Solve Rate</span>
+        </div>
+
+        <div class="stat anim" style="--d: 0.58s">
+          <span class="stat-icon" aria-hidden="true">&lt;</span>
+          <span
+            class="stat-value"
+            data-count="84.5"
+            data-suffix="%"
+            data-decimals="1"
+          >0.0%</span>
+          <span class="stat-label">Fewer Reported Tokens</span>
+        </div>
+
+        <div class="stat anim" style="--d: 0.66s">
+          <span class="stat-icon" aria-hidden="true">%</span>
+          <span
+            class="stat-value"
+            data-count="70.9"
+            data-suffix="%"
+            data-decimals="1"
+          >0.0%</span>
+          <span class="stat-label">Lower Median Runtime</span>
+        </div>
+
+        <div class="stat anim" style="--d: 0.74s">
+          <span class="stat-icon" aria-hidden="true">*</span>
+          <span
+            class="stat-value"
+            data-count="0"
+            data-suffix=""
+            data-decimals="0"
+          >0</span>
+          <span class="stat-label">Scope Violations</span>
+        </div>
+
+        <p class="stats-note">
+          Fixed six-task suites, three repeats per task. Harness-level results are not universal model-quality claims.
+        </p>
+      </footer>
+    </div>
+
+    <section class="site-section problem-section" id="problem" data-mark="DRIFT" aria-labelledby="problem-title">
+      <div class="section-inner">
+        <div class="section-heading reveal-on-scroll">
+          <p class="section-eyebrow">THE AGENT COLD START</p>
+          <h2 class="section-title" id="problem-title">
+            AI adoption without a control plane creates drift, not leverage.
+          </h2>
+          <p class="section-lead">
+            When every engineer assembles their own prompts, skills, tools, and rules, the enterprise
+            ends up with hundreds of private, unversioned versions of “how we build software.” More
+            capable agents do not remove that setup problem. They multiply it.
+          </p>
+        </div>
+
+        <div class="comparison-grid">
+          <article class="comparison-panel comparison-panel-negative reveal-on-scroll">
+            <p class="comparison-label">WITHOUT A SHARED HARNESS</p>
+            <ul class="comparison-list">
+              <li><span aria-hidden="true">×</span>Repository knowledge stays in private chats and personal setup files.</li>
+              <li><span aria-hidden="true">×</span>Each developer installs unreviewed skills, extensions, and MCP servers.</li>
+              <li><span aria-hidden="true">×</span>Leaders cannot tell which configuration improves outcomes or merely adds cost.</li>
+            </ul>
+          </article>
+
+          <article class="comparison-panel comparison-panel-positive reveal-on-scroll">
+            <p class="comparison-label">WITH MIMIR</p>
+            <ul class="comparison-list">
+              <li><span aria-hidden="true">✓</span>Every repository opens with an inherited, team-approved blueprint.</li>
+              <li><span aria-hidden="true">✓</span>Capabilities move through a trusted, versioned, revocable supply chain.</li>
+              <li><span aria-hidden="true">✓</span>Privacy-safe evidence shows what completed, failed, recovered, or violated policy.</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="site-section platform-section" id="platform" data-mark="SYSTEM" aria-labelledby="platform-title">
+      <div class="section-inner">
+        <div class="section-heading section-heading-centered reveal-on-scroll">
+          <p class="section-eyebrow">THE MIMIR CONTROL PLANE</p>
+          <h2 class="section-title" id="platform-title">
+            One operating layer between your developers, agents, and code.
+          </h2>
+          <p class="section-lead">
+            Platform teams define the company baseline. Product teams extend it within guardrails.
+            Developers enter a codebase with an agent already configured for the work.
+          </p>
+        </div>
+
+        <div class="control-loop reveal-on-scroll" aria-label="Mimir enterprise operating loop">
+          <div class="loop-node"><span>01</span>Company standard</div>
+          <i class="fa-solid fa-arrow-right" aria-hidden="true"></i>
+          <div class="loop-node"><span>02</span>Team policy</div>
+          <i class="fa-solid fa-arrow-right" aria-hidden="true"></i>
+          <div class="loop-node"><span>03</span>Repository blueprint</div>
+          <i class="fa-solid fa-arrow-right" aria-hidden="true"></i>
+          <div class="loop-node"><span>04</span>Agent run</div>
+          <i class="fa-solid fa-arrow-right" aria-hidden="true"></i>
+          <div class="loop-node"><span>05</span>Verified improvement</div>
+        </div>
+
+        <div class="pillar-grid">
+          <article class="pillar reveal-on-scroll">
+            <span class="pillar-number">01</span>
+            <i class="fa-solid fa-bolt" aria-hidden="true"></i>
+            <h3>Ready on day one</h3>
+            <p>Replace tribal setup guides with repository blueprints containing the right context, commands, tools, and quality gates.</p>
+          </article>
+          <article class="pillar reveal-on-scroll">
+            <span class="pillar-number">02</span>
+            <i class="fa-solid fa-sitemap" aria-hidden="true"></i>
+            <h3>One company. Many teams.</h3>
+            <p>Set non-negotiables once, then let each team add the domain knowledge and workflows its code actually requires.</p>
+          </article>
+          <article class="pillar reveal-on-scroll">
+            <span class="pillar-number">03</span>
+            <i class="fa-solid fa-shield-halved" aria-hidden="true"></i>
+            <h3>Only approved capabilities</h3>
+            <p>Turn tools, skills, extensions, and MCP servers from shadow infrastructure into a governed supply chain.</p>
+          </article>
+          <article class="pillar reveal-on-scroll">
+            <span class="pillar-number">04</span>
+            <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
+            <h3>Know what is working</h3>
+            <p>Measure completion, reliability, latency, token use, recovery, and policy failure without collecting raw work.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="site-section governance-section" id="governance" data-mark="SCOPE" aria-labelledby="governance-title">
+      <div class="section-inner split-layout">
+        <div class="split-copy reveal-on-scroll">
+          <p class="section-eyebrow">CENTRAL CONTROL. LOCAL FIT.</p>
+          <h2 class="section-title" id="governance-title">
+            A shared standard without a one-size-fits-all agent.
+          </h2>
+          <p class="section-lead">
+            Security and platform teams control the enterprise boundary. Engineering teams control how
+            work gets done inside it. Repositories carry the final, local layer of truth.
+          </p>
+          <p class="governance-close">Policy inherits downward. Evidence rolls upward. Raw code and prompts do not have to.</p>
+        </div>
+
+        <div class="scope-stack">
+          <article class="scope-card reveal-on-scroll">
+            <span>ORGANIZATION</span>
+            <h3>The enterprise boundary</h3>
+            <p>Approved providers, data routes, identity, budgets, execution policy, trusted catalogs, and required audit controls.</p>
+          </article>
+          <article class="scope-card reveal-on-scroll">
+            <span>TEAM</span>
+            <h3>The way each domain works</h3>
+            <p>Specialized workflows, repository groups, task templates, integrations, and team-level reliability goals.</p>
+          </article>
+          <article class="scope-card reveal-on-scroll">
+            <span>REPOSITORY</span>
+            <h3>The local source of truth</h3>
+            <p>Build and test commands, architectural boundaries, ownership, local memory, permissions, and quality gates.</p>
+          </article>
+        </div>
+      </div>
+
+    </section>
+
+    <section class="site-section learning-section" id="learning" data-mark="LOOP" aria-labelledby="learning-title">
+      <div class="section-inner">
+        <div class="section-heading reveal-on-scroll">
+          <p class="section-eyebrow">SAFE, REVERSIBLE LEARNING</p>
+          <h2 class="section-title" id="learning-title">
+            Let good practice compound without letting policy drift.
+          </h2>
+          <p class="section-lead">
+            Mimir improves bounded harness context—not model weights. Evidence can become scoped prompt,
+            memory, skill, or subagent improvements through a controlled path that always preserves rollback.
+          </p>
+        </div>
+
+        <ol class="learning-steps">
+          <li class="reveal-on-scroll"><span>01</span><h3>Observe</h3><p>Capture bounded outcome evidence.</p></li>
+          <li class="reveal-on-scroll"><span>02</span><h3>Propose</h3><p>Turn recurring evidence into a scoped candidate.</p></li>
+          <li class="reveal-on-scroll"><span>03</span><h3>Canary</h3><p>Require repeated verified success.</p></li>
+          <li class="reveal-on-scroll"><span>04</span><h3>Promote</h3><p>Distribute by project, team, or signed fleet.</p></li>
+          <li class="reveal-on-scroll"><span>05</span><h3>Roll back</h3><p>Revert without rewriting history.</p></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="site-section benchmarks-section" id="benchmarks" data-mark="PROOF" aria-labelledby="benchmarks-title">
+      <div class="section-inner">
+        <div class="section-heading section-heading-centered reveal-on-scroll">
+          <p class="section-eyebrow">BUILT FOR REAL CODE</p>
+          <h2 class="section-title" id="benchmarks-title">Proof before promises.</h2>
+          <p class="section-lead">
+            Mimir records the run identifiers, versions, outcome scores, timing, token use, scope
+            violations, and adapter failures behind every comparison.
+          </p>
+        </div>
+
+        <div class="evidence-grid">
+          <article class="evidence-card reveal-on-scroll"><strong>100%</strong><span>Solve rate</span><p>Mimir and Claude Code solved every task in the recorded six-task comparison.</p></article>
+          <article class="evidence-card reveal-on-scroll"><strong>84.5%</strong><span>Fewer reported tokens</span><p>Mean total tokens versus Claude Code in the same comparison.</p></article>
+          <article class="evidence-card reveal-on-scroll"><strong>70.9%</strong><span>Lower median runtime</span><p>Versus Codex with both harnesses using the matched GPT-5.6 Terra model.</p></article>
+          <article class="evidence-card reveal-on-scroll"><strong>0</strong><span>Scope violations</span><p>Across both recorded harness comparison suites.</p></article>
+        </div>
+
+        <div class="methodology reveal-on-scroll">
+          <p>Fixed six-task suites · three repeats per task · harness-level results, not universal model-quality claims</p>
+          <div>
+            <a href="https://github.com/shivendrasoni/mimir/tree/main/benchmarks" target="_blank" rel="noreferrer">View reports <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></a>
+            <a href="https://github.com/shivendrasoni/mimir/tree/main/benchmarks" target="_blank" rel="noreferrer">Read methodology <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="site-section security-section" id="security" data-mark="RUNTIME" aria-labelledby="security-title">
+      <div class="section-inner">
+        <div class="section-heading reveal-on-scroll">
+          <p class="section-eyebrow">CONTROL IS AN ARCHITECTURE</p>
+          <h2 class="section-title" id="security-title">A serious runtime beneath the control plane.</h2>
+          <p class="section-lead">
+            Mimir is written in safe Rust for long-running, inspectable work. Policy remains in
+            deterministic code beneath the model, where it can be tested and enforced.
+          </p>
+        </div>
+
+        <div class="security-grid">
+          <article class="security-item reveal-on-scroll"><i class="fa-solid fa-diagram-project" aria-hidden="true"></i><div><h3>Durable delegation</h3><p>Bounded child agents remain scoped to their parent session and operational budgets.</p></div></article>
+          <article class="security-item reveal-on-scroll"><i class="fa-solid fa-shuffle" aria-hidden="true"></i><div><h3>Provider independence</h3><p>Multiple model providers run through one typed runtime and one policy boundary.</p></div></article>
+          <article class="security-item reveal-on-scroll"><i class="fa-solid fa-user-shield" aria-hidden="true"></i><div><h3>Private evidence</h3><p>Diagnostics exclude prompt text, model output, tool payloads, credentials, and absolute paths.</p></div></article>
+          <article class="security-item reveal-on-scroll"><i class="fa-solid fa-gauge-high" aria-hidden="true"></i><div><h3>Bounded by design</h3><p>Turns, tools, context, output, time, child concurrency, and provider retries remain controlled.</p></div></article>
+        </div>
+
+        <p class="brag-line reveal-on-scroll">No Node.js runtime required. No unsafe Rust. No prompt masquerading as policy.</p>
+      </div>
+    </section>
+
+    <section class="pilot-section" id="pilot" aria-labelledby="pilot-title">
+      <div class="pilot-inner reveal-on-scroll">
+        <p class="section-eyebrow">START WITH ONE TEAM</p>
+        <h2 id="pilot-title">Scale the agents. Keep the standards.</h2>
+        <p>Prove the setup against real work, then expand without rebuilding the harness for every repository.</p>
+        <div class="pilot-actions">
+          <a class="cta" href="https://github.com/shivendrasoni/mimir/issues/new?title=Enterprise%20pilot%20request" target="_blank" rel="noreferrer">Request an Enterprise Pilot</a>
+          <a class="text-link" href="https://github.com/shivendrasoni/mimir" target="_blank" rel="noreferrer">Explore the technical foundation <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+        </div>
+        <p class="pilot-tagline">One harness. Every repository. Your rules.</p>
+      </div>
+    </section>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <a class="footer-brand" href="#home"><img src="assets/logo.webp" alt="" width="36" height="36" /><span>Mimir</span></a>
+        <nav aria-label="Footer navigation">
+          <a href="#platform">Platform</a>
+          <a href="#governance">Governance</a>
+          <a href="#learning">Learning</a>
+          <a href="#benchmarks">Benchmarks</a>
+          <a href="#security">Security</a>
+        </nav>
+        <p>Enterprise agent operations.</p>
+      </div>
+    </footer>
+
+    <div class="mobile-menu" id="mobile-menu" hidden>
+      <button class="mobile-menu-backdrop" type="button" aria-label="Close navigation"></button>
+      <nav class="mobile-menu-sheet" aria-label="Mobile navigation">
+        <a class="mobile-nav-link active" href="#platform" data-nav-target="platform" aria-current="page">Platform</a>
+        <a class="mobile-nav-link" href="#governance" data-nav-target="governance">Governance</a>
+        <a class="mobile-nav-link" href="#learning" data-nav-target="learning">Learning</a>
+        <a class="mobile-nav-link" href="#benchmarks" data-nav-target="benchmarks">Benchmarks</a>
+        <a class="mobile-nav-link" href="#security" data-nav-target="security">Security</a>
+        <a
+          class="mobile-sign-in"
+          href="#pilot"
+        >Request an enterprise pilot</a>
+      </nav>
+    </div>
+
+    <script src="main.js" defer></script>
+  </body>
+</html>

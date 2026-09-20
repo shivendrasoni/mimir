@@ -705,7 +705,12 @@ fn parse_usage(value: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let fresh_input_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
-    Usage::from_separate_cached_input(fresh_input_tokens, output_tokens, cache_read_input_tokens)
+    Usage::from_separate_cached_input(
+        fresh_input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+    )
 }
 
 #[derive(Default)]
@@ -867,6 +872,9 @@ impl StreamAccumulator {
         }
         if usage.cached_tokens != 0 {
             self.usage.cached_tokens = usage.cached_tokens;
+        }
+        if usage.cache_write_tokens != 0 {
+            self.usage.cache_write_tokens = usage.cache_write_tokens;
         }
     }
 

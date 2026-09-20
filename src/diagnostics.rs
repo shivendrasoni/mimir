@@ -345,6 +345,8 @@ pub struct DiagnosticSummary {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
     pub fresh_input_tokens: u64,
     #[serde(default)]
     pub operational_tokens: u64,
@@ -1121,6 +1123,10 @@ impl SummaryAccumulator {
                     .usage
                     .cached_tokens
                     .saturating_add(metadata.usage.cached_tokens);
+                self.usage.cache_write_tokens = self
+                    .usage
+                    .cache_write_tokens
+                    .saturating_add(metadata.usage.cache_write_tokens);
                 self.peak_context_tokens =
                     self.peak_context_tokens.max(metadata.usage.input_tokens);
             }
@@ -1150,6 +1156,7 @@ impl SummaryAccumulator {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cached_tokens: self.usage.cached_tokens,
+            cache_write_tokens: self.usage.cache_write_tokens,
             fresh_input_tokens: self.usage.uncached_input_tokens(),
             operational_tokens: self.usage.budget_tokens(),
             peak_context_tokens: self.peak_context_tokens,
@@ -1729,6 +1736,7 @@ mod tests {
         message.usage = Usage {
             input_tokens: 140_000,
             cached_tokens: 133_000,
+            cache_write_tokens: 2_000,
             output_tokens: 3_000,
         };
         recorder.record(&journal, &RuntimeEvent::MessageCompleted { message });
@@ -1739,6 +1747,7 @@ mod tests {
         let summary = bundle.summary.expect("summary");
         assert_eq!(summary.input_tokens, 140_000);
         assert_eq!(summary.cached_tokens, 133_000);
+        assert_eq!(summary.cache_write_tokens, 2_000);
         assert_eq!(summary.fresh_input_tokens, 7_000);
         assert_eq!(summary.output_tokens, 3_000);
         assert_eq!(summary.operational_tokens, 10_000);

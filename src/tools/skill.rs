@@ -41,7 +41,7 @@ impl Tool for SearchSkillsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_skills".into(),
-            description: "Discover an applicable skill without loading the full skill catalog. Use query when the task may benefit from specialized instructions and you do not know the exact skill. Results contain only bounded names and descriptions. If the user names a skill or a result is clearly applicable, call this tool with its exact name to activate that skill for the current run; only then are its full instructions added ephemerally to system context. Do not activate a merely plausible skill without checking that its description fits the task."
+            description: "Search bounded skill summaries by query, or activate an exact name for this run. Activation ephemerally loads full instructions. Activate named or clearly applicable skills only."
                 .into(),
             parameters: object_schema(
                 &json!({

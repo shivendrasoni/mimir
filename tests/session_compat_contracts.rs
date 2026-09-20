@@ -55,7 +55,7 @@ fn rich_reference_session() -> String {
                 {"type":"thinking","thinking":"consider","signature":"signed-thought"},
                 {"type":"redacted_thinking","data":"opaque-redacted-data"},
                 {"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"README.md"}}
-            ],"stopReason":"toolUse"}
+            ],"stopReason":"toolUse","usage":{"input":12,"output":4,"cacheRead":5,"cacheWrite":2,"totalTokens":23}}
         }),
         json!({
             "type":"message", "id":"dddddddd", "parentId":"cccccccc",
@@ -100,6 +100,9 @@ fn imports_only_the_reference_active_branch_and_preserves_rich_messages() {
         panic!("assistant message");
     };
     assert_eq!(assistant.stop_reason, Some(StopReason::ToolUse));
+    assert_eq!(assistant.usage.input_tokens, 19);
+    assert_eq!(assistant.usage.cached_tokens, 5);
+    assert_eq!(assistant.usage.cache_write_tokens, 2);
     assert!(matches!(
         &assistant.content[0],
         Content::Thinking {
@@ -145,6 +148,9 @@ fn imports_only_the_reference_active_branch_and_preserves_rich_messages() {
         reexported[2]["message"]["content"][1]["data"],
         "opaque-redacted-data"
     );
+    assert_eq!(reexported[2]["message"]["usage"]["input"], 12);
+    assert_eq!(reexported[2]["message"]["usage"]["cacheRead"], 5);
+    assert_eq!(reexported[2]["message"]["usage"]["cacheWrite"], 2);
 }
 
 #[test]

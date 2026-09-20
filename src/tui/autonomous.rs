@@ -311,6 +311,7 @@ mod tests {
                 input_tokens: 50_010,
                 output_tokens: 5,
                 cached_tokens: 50_000,
+                cache_write_tokens: 0,
             },
         );
         for _ in 0..state.limits.max_continuations.expect("bounded") {
@@ -336,6 +337,7 @@ mod tests {
                     input_tokens: 10_000,
                     output_tokens: 1_000,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                 },
             );
             assert!(state.next_continuation(generation, now).is_some());
@@ -367,6 +369,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 10,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
             },
         );
         assert!(state.next_continuation(first, now).is_some());

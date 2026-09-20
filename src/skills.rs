@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use thiserror::Error;
 
@@ -15,8 +15,20 @@ pub enum SkillInvocationError {
     Malformed(String),
     #[error("unknown skill `{0}`; use the `get_commands` RPC command to list available skills")]
     Unknown(String),
-    #[error("active skill instructions exceed {MAX_ACTIVE_SKILL_CONTEXT_BYTES} bytes")]
-    Oversized,
+    #[error("cannot activate skill `{name}` at {path}: {message}")]
+    Unavailable {
+        name: String,
+        path: PathBuf,
+        message: String,
+    },
+    #[error(
+        "skill `{name}` at {path} would use {actual_bytes} bytes of active skill context, exceeding the {MAX_ACTIVE_SKILL_CONTEXT_BYTES}-byte limit; keep SKILL.md concise and move detailed material into referenced files"
+    )]
+    Oversized {
+        name: String,
+        path: PathBuf,
+        actual_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,10 +81,12 @@ impl SkillRuntime {
                 .skills
                 .get(name)
                 .ok_or_else(|| SkillInvocationError::Unknown(name.to_owned()))?;
-            let context = render_skill_context(skill);
-            total = total.saturating_add(context.len());
+            let context = render_skill_context(skill)?;
+            total = total
+                .saturating_add(usize::from(!contexts.is_empty()) * 2)
+                .saturating_add(context.len());
             if total > MAX_ACTIVE_SKILL_CONTEXT_BYTES {
-                return Err(SkillInvocationError::Oversized);
+                return Err(oversized_error(skill, total));
             }
             contexts.push(context);
         }
@@ -116,15 +130,14 @@ impl SkillRuntime {
         {
             return Ok(false);
         }
-        let context = render_skill_context(skill);
+        let context = render_skill_context(skill)?;
         let current_len = active_context.as_ref().map_or(0, String::len);
         let separator_len = usize::from(active_context.is_some()) * 2;
-        if current_len
+        let total = current_len
             .saturating_add(separator_len)
-            .saturating_add(context.len())
-            > MAX_ACTIVE_SKILL_CONTEXT_BYTES
-        {
-            return Err(SkillInvocationError::Oversized);
+            .saturating_add(context.len());
+        if total > MAX_ACTIVE_SKILL_CONTEXT_BYTES {
+            return Err(oversized_error(skill, total));
         }
         match active_context {
             Some(active) => {
@@ -207,15 +220,30 @@ fn terms(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn render_skill_context(skill: &Skill) -> String {
+fn render_skill_context(skill: &Skill) -> Result<String, SkillInvocationError> {
+    let body = skill
+        .load_instructions(MAX_ACTIVE_SKILL_CONTEXT_BYTES)
+        .map_err(|error| SkillInvocationError::Unavailable {
+            name: skill.name.clone(),
+            path: skill.path.clone(),
+            message: error.to_string(),
+        })?;
     let base_dir = skill.path.parent().unwrap_or(&skill.path).display();
-    format!(
+    Ok(format!(
         "<active_skill name=\"{}\" location=\"{}\">\nReferences are relative to {}. The current user request supplies the task context; for an explicit skill invocation, text after the skill name supplies its arguments. Do not install packages or execute referenced scripts automatically; inspect them and request the authority required by the active task.\n\n{}\n</active_skill>",
         skill.name,
         escape_xml(&skill.path.display().to_string()),
         escape_xml(&base_dir.to_string()),
-        skill.body,
-    )
+        body,
+    ))
+}
+
+fn oversized_error(skill: &Skill, actual_bytes: usize) -> SkillInvocationError {
+    SkillInvocationError::Oversized {
+        name: skill.name.clone(),
+        path: skill.path.clone(),
+        actual_bytes,
+    }
 }
 
 fn parse_invocation(input: &str) -> Result<Option<(&str, &str)>, SkillInvocationError> {

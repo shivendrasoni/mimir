@@ -31,6 +31,7 @@ fn response(content: Vec<Content>, stop_reason: StopReason, tokens: u64) -> Mode
         input_tokens: tokens / 2,
         output_tokens: tokens - tokens / 2,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     ModelResponse {
         message,
@@ -1650,6 +1651,7 @@ async fn cached_replay_across_seven_large_tool_turns_does_not_pause_at_one_milli
             response.message.usage = Usage {
                 input_tokens: 140_000,
                 cached_tokens: 133_000,
+                cache_write_tokens: 0,
                 output_tokens: 3_000,
             };
             response

@@ -264,7 +264,7 @@ impl ToolRegistry {
             ""
         };
         format!(
-            "Workspace root: {}\nFor filesystem tools and path-like process arguments, $WORKSPACE refers to this directory. Pass workspace-relative paths without '..'. To access a target outside it, do not retry with absolute paths or traversal; restart Mimir with a broader --workspace or copy the target into this workspace. {permission_guidance}{remember_guidance} Recursive search and listing skip .mimir, version-control metadata, dependencies, and generated outputs so internal state cannot amplify model context; read_file remains available for a deliberately targeted file. Bash and run_process execution are not an OS sandbox.",
+            "Workspace root: {}\n$WORKSPACE is this directory. Tool paths must be relative and cannot contain '..'; for outside targets, restart with a broader --workspace or copy them here. {permission_guidance}{remember_guidance} Recursive discovery skips harness state, VCS metadata, dependencies, and generated output; targeted read_file remains available. Bash/run_process execution is not an OS sandbox.",
             self.workspace_root.display(),
         )
     }

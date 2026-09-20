@@ -211,11 +211,14 @@ fn tool_result_value(result: &ToolResult, message: &Message) -> Value {
 }
 
 fn export_usage(usage: Usage) -> Value {
+    let ordinary_input = usage
+        .uncached_input_tokens()
+        .saturating_sub(usage.cache_write_tokens);
     json!({
-        "input": usage.input_tokens,
+        "input": ordinary_input,
         "output": usage.output_tokens,
         "cacheRead": usage.cached_tokens,
-        "cacheWrite": 0,
+        "cacheWrite": usage.cache_write_tokens,
         "totalTokens": usage.total(),
         "cost": {
             "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0

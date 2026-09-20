@@ -721,6 +721,7 @@ fn parse_usage(value: Option<&Value>) -> Usage {
             .pointer("/input_tokens_details/cached_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        cache_write_tokens: 0,
     }
 }
 

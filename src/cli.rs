@@ -4111,6 +4111,9 @@ impl RuntimePromptHandler {
                 total.cached_tokens = total
                     .cached_tokens
                     .saturating_add(message.usage.cached_tokens);
+                total.cache_write_tokens = total
+                    .cache_write_tokens
+                    .saturating_add(message.usage.cache_write_tokens);
                 total
             });
         loop {
@@ -4158,6 +4161,9 @@ impl RuntimePromptHandler {
                     total.cached_tokens = total
                         .cached_tokens
                         .saturating_add(message.usage.cached_tokens);
+                    total.cache_write_tokens = total
+                        .cache_write_tokens
+                        .saturating_add(message.usage.cache_write_tokens);
                     total
                 });
         }
@@ -10152,6 +10158,10 @@ async fn legacy_session_stats(context: &RpcSessionContext) -> Result<Value> {
         .iter()
         .map(|message| message.usage.cached_tokens)
         .sum();
+    let cache_write: u64 = assistant
+        .iter()
+        .map(|message| message.usage.cache_write_tokens)
+        .sum();
     let store = current_session_store(context).await?;
     Ok(json!({
         "sessionFile": store.path(),
@@ -10161,7 +10171,7 @@ async fn legacy_session_stats(context: &RpcSessionContext) -> Result<Value> {
         "toolCalls": tool_calls,
         "toolResults": tool_results,
         "totalMessages": messages.len(),
-        "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": 0, "total": input.saturating_add(output)},
+        "tokens": {"input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write, "total": input.saturating_add(output)},
         "cost": 0.0
     }))
 }
@@ -10754,7 +10764,7 @@ mod tui_model_selection_tests {
         assert!(matches!(error, DaemonError::BudgetPaused(_)));
         assert_eq!(
             error.to_string(),
-            "budget paused: turn budget exhausted at 64 (turns=64, tool_calls=0, budget_tokens=0, input_tokens=0, cached_tokens=0, fresh_input_tokens=0, output_tokens=0, current_context_tokens=0, elapsed_ms=0)"
+            "budget paused: turn budget exhausted at 64 (turns=64, tool_calls=0, budget_tokens=0, input_tokens=0, cache_read_tokens=0, cache_write_tokens=0, fresh_input_tokens=0, output_tokens=0, current_context_tokens=0, elapsed_ms=0)"
         );
         assert!(!error.to_string().contains("protocol"));
     }

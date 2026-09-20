@@ -85,7 +85,7 @@ export default function activate(pi) {
       const message = {
         role: "assistant", content: [{ type: "text", text: "bridge-ok" }],
         api: model.api, provider: model.provider, model: model.id,
-        usage: { input: 3, output: 2, cacheRead: 1, cacheWrite: 0, totalTokens: 6, cost: {} },
+        usage: { input: 3, output: 2, cacheRead: 1, cacheWrite: 2, totalTokens: 8, cost: {} },
         stopReason: "stop", responseId: "custom-response", timestamp: Date.now(),
       };
       yield { type: "start", partial: { ...message, content: [] } };
@@ -165,6 +165,10 @@ export default function activate(pi) {
         .expect("custom stream");
     assert_eq!(response.response_id.as_deref(), Some("custom-response"));
     assert_eq!(response.message.text(), "bridge-ok");
+    assert_eq!(response.message.usage.input_tokens, 6);
+    assert_eq!(response.message.usage.cached_tokens, 1);
+    assert_eq!(response.message.usage.cache_write_tokens, 2);
+    assert_eq!(response.message.usage.total(), 8);
     assert_eq!(
         events.0.lock().expect("events").as_slice(),
         [ProviderEvent::TextDelta("bridge-ok".into())]

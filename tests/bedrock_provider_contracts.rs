@@ -191,7 +191,7 @@ async fn bearer_stream_decodes_text_thinking_tools_usage_and_stop() {
         ),
         event_frame(
             "metadata",
-            &json!({"usage": {"inputTokens": 7, "outputTokens": 5, "cacheReadInputTokens": 2, "totalTokens": 12}}),
+            &json!({"usage": {"inputTokens": 7, "outputTokens": 5, "cacheReadInputTokens": 2, "cacheWriteInputTokens": 1, "totalTokens": 12}}),
         ),
         event_frame("messageStop", &json!({"stopReason": "tool_use"})),
     ]
@@ -218,6 +218,7 @@ async fn bearer_stream_decodes_text_thinking_tools_usage_and_stop() {
     assert_eq!(response.message.usage.input_tokens, 7);
     assert_eq!(response.message.usage.output_tokens, 5);
     assert_eq!(response.message.usage.cached_tokens, 2);
+    assert_eq!(response.message.usage.cache_write_tokens, 1);
     assert!(response.message.content.iter().any(|block| matches!(
         block,
         Content::Thinking { text, signature: Some(signature), .. }

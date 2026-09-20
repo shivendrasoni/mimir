@@ -139,7 +139,11 @@ fn resource_loader_applies_parent_to_child_context_and_nearest_skill_wins() {
     );
     assert_eq!(resources.skills.len(), 1);
     assert_eq!(resources.skills[0].description, "child");
-    assert!(resources.skills[0].body.contains("child body"));
+    assert_eq!(
+        resources.skills[0].path,
+        std::fs::canonicalize(child.join(".agents/skills/review/SKILL.md"))
+            .expect("canonical child skill")
+    );
 }
 
 #[tokio::test]

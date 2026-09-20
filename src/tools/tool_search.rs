@@ -52,7 +52,7 @@ impl Tool for SearchToolsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_tools".into(),
-            description: "Discover and activate tools omitted from the current TypeSafe shortlist. Search by the capability needed next. Matching configured tools become available on the following model step for this run. Use this when the visible tools cannot complete the task; do not search for a tool that is already available."
+            description: "Find and activate configured tools omitted from the current TypeSafe shortlist. Use only when visible tools cannot complete the task; activated tools appear on the next model step."
                 .into(),
             parameters: object_schema(
                 &json!({

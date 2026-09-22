@@ -263,10 +263,9 @@ pub struct Cli {
         long,
         env = "MIMIR_TYPESAFE",
         value_enum,
-        default_value = "off",
         help = "Enable or disable TypeSafe-backed features"
     )]
-    typesafe: TypeSafeModeArg,
+    typesafe: Option<TypeSafeModeArg>,
     #[arg(long)]
     no_prompt_templates: bool,
     #[arg(long)]
@@ -464,7 +463,18 @@ impl RuntimeBuildConfig {
             no_context_files: cli.no_context_files,
             no_skills: cli.no_skills,
             typesafe: TypeSafeConfig {
-                mode: cli.typesafe.into(),
+                // Explicit CLI input wins. Without one, credentials opt into
+                // the safe, failure-isolated Jev features automatically.
+                mode: cli.typesafe.map_or_else(
+                    || {
+                        if std::env::var_os("TYPESAFE_API_KEY").is_some() {
+                            TypeSafeMode::On
+                        } else {
+                            TypeSafeMode::Off
+                        }
+                    },
+                    Into::into,
+                ),
                 ..TypeSafeConfig::default()
             },
             no_prompt_templates: cli.no_prompt_templates,
@@ -1964,6 +1974,20 @@ async fn dispatch_run_with_diagnostics(
     initial_prompt: Option<&str>,
 ) -> Result<()> {
     let state = resolve_state_dir(&cli.state_dir)?;
+    // One-shot invocations never wait on continual learning. A prior task's
+    // reference-only job may be evaluated concurrently on this invocation;
+    // failures are intentionally silent and cannot affect the task result.
+    let background_learning_runtime = Arc::clone(&runtime);
+    let background_workspace = cli.workspace.clone();
+    let background_state = state.clone();
+    tokio::spawn(async move {
+        let _ = learning::process_one_learning_job(
+            background_learning_runtime.as_ref(),
+            &background_workspace,
+            &background_state,
+        )
+        .await;
+    });
     let (provider, model, _) = runtime.model_selection().await;
     let mut recorder = RuntimeDiagnosticRunCollector::new(
         diagnostics_root(&state),
@@ -2011,28 +2035,38 @@ async fn dispatch_run_with_diagnostics(
         }
         recorder.finish_open();
     });
-    let learning_runtime = Arc::clone(&runtime);
-    let result = dispatch_run(cli, runtime, initial_prompt).await;
+    let result = dispatch_run(cli, Arc::clone(&runtime), initial_prompt).await;
     let _ = stop_sender.send(());
     let _ = collector.await;
     if let Err(error) = ingest_learning_diagnostics(cli, &state).await {
         eprintln!("warning: project learning evidence was not recorded: {error}");
     }
-    if result.is_err() {
-        let mode = match learning::discover_project_root(&cli.workspace) {
-            Ok(project) => learning::load_learning_state(&project)
-                .await
-                .map(|state| state.mode),
-            Err(error) => Err(error),
-        };
-        if matches!(mode, Ok(LearningMode::Auto))
-            && let Err(error) =
-                learning::propose_project_candidate(&learning_runtime, &cli.workspace).await
-        {
-            eprintln!("warning: automatic learning proposal failed safely: {error}");
-        }
-    }
+    // Reference-only enqueue is deliberately after foreground completion. The
+    // next invocation or TUI idle time can process it without response latency.
+    let _ = enqueue_completed_learning_span(cli, &state, runtime.as_ref()).await;
     result
+}
+
+async fn enqueue_completed_learning_span(
+    cli: &Cli,
+    state_root: &Path,
+    runtime: &AgentRuntime,
+) -> Result<()> {
+    let session_root = learning::project_session_root(state_root, &cli.workspace)?;
+    let store = FileSessionStore::create(&session_root, &cli.session).await?;
+    let records = store.load().await?.records;
+    let (Some(first), Some(last)) = (records.first(), records.last()) else {
+        return Ok(());
+    };
+    let _ = learning::enqueue_completed_task(
+        &cli.workspace,
+        &cli.session,
+        first.record_id,
+        last.record_id,
+        runtime.harness_candidate_ids().await,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn ingest_learning_diagnostics(cli: &Cli, state_root: &Path) -> Result<()> {
@@ -6567,8 +6601,20 @@ async fn ensure_rpc_daemon(context: &RpcSessionContext, state: &std::path::Path)
 
 fn daemon_config(state: &std::path::Path, workspace: &Path) -> Result<DaemonConfig> {
     let project_state = learning::project_session_root(state, workspace)?;
+    let requested_socket = project_state.join("daemon/mimir.sock");
+    // Unix-domain socket addresses have a small platform limit (typically 104
+    // bytes on macOS). Project isolation adds deliberate path depth, so retain
+    // the project hash but use a short private temp-root rendezvous when needed.
+    let socket_path = if requested_socket.as_os_str().as_encoded_bytes().len() < 100 {
+        requested_socket
+    } else {
+        std::env::temp_dir().join("mimir-sockets").join(format!(
+            "{}.sock",
+            learning::project_storage_key(workspace)?
+        ))
+    };
     Ok(DaemonConfig {
-        socket_path: project_state.join("daemon/mimir.sock"),
+        socket_path,
         state_root: project_state,
         server_name: "mimir".into(),
         lease_ttl: std::time::Duration::from_secs(30),
@@ -7850,11 +7896,10 @@ async fn build_runtime_for_session(
     for (name, value) in extension_flags {
         runtime.set_extension_flag(&name, value).await?;
     }
+    let harness =
+        refinement::load_harness_context_with_provenance(&state, &workspace, session, None).await?;
     runtime
-        .set_harness_context(
-            refinement::load_harness_context_for_workspace(&state, &workspace, session, None)
-                .await?,
-        )
+        .set_harness_context_with_candidates(harness.text, harness.exposed_candidate_ids)
         .await;
     Ok(runtime)
 }
@@ -9111,7 +9156,11 @@ async fn run_legacy_schedule_request(
         Ok(state) => state,
         Err(error) => return legacy_error(request.id, &request.command, &error.to_string()),
     };
-    let store = ScheduleStore::new(&state);
+    let project_state = match learning::project_session_root(&state, &context.build.workspace) {
+        Ok(project_state) => project_state,
+        Err(error) => return legacy_error(request.id, &request.command, &error.to_string()),
+    };
+    let store = ScheduleStore::new(&project_state);
     if matches!(
         request.command.as_str(),
         "list_heartbeats"
@@ -9120,9 +9169,9 @@ async fn run_legacy_schedule_request(
             | "update_heartbeat"
             | "manage_heartbeat"
     ) {
-        return run_legacy_heartbeat_request(context, &state, &store, request).await;
+        return run_legacy_heartbeat_request(context, &project_state, &store, request).await;
     }
-    run_legacy_cron_request(context, &state, &store, request).await
+    run_legacy_cron_request(context, &project_state, &store, request).await
 }
 
 async fn run_legacy_cron_request(
@@ -9496,7 +9545,8 @@ fn legacy_schedule_job(
     schedule: &Schedule,
 ) -> Result<Value> {
     let workspace = std::fs::canonicalize(&context.build.workspace)?;
-    let session_file = state
+    let project_state = learning::project_session_root(state, &context.build.workspace)?;
+    let session_file = project_state
         .join("sessions")
         .join(format!("{}.jsonl", schedule.session_id));
     let schedule_kind = if schedule.every_seconds.is_some() {
@@ -11246,20 +11296,24 @@ mod tui_model_selection_tests {
             .await
             .expect("tier")
             .expect("handled");
-        FileSessionStore::create(state.path(), "live-state")
-            .await
-            .expect("store")
-            .append(SessionRecord::new(SessionPayload::Compaction {
-                summary: "checkpoint".into(),
-                retained_message_count: 0,
-                reason: Some("test".into()),
-                first_kept_entry_id: None,
-                tokens_before: 0,
-                custom_instructions: None,
-                details: None,
-            }))
-            .await
-            .expect("compaction");
+        FileSessionStore::create(
+            &crate::learning::project_session_root(state.path(), workspace.path())
+                .expect("project session root"),
+            "live-state",
+        )
+        .await
+        .expect("store")
+        .append(SessionRecord::new(SessionPayload::Compaction {
+            summary: "checkpoint".into(),
+            retained_message_count: 0,
+            reason: Some("test".into()),
+            first_kept_entry_id: None,
+            tokens_before: 0,
+            custom_instructions: None,
+            details: None,
+        }))
+        .await
+        .expect("compaction");
 
         let snapshot = handler
             .session_runtime_state("live-state")

@@ -309,7 +309,11 @@ pub async fn refine(
                 state_path.display()
             )));
         }
-        let baseline = load_state(&root, &state_path).await?;
+        // A session/project rollback may intentionally target the original
+        // session's recorded file after a transcript clone. Validate it under
+        // the project root, not the global state root.
+        let storage_root = storage_root_for_scope(&root, &project_root, scope);
+        let baseline = load_state(storage_root, &state_path).await?;
         (
             rollback_proposal(&target),
             Some(target.id),
@@ -593,6 +597,33 @@ pub async fn load_harness_context_for_workspace(
     session_id: &str,
     query: Option<&str>,
 ) -> Result<String> {
+    Ok(
+        load_harness_context_with_provenance(state_root, workspace, session_id, query)
+            .await?
+            .text,
+    )
+}
+
+/// The exact learned candidates whose entries survived precedence, relevance,
+/// and context-budget selection for this turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessContext {
+    pub text: String,
+    pub exposed_candidate_ids: Vec<Uuid>,
+}
+
+/// Loads formatted harness context together with conservative candidate
+/// provenance. Only entries actually emitted into the context are reported.
+///
+/// # Errors
+///
+/// Returns a safe-path, JSON, or I/O error while loading a harness layer.
+pub async fn load_harness_context_with_provenance(
+    state_root: &Path,
+    workspace: &Path,
+    session_id: &str,
+    query: Option<&str>,
+) -> Result<HarnessContext> {
     validate_options(session_id, &RefineOptions::default())?;
     let root = canonical_state_root(state_root);
     let project_root = learning::discover_project_root(workspace)?;
@@ -632,7 +663,7 @@ fn format_harness_context(
     project: &HarnessState,
     session: &HarnessState,
     query: Option<&str>,
-) -> String {
+) -> HarnessContext {
     let mut lines = vec![
         "## Continual Harness".to_owned(),
         "Use these persisted prompt notes, memories, skills, and subagent specifications as reusable context. More specific scopes take precedence: session, project, user, then fleet.".to_owned(),
@@ -666,6 +697,7 @@ fn format_harness_context(
             .then_with(|| left.1.id.cmp(&right.1.id))
     });
     let mut used_chars = lines.iter().map(String::len).sum::<usize>();
+    let mut exposed_candidate_ids = Vec::new();
     for (scope, entry) in ranked.into_iter().take(MAX_HARNESS_CONTEXT_ENTRIES) {
         let content = compact_text(&entry.content, 360);
         let mut block = vec![format!(
@@ -696,12 +728,22 @@ fn format_harness_context(
             continue;
         }
         used_chars = used_chars.saturating_add(block_chars);
+        if let Some(value) = entry.source.strip_prefix("learning:")
+            && let Ok(id) = Uuid::parse_str(value)
+            && !exposed_candidate_ids.contains(&id)
+        {
+            exposed_candidate_ids.push(id);
+        }
         lines.extend(block);
     }
-    if lines.len() == 2 {
+    let text = if lines.len() == 2 {
         String::new()
     } else {
         lines.join("\n")
+    };
+    HarnessContext {
+        text,
+        exposed_candidate_ids,
     }
 }
 

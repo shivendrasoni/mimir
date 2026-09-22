@@ -10,6 +10,10 @@
     reason = "learning operations return typed validation, provider, transport, and durable-state errors"
 )]
 
+pub mod jobs;
+pub mod policy;
+pub mod projection;
+
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
@@ -32,11 +36,11 @@ use crate::{
     error::{MimirError, Result},
     refinement::{RefinementEdit, RefinementKind},
     runtime::AgentRuntime,
+    session::{FileSessionStore, SessionStore},
 };
 
-pub const LEARNING_SCHEMA_VERSION: u16 = 2;
+pub const LEARNING_SCHEMA_VERSION: u16 = 3;
 pub const PROJECT_CANARY_RUNS: u8 = 3;
-pub const OBSERVE_DOGFOOD_EVIDENCE: usize = 3;
 const MAX_EVIDENCE: usize = 1_000;
 const MAX_CANDIDATES: usize = 256;
 const MAX_PACK_BYTES: usize = 4 * 1024 * 1024;
@@ -111,6 +115,51 @@ pub struct LearningEvidence {
     pub metrics: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Only candidates actually exposed in this logical task may consume this
+    /// outcome. Absence means the evidence is diagnostic only.
+    #[serde(default)]
+    pub exposed_candidate_ids: Vec<Uuid>,
+}
+
+/// Durable typed Jev evaluation metadata and its deterministic disposition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningEvaluation {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub session_alias: String,
+    pub first_record_id: Uuid,
+    pub last_record_id: Uuid,
+    pub rubric_hash: String,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub latency_ms: u64,
+    pub lesson_kind: Option<String>,
+    pub resolution: Option<String>,
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overfit_risk: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_correction_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categorical_confidence: Option<f64>,
+    pub cluster_id: Option<Uuid>,
+    #[serde(default)]
+    pub exposed_candidate_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningCluster {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub summary: String,
+    pub lesson_kind: String,
+    #[serde(default)]
+    pub evaluation_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub task_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +174,9 @@ pub struct LearningCandidate {
     pub edits: Vec<RefinementEdit>,
     #[serde(default)]
     pub evidence_ids: Vec<Uuid>,
+    /// The one qualified evaluation cluster this candidate was synthesized from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cluster_id: Option<Uuid>,
     #[serde(default)]
     pub canary_outcomes: Vec<EvidenceOutcome>,
     pub canary_runs_required: u8,
@@ -143,6 +195,10 @@ pub struct LearningState {
     #[serde(default)]
     pub evidence: Vec<LearningEvidence>,
     #[serde(default)]
+    pub evaluations: Vec<LearningEvaluation>,
+    #[serde(default)]
+    pub clusters: Vec<LearningCluster>,
+    #[serde(default)]
     pub candidates: Vec<LearningCandidate>,
     #[serde(default)]
     pub feedback_requested_for: Option<Uuid>,
@@ -155,10 +211,15 @@ impl Default for LearningState {
         Self {
             schema: LEARNING_SCHEMA_VERSION,
             generation: 0,
-            mode: LearningMode::Observe,
+            // The lifecycle is automatic when Jev is available. With
+            // TypeSafe off, its evaluation is disabled and no candidate can
+            // advance, so this remains a safe no-flag default.
+            mode: LearningMode::Auto,
             contribution_enabled: false,
             contributor_id: Uuid::new_v4(),
             evidence: Vec::new(),
+            evaluations: Vec::new(),
+            clusters: Vec::new(),
             candidates: Vec::new(),
             feedback_requested_for: None,
             pinned_fleet_version: None,
@@ -239,6 +300,10 @@ Return JSON only: {"summary":"...","rationale":"...","applicability":{"tags":[],
 
 const LEARNING_CRITIC_PROMPT: &str = r#"You are Mimir's independent project learning critic. Review the candidate for overfitting, unsupported claims, secret or project-identity leakage, executable payloads, permission expansion, and conflicts with its evidence. Return JSON only: {"approved":true|false,"reason":"..."}. Reject uncertain candidates."#;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one explicit bounded-cluster synthesis transaction keeps provider inputs auditable"
+)]
 pub async fn propose_project_candidate(
     runtime: &AgentRuntime,
     workspace: &Path,
@@ -251,28 +316,53 @@ pub async fn propose_project_candidate(
             "project learning is disabled".into(),
         ));
     }
+    let cluster = qualified_cluster(&state).ok_or_else(|| {
+        MimirError::Configuration(
+            "no qualified learning cluster; retain two distinct safe task evaluations, or one strong validated correction".into(),
+        )
+    })?;
+    if state
+        .candidates
+        .iter()
+        .any(|candidate| candidate.source_cluster_id == Some(cluster.id))
+    {
+        return Err(MimirError::Configuration(
+            "a candidate already exists for the qualified learning cluster".into(),
+        ));
+    }
+    let cluster_evaluations = state
+        .evaluations
+        .iter()
+        .filter(|evaluation| evaluation.cluster_id == Some(cluster.id))
+        .map(|evaluation| {
+            serde_json::json!({
+                "evaluation_id": evaluation.id,
+                "lesson_kind": evaluation.lesson_kind,
+                "resolution": evaluation.resolution,
+                "scope": evaluation.scope,
+                "reuse_value": evaluation.reuse_value,
+                "overfit_risk": evaluation.overfit_risk,
+                "categorical_confidence": evaluation.categorical_confidence,
+            })
+        })
+        .collect::<Vec<_>>();
     let evidence = state
         .evidence
         .iter()
-        .rev()
-        .take(20)
+        .filter(|item| cluster.task_aliases.contains(&item.session_alias))
         .cloned()
         .collect::<Vec<_>>();
     let evidence_summary = evidence
         .iter()
-        .map(|item| {
-            serde_json::json!({
-                "id": item.id,
-                "outcome": item.outcome,
-                "signal": item.signal,
-                "task_fingerprint": item.task_fingerprint,
-                "metrics": item.metrics,
-            })
-        })
+        .map(|item| serde_json::json!({
+            "id": item.id, "outcome": item.outcome, "signal": item.signal, "metrics": item.metrics,
+        }))
         .collect::<Vec<_>>();
     let prompt = format!(
-        "<verified_evidence>{}</verified_evidence>\nReturn JSON only.",
-        serde_json::to_string(&evidence_summary)?
+        "<qualified_cluster>{}</qualified_cluster>\n<bounded_evaluations>{}</bounded_evaluations>\n<verified_evidence>{}</verified_evidence>\nReturn JSON only.",
+        serde_json::to_string(cluster)?,
+        serde_json::to_string(&cluster_evaluations)?,
+        serde_json::to_string(&evidence_summary)?,
     );
     let proposal = runtime
         .complete_control_request(LEARNING_PROPOSER_PROMPT, &prompt, 8_000)
@@ -288,14 +378,17 @@ pub async fn propose_project_candidate(
         applicability: draft.applicability,
         edits: draft.edits,
         evidence_ids: evidence.iter().map(|item| item.id).collect(),
+        source_cluster_id: Some(cluster.id),
         canary_outcomes: Vec::new(),
         canary_runs_required: PROJECT_CANARY_RUNS,
         rejection_reason: None,
     };
     validate_candidate(&candidate)?;
     let critic_prompt = format!(
-        "<candidate>{}</candidate>\n<verified_evidence>{}</verified_evidence>\nReturn JSON only.",
+        "<candidate>{}</candidate>\n<qualified_cluster>{}</qualified_cluster>\n<bounded_evaluations>{}</bounded_evaluations>\n<verified_evidence>{}</verified_evidence>\nReturn JSON only.",
         serde_json::to_string(&candidate)?,
+        serde_json::to_string(cluster)?,
+        serde_json::to_string(&cluster_evaluations)?,
         serde_json::to_string(&evidence_summary)?
     );
     let review = runtime
@@ -303,6 +396,9 @@ pub async fn propose_project_candidate(
         .await?;
     let decision: CriticDecision = parse_json_response(&review, "learning critic")?;
     if decision.approved {
+        // The provider may judge content but never lifecycle. Rust validates the
+        // bounded Memory-only edit and deterministically advances it to canary.
+        candidate.status = CandidateStatus::Validated;
         candidate.status = CandidateStatus::Canary;
     } else {
         candidate.status = CandidateStatus::Quarantined;
@@ -313,10 +409,31 @@ pub async fn propose_project_candidate(
         });
     }
     save_candidate(&project_root, candidate.clone()).await?;
-    if candidate.status == CandidateStatus::Canary {
-        request_candidate_feedback(&project_root, candidate.id).await?;
-    }
     Ok(candidate)
+}
+
+/// Returns a single cluster that is sufficiently repeatable for provider
+/// synthesis. This is deterministic policy: a provider cannot select the data
+/// it is allowed to generalize from.
+fn qualified_cluster(state: &LearningState) -> Option<&LearningCluster> {
+    state.clusters.iter().find(|cluster| {
+        let evaluations = state
+            .evaluations
+            .iter()
+            .filter(|evaluation| evaluation.cluster_id == Some(cluster.id))
+            .collect::<Vec<_>>();
+        let strong_correction = evaluations.iter().any(|evaluation| {
+            evaluation.lesson_kind.as_deref() == Some("correction")
+                && evaluation.resolution.as_deref() == Some("validated")
+                && evaluation
+                    .human_correction_probability
+                    .is_some_and(|value| value >= 0.85)
+                && evaluation
+                    .categorical_confidence
+                    .is_some_and(|value| value >= 0.75)
+        });
+        strong_correction || cluster.task_aliases.len() >= 2
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,7 +578,12 @@ pub async fn load_learning_state(project_root: &Path) -> Result<LearningState> {
         return Ok(LearningState::default());
     }
     prepare_state_path(project_root, &path).await?;
-    let state = read_json(&path).await?.unwrap_or_default();
+    let mut state: LearningState = read_json(&path).await?.unwrap_or_default();
+    // Mimir is unlaunched: schema 2 has a compact, lossless in-place upgrade.
+    // Earlier/unknown schemas fail closed rather than guessing at local state.
+    if state.schema == 2 {
+        state.schema = LEARNING_SCHEMA_VERSION;
+    }
     validate_learning_state(&state)?;
     Ok(state)
 }
@@ -513,14 +635,6 @@ pub async fn set_contribution(workspace: &Path, enabled: bool) -> Result<Learnin
 pub async fn set_mode(workspace: &Path, mode: LearningMode) -> Result<LearningState> {
     let root = discover_project_root(workspace)?;
     ensure_project_marker(&root).await?;
-    if mode == LearningMode::Auto {
-        let state = load_learning_state(&root).await?;
-        if state.evidence.len() < OBSERVE_DOGFOOD_EVIDENCE {
-            return Err(MimirError::Configuration(format!(
-                "automatic project learning requires at least {OBSERVE_DOGFOOD_EVIDENCE} observe-only evidence records"
-            )));
-        }
-    }
     mutate_learning_state(&root, |state| state.mode = mode).await
 }
 
@@ -538,6 +652,237 @@ pub async fn record_evidence(
         }
     })
     .await
+}
+
+/// Records a verified result for candidates that were actually assembled into
+/// one logical task's harness context. Callers must never infer exposure from a
+/// candidate's current status; the supplied IDs are immutable task provenance.
+pub async fn record_attributed_outcome(
+    workspace: &Path,
+    session_id: &str,
+    exposed_candidate_ids: &[Uuid],
+    outcome: EvidenceOutcome,
+    signal: EvidenceSignal,
+) -> Result<LearningState> {
+    if exposed_candidate_ids.is_empty()
+        || !matches!(
+            outcome,
+            EvidenceOutcome::VerifiedSuccess | EvidenceOutcome::VerifiedFailure
+        )
+        || !matches!(
+            signal,
+            EvidenceSignal::ValidationGate | EvidenceSignal::Correction
+        )
+    {
+        return load_learning_state(&discover_project_root(workspace)?).await;
+    }
+    let root = discover_project_root(workspace)?;
+    ensure_project_marker(&root).await?;
+    let ids = exposed_candidate_ids.to_vec();
+    let session_alias = stable_alias(session_id);
+    mutate_learning_state(&root, move |state| {
+        let mut applied = Vec::new();
+        for candidate in state.candidates.iter_mut().filter(|candidate| {
+            ids.contains(&candidate.id)
+                && matches!(
+                    candidate.status,
+                    CandidateStatus::Canary | CandidateStatus::Active
+                )
+        }) {
+            candidate.canary_outcomes.push(outcome);
+            candidate.updated_at = Utc::now();
+            update_candidate_status(candidate);
+            applied.push(candidate.id);
+        }
+        if !applied.is_empty() {
+            state.evidence.push(LearningEvidence {
+                id: Uuid::new_v4(),
+                created_at: Utc::now(),
+                session_alias,
+                outcome,
+                signal,
+                task_fingerprint: stable_alias("attributed-outcome"),
+                diagnostic_run_id: None,
+                metrics: BTreeMap::new(),
+                note: None,
+                exposed_candidate_ids: applied,
+            });
+            trim_front(&mut state.evidence, MAX_EVIDENCE);
+        }
+    })
+    .await
+}
+
+/// Enqueues a completed logical task by record references only. Queue failures
+/// are returned to the caller so foreground dispatch can intentionally ignore
+/// them; no transcript is copied into learning storage.
+pub async fn enqueue_completed_task(
+    workspace: &Path,
+    session_id: &str,
+    first_record_id: Uuid,
+    last_record_id: Uuid,
+    exposed_candidate_ids: Vec<Uuid>,
+) -> Result<jobs::LearningJob> {
+    let root = discover_project_root(workspace)?;
+    ensure_project_marker(&root).await?;
+    jobs::enqueue(
+        &root,
+        session_id,
+        first_record_id,
+        last_record_id,
+        exposed_candidate_ids,
+    )
+    .await
+}
+
+/// Opportunistically processes one queued evaluation. Service, projection, and
+/// persistence failures are isolated to the job and never alter task success.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one queue claim, projection, typed evaluation, and durable commit transaction"
+)]
+pub async fn process_one_learning_job(
+    runtime: &AgentRuntime,
+    workspace: &Path,
+    state_root: &Path,
+) -> Result<bool> {
+    let root = discover_project_root(workspace)?;
+    let Some(job) = jobs::claim(&root).await? else {
+        return Ok(false);
+    };
+    let result = async {
+        let session_root = project_session_root(state_root, &root)?;
+        let store = FileSessionStore::create(&session_root, &job.session_id).await?;
+        let records = store.load().await?.records;
+        let projection = projection::project_records(
+            &job.session_id,
+            &records,
+            job.first_record_id,
+            job.last_record_id,
+            root.to_str(),
+            job.exposed_candidate_ids.clone(),
+        )
+        .ok_or_else(|| {
+            MimirError::Configuration("queued learning record span is unavailable".into())
+        })?;
+        let state = load_learning_state(&root).await?;
+        if state.mode == LearningMode::Off {
+            return Ok(());
+        }
+        let options = state
+            .clusters
+            .iter()
+            .take(32)
+            .map(|cluster| cluster.summary.clone())
+            .collect::<Vec<_>>();
+        let evaluation = runtime
+            .evaluate_learning(&serde_json::to_value(&projection)?, &options)
+            .await;
+        let attributed_outcome = automatic_attributed_outcome(&evaluation, &projection);
+        let outcome_session_id = job.session_id.clone();
+        let outcome_candidate_ids = job.exposed_candidate_ids.clone();
+        let disposition = policy::disposition(&evaluation);
+        let updated = mutate_learning_state(&root, move |state| {
+            let evaluation_id = Uuid::new_v4();
+            let task_alias = stable_alias(&job.session_id);
+            let cluster_id = match disposition {
+                policy::EvaluationDisposition::Discard => None,
+                policy::EvaluationDisposition::MatchCluster => state
+                    .clusters
+                    .iter_mut()
+                    .find(|cluster| {
+                        Some(cluster.summary.as_str()) == evaluation.cluster_match.as_deref()
+                    })
+                    .map(|cluster| {
+                        cluster.evaluation_ids.push(evaluation_id);
+                        if !cluster.task_aliases.contains(&task_alias) {
+                            cluster.task_aliases.push(task_alias.clone());
+                        }
+                        cluster.id
+                    }),
+                policy::EvaluationDisposition::NewCluster => {
+                    let id = Uuid::new_v4();
+                    state.clusters.push(LearningCluster {
+                        id,
+                        created_at: Utc::now(),
+                        summary: format!(
+                            "{}: {}",
+                            evaluation.lesson_kind.clone().unwrap_or_default(),
+                            evaluation.scope.clone().unwrap_or_default()
+                        ),
+                        lesson_kind: evaluation
+                            .lesson_kind
+                            .clone()
+                            .unwrap_or_else(|| "none".into()),
+                        evaluation_ids: vec![evaluation_id],
+                        task_aliases: vec![task_alias.clone()],
+                    });
+                    Some(id)
+                }
+            };
+            state.evaluations.push(LearningEvaluation {
+                id: evaluation_id,
+                created_at: Utc::now(),
+                session_alias: stable_alias(&job.session_id),
+                first_record_id: job.first_record_id,
+                last_record_id: job.last_record_id,
+                rubric_hash: evaluation.rubric_hash,
+                model: evaluation.model,
+                input_tokens: evaluation.input_tokens,
+                output_tokens: evaluation.output_tokens,
+                latency_ms: evaluation.latency_ms,
+                lesson_kind: evaluation.lesson_kind,
+                resolution: evaluation.resolution,
+                scope: evaluation.scope,
+                reuse_value: evaluation.reuse_value,
+                overfit_risk: evaluation.overfit_risk,
+                human_correction_probability: evaluation.human_correction_probability,
+                categorical_confidence: evaluation.categorical_confidence,
+                cluster_id,
+                exposed_candidate_ids: job.exposed_candidate_ids,
+            });
+            trim_front(&mut state.evaluations, MAX_EVIDENCE);
+        })
+        .await?;
+        // Synthesis is an optional second background step. Evaluation has
+        // already been durably committed, so a provider outage cannot cause a
+        // task to be retried or lose its bounded observation.
+        if updated.mode == LearningMode::Auto && qualified_cluster(&updated).is_some() {
+            let _ = propose_project_candidate(runtime, &root).await;
+        }
+        if let Some((outcome, signal)) = attributed_outcome {
+            let _ = record_attributed_outcome(
+                &root,
+                &outcome_session_id,
+                &outcome_candidate_ids,
+                outcome,
+                signal,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    jobs::complete(&root, job.id, result.is_ok()).await?;
+    result.map(|()| true)
+}
+
+fn automatic_attributed_outcome(
+    evaluation: &crate::typesafe::TypeSafeLearningEvaluation,
+    projection: &projection::LogicalTaskProjection,
+) -> Option<(EvidenceOutcome, EvidenceSignal)> {
+    if projection.exposed_candidate_ids.is_empty() {
+        return None;
+    }
+    if policy::correction_is_strong(evaluation) {
+        return Some((EvidenceOutcome::VerifiedFailure, EvidenceSignal::Correction));
+    }
+    (evaluation.resolution.as_deref() == Some("validated")
+        && !projection.validation_evidence.is_empty())
+    .then_some((
+        EvidenceOutcome::VerifiedSuccess,
+        EvidenceSignal::ValidationGate,
+    ))
 }
 
 pub async fn record_diagnostic_evidence(
@@ -573,6 +918,7 @@ pub async fn record_diagnostic_evidence(
         diagnostic_run_id: Some(summary.run_id),
         metrics,
         note: None,
+        exposed_candidate_ids: Vec::new(),
     };
     mutate_learning_state(&root, move |state| {
         if state.mode == LearningMode::Off
@@ -585,20 +931,6 @@ pub async fn record_diagnostic_evidence(
         }
         state.evidence.push(evidence.clone());
         trim_front(&mut state.evidence, MAX_EVIDENCE);
-        if let Some(candidate) = state
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.status == CandidateStatus::Canary)
-        {
-            if outcome == EvidenceOutcome::VerifiedFailure {
-                candidate.canary_outcomes.push(outcome);
-                candidate.evidence_ids.push(evidence.id);
-                candidate.updated_at = Utc::now();
-                update_candidate_status(candidate);
-            } else if outcome == EvidenceOutcome::Ambiguous {
-                state.feedback_requested_for = Some(candidate.id);
-            }
-        }
     })
     .await
 }
@@ -616,6 +948,7 @@ pub async fn record_runtime_failure(workspace: &Path, session_id: &str) -> Resul
         diagnostic_run_id: None,
         metrics: BTreeMap::new(),
         note: None,
+        exposed_candidate_ids: Vec::new(),
     };
     mutate_learning_state(&root, move |state| {
         if state.mode == LearningMode::Off {
@@ -623,21 +956,6 @@ pub async fn record_runtime_failure(workspace: &Path, session_id: &str) -> Resul
         }
         state.evidence.push(evidence.clone());
         trim_front(&mut state.evidence, MAX_EVIDENCE);
-        if let Some(candidate) = state
-            .candidates
-            .iter_mut()
-            .find(|candidate| candidate.status == CandidateStatus::Canary)
-        {
-            candidate
-                .canary_outcomes
-                .push(EvidenceOutcome::VerifiedFailure);
-            candidate.evidence_ids.push(evidence.id);
-            candidate.updated_at = Utc::now();
-            update_candidate_status(candidate);
-            if state.feedback_requested_for == Some(candidate.id) {
-                state.feedback_requested_for = None;
-            }
-        }
     })
     .await
 }
@@ -673,6 +991,7 @@ pub async fn record_feedback(
             diagnostic_run_id: None,
             metrics: BTreeMap::new(),
             note,
+            exposed_candidate_ids: target.into_iter().collect(),
         };
         state.evidence.push(evidence.clone());
         trim_front(&mut state.evidence, MAX_EVIDENCE);
@@ -733,22 +1052,14 @@ pub async fn request_candidate_feedback(
     .await
 }
 
-pub async fn request_feedback_if_informative(workspace: &Path) -> Result<bool> {
-    let root = discover_project_root(workspace)?;
-    let state = load_learning_state(&root).await?;
-    if state.mode == LearningMode::Off || state.feedback_requested_for.is_some() {
-        return Ok(state.feedback_requested_for.is_some());
-    }
-    let Some(candidate_id) = state
-        .candidates
-        .iter()
-        .find(|candidate| candidate.status == CandidateStatus::Canary)
-        .map(|candidate| candidate.id)
-    else {
-        return Ok(false);
-    };
-    request_candidate_feedback(&root, candidate_id).await?;
-    Ok(true)
+/// Automatic feedback prompts are intentionally absent. `/learn feedback` is
+/// retained as an explicit manual override for users who choose to provide it.
+#[allow(
+    clippy::unused_async,
+    reason = "keeps the existing TUI command contract stable"
+)]
+pub async fn request_feedback_if_informative(_workspace: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 pub async fn rollback_candidate(workspace: &Path, candidate_id: Uuid) -> Result<LearningState> {
@@ -779,6 +1090,7 @@ pub async fn rollback_candidate(workspace: &Path, candidate_id: Uuid) -> Result<
                 diagnostic_run_id: None,
                 metrics: BTreeMap::new(),
                 note: None,
+                exposed_candidate_ids: vec![candidate_id],
             });
             trim_front(&mut state.evidence, MAX_EVIDENCE);
         }
@@ -1128,39 +1440,15 @@ fn validate_candidate(candidate: &LearningCandidate) -> Result<()> {
         ));
     }
     for edit in &candidate.edits {
-        if edit.kind == RefinementKind::Unknown {
+        if edit.kind != RefinementKind::Memory {
             return Err(MimirError::Configuration(
-                "learning candidate contains an unknown refinement kind".into(),
+                "generated learning candidates may only contain bounded Memory edits".into(),
             ));
         }
         if edit.id.as_deref() == Some("base_system_prompt") {
             return Err(MimirError::Configuration(
                 "learning candidates cannot edit the base system prompt".into(),
             ));
-        }
-        if edit.kind == RefinementKind::Skill
-            && edit.action != crate::refinement::RefinementAction::Delete
-        {
-            let reference = edit.reference.as_ref().ok_or_else(|| {
-                MimirError::Configuration("learned skills require an existing reference".into())
-            })?;
-            if reference.get("type").and_then(serde_json::Value::as_str) != Some("python")
-                || reference
-                    .get("import")
-                    .or_else(|| reference.get("python_import"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-                || reference
-                    .get("callable")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-                || edit.arguments.is_none()
-            {
-                return Err(MimirError::Configuration(
-                    "learned skills require an existing Python import, callable, and argument map"
-                        .into(),
-                ));
-            }
         }
         let serialized = serde_json::to_string(edit)?;
         let forbidden = [
@@ -1289,6 +1577,9 @@ async fn mutate_learning_state(
     let _guard = lock.lock().await;
     let _process_guard = CrossProcessLock::acquire(&path).await?;
     let mut state: LearningState = read_json(&path).await?.unwrap_or_default();
+    if state.schema == 2 {
+        state.schema = LEARNING_SCHEMA_VERSION;
+    }
     validate_learning_state(&state)?;
     mutate(&mut state);
     state.schema = LEARNING_SCHEMA_VERSION;

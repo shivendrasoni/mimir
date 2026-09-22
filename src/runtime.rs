@@ -352,6 +352,7 @@ pub struct AgentRuntime {
     config: RuntimeConfig,
     operational_budget: StdMutex<Budget>,
     harness_context: RwLock<String>,
+    harness_candidate_ids: RwLock<Vec<uuid::Uuid>>,
     messages: Mutex<Vec<Message>>,
     steering: Mutex<VecDeque<Message>>,
     steering_mode: Mutex<QueueMode>,
@@ -528,6 +529,7 @@ impl AgentRuntime {
             config,
             operational_budget: StdMutex::new(operational_budget),
             harness_context: RwLock::new(String::new()),
+            harness_candidate_ids: RwLock::new(Vec::new()),
             messages: Mutex::new(messages),
             steering: Mutex::new(VecDeque::new()),
             steering_mode: Mutex::new(QueueMode::default()),
@@ -786,6 +788,20 @@ impl AgentRuntime {
     #[doc(hidden)]
     pub async fn attach_typesafe_skill_selector(&self, selector: TypeSafeSkillSelector) {
         *self.typesafe_skill_selector.write().await = Arc::new(selector);
+    }
+
+    /// Runs a bounded post-run Jev judgment. Callers must keep it off the
+    /// foreground provider path and treat unavailable results as a no-op.
+    pub async fn evaluate_learning(
+        &self,
+        projection: &serde_json::Value,
+        cluster_options: &[String],
+    ) -> crate::typesafe::TypeSafeLearningEvaluation {
+        self.typesafe_skill_selector
+            .read()
+            .await
+            .evaluate_learning(projection, cluster_options)
+            .await
     }
 
     pub async fn extension_manager(&self) -> Option<Arc<ExtensionManager>> {
@@ -1503,6 +1519,23 @@ impl AgentRuntime {
     /// provider turns. Persistence is owned by the refinement store.
     pub async fn set_harness_context(&self, context: String) {
         *self.harness_context.write().await = context;
+        self.harness_candidate_ids.write().await.clear();
+    }
+
+    /// Replaces context and records only candidate entries that were actually
+    /// assembled into it. This provenance is consumed by post-run learning.
+    pub async fn set_harness_context_with_candidates(
+        &self,
+        context: String,
+        candidate_ids: Vec<uuid::Uuid>,
+    ) {
+        *self.harness_context.write().await = context;
+        *self.harness_candidate_ids.write().await = candidate_ids;
+    }
+
+    /// Returns the candidate IDs included in the current assembled harness.
+    pub async fn harness_candidate_ids(&self) -> Vec<uuid::Uuid> {
+        self.harness_candidate_ids.read().await.clone()
     }
 
     /// Manually summarizes older context and atomically checkpoints the retained

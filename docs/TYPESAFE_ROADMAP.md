@@ -15,7 +15,7 @@ recommendation with Mimir's current behavior as the fallback.
 
 Do not build a general TypeSafe framework. Phase 3 adds only the measured
 tool/MCP shortlisting bet; model routing, verification, guardrails, continual
-learning, and orchestration remain out of scope.
+The completed next increment adds semantic continual learning: a reference-only local queue, typed Jev evaluation, hard Rust policy gates, and Memory-only candidate synthesis. It remains shadow/observe-first; generated executable playbooks remain out of scope.
 
 ## Rules
 

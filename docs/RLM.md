@@ -20,7 +20,7 @@ Undo a recorded update with:
 
 Initialize project learning with `mimir learning init`, then inspect or change it with `mimir learning status`, `mimir learning mode observe|auto|off`, or `/learn`.
 
-Observe-only is the default. Auto mode unlocks after three observed evidence records, and auto candidates need three applicable verified successes before activation; a verified failure quarantines them. Fleet contribution is separately opt-in.
+With `TYPESAFE_API_KEY`, the local learning lifecycle is automatic; `--typesafe off` makes the Jev path inert immediately. Candidates still need three applicable attributed verified successes before activation, while an attributed verified failure quarantines them. Fleet contribution is separately opt-in.
 
 See [Continual learning](CONTINUAL_LEARNING.md) for the storage, trust, privacy, rollout, and rollback contract.
 

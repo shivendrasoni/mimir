@@ -1,0 +1,55 @@
+{
+  "schema": 2,
+  "description": "Offline, redacted logical-task cases for deterministic continual-learning policy tests.",
+  "cases": [
+    {
+      "id": "correction-qualified",
+      "category": "human_correction",
+      "projection": {"messages":[{"role":"user","text":"Do not use the old endpoint; this project requires v2."}],"validation_evidence":["quality_gate: passed"]},
+      "evaluation": {"lesson_kind":"correction","resolution":"validated","reuse_value":0.92,"overfit_risk":0.08,"human_correction_probability":0.95,"categorical_confidence":0.93},
+      "expected": { "disposition": "new_cluster", "attributed_outcome":"verified_failure" }
+    },
+    {
+      "id": "repeated-debugging-pattern",
+      "category": "debugging_pattern",
+      "projection": {"messages":[{"role":"assistant","text":"Refreshing the manifest fixed the repeated parser error."}],"validation_evidence":[]},
+      "evaluation": {"lesson_kind":"debugging_pattern","resolution":"observed","reuse_value":0.82,"overfit_risk":0.18,"categorical_confidence":0.88},
+      "expected": { "disposition": "new_cluster", "attributed_outcome":"neutral" }
+    },
+    {
+      "id": "one-off-feature-request",
+      "category": "false_positive_rejection",
+      "projection": {"messages":[{"role":"user","text":"Rename this one button for this launch."}],"validation_evidence":[]},
+      "evaluation": {"lesson_kind":"none","resolution":"claimed","reuse_value":0.12,"overfit_risk":0.79,"categorical_confidence":0.91},
+      "expected": { "disposition": "discard", "attributed_outcome":"neutral" }
+    },
+    {
+      "id": "secret-bearing-tool-output",
+      "category": "privacy_redaction",
+      "projection": {"tool_events":[{"name":"deploy","result":"Bearer [REDACTED_CREDENTIAL] failed"}],"messages":[],"validation_evidence":[]},
+      "evaluation": {"lesson_kind":"none","resolution":"unresolved","reuse_value":0.0,"overfit_risk":1.0,"categorical_confidence":0.9},
+      "expected": { "disposition": "discard", "must_not_contain":["sk-live","Bearer token"] }
+    },
+    {
+      "id": "partial-resolution",
+      "category": "incomplete_task",
+      "projection": {"messages":[{"role":"assistant","text":"The test is still failing and no validator completed."}],"validation_evidence":[]},
+      "evaluation": {"lesson_kind":"workflow","resolution":"unresolved","reuse_value":0.8,"overfit_risk":0.2,"categorical_confidence":0.88},
+      "expected": { "disposition": "discard", "attributed_outcome":"neutral" }
+    },
+    {
+      "id": "candidate-canary-regression",
+      "category": "attributed_failure",
+      "projection": {"messages":[{"role":"user","text":"That learned instruction is wrong here; use the project validator."}],"validation_evidence":[]},
+      "evaluation": {"lesson_kind":"correction","resolution":"validated","reuse_value":0.9,"overfit_risk":0.1,"human_correction_probability":0.96,"categorical_confidence":0.9},
+      "expected": { "disposition":"new_cluster", "candidate_status": "quarantined", "requires_exposure":true }
+    },
+    {
+      "id": "three-attributed-successes",
+      "category": "promotion",
+      "projection": {"messages":[{"role":"assistant","text":"Project quality gate passed."}],"validation_evidence":["quality_gate: passed"]},
+      "evaluation": {"lesson_kind":"workflow","resolution":"validated","reuse_value":0.88,"overfit_risk":0.12,"categorical_confidence":0.9},
+      "expected": { "disposition":"new_cluster", "candidate_status": "active", "required_successes": 3, "requires_exposure":true }
+    }
+  ]
+}

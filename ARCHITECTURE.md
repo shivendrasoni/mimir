@@ -44,7 +44,7 @@
 - Auth and imported credential files are owner-readable only on Unix.
 - Daemon metadata persists timestamps and lease state but not raw prompt text.
 - Diagnostics are separate from transcripts and contain metadata only; raw prompts, model/tool payloads, environment values, credentials, and absolute host paths are excluded.
-- TypeSafe is off by default and has no policy authority. When on, it can only recommend one discovered skill; explicit skill selection wins, confidence gates remain in Rust, and failure preserves the ordinary runtime path.
+- TypeSafe has no policy authority. With credentials it is automatically available unless explicitly off; it can recommend a skill/tool pool during a turn and type a bounded post-run task projection. Confidence gates, queue claims/retries, clustering, candidate lifecycle, permission checks, canary attribution, and rollback remain in Rust; service failure preserves the ordinary runtime path.
 - Daemon IPC frames are capped at 1 MiB, and shutdown cancels in-flight connection tasks before reporting completion.
 - A corrupt incomplete final JSONL record is recoverable; interior corruption is not silently ignored.
 - Provider and tool activity is bounded by budgets, response sizes, timeouts, and concurrency admission.

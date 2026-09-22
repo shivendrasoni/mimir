@@ -13,11 +13,70 @@ use mimir::{
         RefinementEdit, RefinementKind,
     },
     session::{FileSessionStore, SessionPayload, SessionRecord, SessionStore},
+    typesafe::{TypeSafeLearningEvaluation, TypeSafeRecommendationStatus},
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[test]
+fn continual_learning_benchmark_has_representative_inputs_and_policy_expectations() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../benchmarks/continual-learning/fixtures.json"
+    ))
+    .expect("benchmark fixture JSON");
+    let cases = fixture["cases"].as_array().expect("benchmark cases");
+    let categories = cases
+        .iter()
+        .filter_map(|case| case["category"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for required in [
+        "human_correction",
+        "debugging_pattern",
+        "false_positive_rejection",
+        "privacy_redaction",
+        "incomplete_task",
+        "attributed_failure",
+        "promotion",
+    ] {
+        assert!(
+            categories.contains(required),
+            "missing benchmark case: {required}"
+        );
+    }
+    for case in cases {
+        assert!(case["projection"].is_object(), "missing projection: {case}");
+        assert!(case["evaluation"].is_object(), "missing evaluation: {case}");
+        let evaluation = &case["evaluation"];
+        let typed = TypeSafeLearningEvaluation {
+            status: TypeSafeRecommendationStatus::Success,
+            lesson_kind: evaluation["lesson_kind"].as_str().map(str::to_owned),
+            resolution: evaluation["resolution"].as_str().map(str::to_owned),
+            scope: Some("project".into()),
+            cluster_match: Some("none".into()),
+            reuse_value: evaluation["reuse_value"].as_f64(),
+            overfit_risk: evaluation["overfit_risk"].as_f64(),
+            human_correction_probability: evaluation["human_correction_probability"].as_f64(),
+            categorical_confidence: evaluation["categorical_confidence"].as_f64(),
+            model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: 0,
+            rubric_hash: "fixture".into(),
+            error_kind: None,
+        };
+        let expected = case["expected"]["disposition"]
+            .as_str()
+            .expect("disposition");
+        let actual = match learning::policy::disposition(&typed) {
+            learning::policy::EvaluationDisposition::Discard => "discard",
+            learning::policy::EvaluationDisposition::NewCluster => "new_cluster",
+            learning::policy::EvaluationDisposition::MatchCluster => "match_cluster",
+        };
+        assert_eq!(actual, expected, "fixture policy: {}", case["id"]);
+    }
+}
 
 fn memory_edit(id: &str, content: &str) -> RefinementEdit {
     RefinementEdit {
@@ -67,6 +126,7 @@ fn candidate(id: Uuid) -> LearningCandidate {
             "Run the project gate.",
         )],
         evidence_ids: Vec::new(),
+        source_cluster_id: None,
         canary_outcomes: Vec::new(),
         canary_runs_required: learning::PROJECT_CANARY_RUNS,
         rejection_reason: None,
@@ -426,7 +486,90 @@ async fn feedback_promotes_after_three_successes_and_quarantines_on_failure() {
 }
 
 #[tokio::test]
-async fn runtime_failure_quarantines_the_current_canary_and_recovers_orphan_lock() {
+async fn attributed_validation_promotes_and_correction_quarantines_without_feedback() {
+    let project = TempDir::new().expect("project");
+    learning::initialize_project(project.path())
+        .await
+        .expect("initialize");
+    let promoted = Uuid::new_v4();
+    learning::save_candidate(project.path(), candidate(promoted))
+        .await
+        .expect("candidate");
+    // No provenance means a genuine validation signal remains neutral.
+    learning::record_attributed_outcome(
+        project.path(),
+        "main",
+        &[],
+        EvidenceOutcome::VerifiedSuccess,
+        EvidenceSignal::ValidationGate,
+    )
+    .await
+    .expect("neutral unexposed result");
+    for _ in 0..3 {
+        learning::record_attributed_outcome(
+            project.path(),
+            "main",
+            &[promoted],
+            EvidenceOutcome::VerifiedSuccess,
+            EvidenceSignal::ValidationGate,
+        )
+        .await
+        .expect("attributed validation");
+    }
+    let root = learning::discover_project_root(project.path()).expect("root");
+    let state = learning::load_learning_state(&root).await.expect("state");
+    assert_eq!(state.candidates[0].status, CandidateStatus::Active);
+
+    let failed = Uuid::new_v4();
+    learning::save_candidate(project.path(), candidate(failed))
+        .await
+        .expect("candidate");
+    learning::record_attributed_outcome(
+        project.path(),
+        "main",
+        &[failed],
+        EvidenceOutcome::VerifiedFailure,
+        EvidenceSignal::Correction,
+    )
+    .await
+    .expect("attributed correction");
+    let state = learning::load_learning_state(&root).await.expect("state");
+    assert_eq!(
+        state
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == failed)
+            .expect("failed candidate")
+            .status,
+        CandidateStatus::Quarantined
+    );
+}
+
+#[tokio::test]
+async fn harness_provenance_includes_only_candidate_entries_that_fit_context() {
+    let project = TempDir::new().expect("project");
+    let state = TempDir::new().expect("state");
+    learning::initialize_project(project.path())
+        .await
+        .expect("initialize");
+    let id = Uuid::new_v4();
+    learning::save_candidate(project.path(), candidate(id))
+        .await
+        .expect("candidate");
+    let assembled = refinement::load_harness_context_with_provenance(
+        state.path(),
+        project.path(),
+        "main",
+        None,
+    )
+    .await
+    .expect("assembled context");
+    assert!(assembled.text.contains("Run the project gate"));
+    assert_eq!(assembled.exposed_candidate_ids, vec![id]);
+}
+
+#[tokio::test]
+async fn unexposed_runtime_failure_is_diagnostic_only_and_recovers_orphan_lock() {
     let project = TempDir::new().expect("project");
     learning::initialize_project(project.path())
         .await
@@ -440,19 +583,19 @@ async fn runtime_failure_quarantines_the_current_canary_and_recovers_orphan_lock
     let state = learning::record_runtime_failure(project.path(), "main")
         .await
         .expect("failure evidence");
-    assert_eq!(state.candidates[0].status, CandidateStatus::Quarantined);
+    assert_eq!(state.candidates[0].status, CandidateStatus::Canary);
     assert!(!lock.exists());
 }
 
 #[tokio::test]
-async fn candidates_support_every_refinement_kind_and_reject_generated_skills() {
+async fn generated_candidates_are_limited_to_memory_refinements() {
     let project = TempDir::new().expect("project");
     let state = TempDir::new().expect("state");
     learning::initialize_project(project.path())
         .await
         .expect("initialize");
     let mut proposal = candidate(Uuid::new_v4());
-    proposal.edits = vec![
+    let executable_or_broad_edits = vec![
         RefinementEdit {
             kind: RefinementKind::Prompt,
             ..memory_edit("prompt", "Prompt guidance")
@@ -473,29 +616,21 @@ async fn candidates_support_every_refinement_kind_and_reject_generated_skills() 
             ..memory_edit("skill", "Use the existing validator")
         },
     ];
+    proposal.edits = executable_or_broad_edits;
+    assert!(
+        learning::save_candidate(project.path(), proposal.clone())
+            .await
+            .is_err()
+    );
+    proposal.edits = vec![memory_edit("memory", "Memory guidance")];
     learning::save_candidate(project.path(), proposal.clone())
         .await
-        .expect("all kinds");
+        .expect("memory only");
     let context =
         refinement::load_harness_context_for_workspace(state.path(), project.path(), "main", None)
             .await
             .expect("context");
-    for expected in [
-        "Prompt guidance",
-        "Memory guidance",
-        "Subagent specification",
-        "existing.module",
-    ] {
-        assert!(context.contains(expected), "missing {expected}");
-    }
-
-    proposal.id = Uuid::new_v4();
-    proposal.edits[3].reference = None;
-    assert!(
-        learning::save_candidate(project.path(), proposal)
-            .await
-            .is_err()
-    );
+    assert!(context.contains("Memory guidance"));
 
     let mut deletion = candidate(Uuid::new_v4());
     deletion.edits = vec![RefinementEdit {
@@ -534,6 +669,7 @@ async fn concurrent_evidence_writes_are_serialized_and_bounded() {
                     diagnostic_run_id: None,
                     metrics: BTreeMap::new(),
                     note: None,
+                    exposed_candidate_ids: Vec::new(),
                 },
             )
             .await
@@ -563,6 +699,7 @@ fn contribution_is_structurally_redacted_and_rejects_sensitive_summary() {
         diagnostic_run_id: None,
         metrics: BTreeMap::new(),
         note: Some("raw private observation".into()),
+        exposed_candidate_ids: vec![id],
     };
     proposal.evidence_ids.push(evidence.id);
     proposal.rationale = "raw user prompt with authorization: Bearer credential".into();
@@ -766,7 +903,7 @@ async fn symlinked_project_marker_is_rejected() {
 }
 
 #[tokio::test]
-async fn observe_is_default_and_contribution_is_opt_in() {
+async fn learning_is_automatic_when_available_and_contribution_is_opt_in() {
     let project = TempDir::new().expect("project");
     let state = TempDir::new().expect("state");
     learning::initialize_project(project.path())
@@ -775,35 +912,12 @@ async fn observe_is_default_and_contribution_is_opt_in() {
     let status = learning::learning_status(project.path(), state.path())
         .await
         .expect("status");
-    assert_eq!(status.mode, LearningMode::Observe);
+    assert_eq!(status.mode, LearningMode::Auto);
     assert!(!status.contribution_enabled);
-    assert!(
-        learning::set_mode(project.path(), LearningMode::Auto)
-            .await
-            .is_err()
-    );
-    for index in 0..learning::OBSERVE_DOGFOOD_EVIDENCE {
-        learning::record_evidence(
-            project.path(),
-            LearningEvidence {
-                id: Uuid::new_v4(),
-                created_at: Utc::now(),
-                session_alias: format!("observe-{index}"),
-                outcome: EvidenceOutcome::Ambiguous,
-                signal: EvidenceSignal::Diagnostic,
-                task_fingerprint: format!("task-{index}"),
-                diagnostic_run_id: None,
-                metrics: BTreeMap::new(),
-                note: None,
-            },
-        )
-        .await
-        .expect("observe evidence");
-    }
     assert_eq!(
         learning::set_mode(project.path(), LearningMode::Auto)
             .await
-            .expect("auto after dogfood")
+            .expect("auto remains explicit opt-in/out controllable")
             .mode,
         LearningMode::Auto
     );

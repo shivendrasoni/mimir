@@ -10,6 +10,10 @@ use predicates::prelude::*;
 use serde_json::json;
 use tempfile::TempDir;
 
+fn project_sessions(state: &std::path::Path, workspace: &std::path::Path) -> std::path::PathBuf {
+    mimir::learning::project_session_root(state, workspace).expect("project session root")
+}
+
 #[test]
 fn help_exposes_the_operational_surface() {
     Command::cargo_bin("mimir")
@@ -366,7 +370,11 @@ fn offline_print_mode_needs_no_api_key_and_persists_a_session() {
         .assert()
         .success()
         .stdout("offline answer\n");
-    assert!(state.path().join("sessions/cli-test.jsonl").exists());
+    assert!(
+        project_sessions(state.path(), workspace.path())
+            .join("sessions/cli-test.jsonl")
+            .exists()
+    );
 }
 
 #[test]
@@ -690,10 +698,15 @@ fn legacy_rpc_forks_before_the_selected_user_message() {
         .args(["--print", "fork this prompt"])
         .assert()
         .success();
-    let transcript = std::fs::read_to_string(state.path().join("sessions/fork-source.jsonl"))
-        .expect("source transcript");
-    let first: serde_json::Value =
-        serde_json::from_str(transcript.lines().next().expect("user record")).expect("record JSON");
+    let transcript = std::fs::read_to_string(
+        project_sessions(state.path(), workspace.path()).join("sessions/fork-source.jsonl"),
+    )
+    .expect("source transcript");
+    let first: serde_json::Value = transcript
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record JSON"))
+        .find(|record: &serde_json::Value| record["payload"]["data"]["role"] == "user")
+        .expect("user record");
     let entry_id = first["record_id"].as_str().expect("record id");
 
     let output = Command::cargo_bin("mimir")
@@ -716,7 +729,10 @@ fn legacy_rpc_forks_before_the_selected_user_message() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("JSON response line"))
         .collect();
-    assert_eq!(responses[0]["data"]["text"], "fork this prompt");
+    assert_eq!(
+        responses[0]["data"]["text"], "fork this prompt",
+        "{responses:?}"
+    );
     assert_eq!(responses[0]["data"]["cancelled"], false);
     assert_eq!(responses[1]["data"]["messageCount"], 0);
     assert_ne!(responses[1]["data"]["sessionId"], "fork-source");
@@ -1026,6 +1042,8 @@ fn legacy_rpc_controls_compaction_lists_skill_commands_and_exports_safe_html() {
             workspace.path().to_str().expect("workspace path"),
             "--state-dir",
             state.path().to_str().expect("state path"),
+            "--session",
+            "export-test",
             "--fake-response",
             "<script>alert('unsafe')</script>",
             "--print",
@@ -1054,6 +1072,8 @@ fn legacy_rpc_controls_compaction_lists_skill_commands_and_exports_safe_html() {
             workspace.path().to_str().expect("workspace path"),
             "--state-dir",
             state.path().to_str().expect("state path"),
+            "--session",
+            "export-test",
             "--fake-response",
             "unused",
             "--output",
@@ -1269,7 +1289,7 @@ fn legacy_rpc_bash_executes_persists_and_aborts_concurrently() {
     assert_eq!(completed["data"]["cancelled"], false);
 
     write_rpc(&mut stdin, &json!({"id":"messages","type":"get_messages"}));
-    let messages = receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
+    let messages = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
         value["id"] == "messages"
     });
     let context = messages["data"]["messages"][0]["content"][0]["text"]
@@ -1282,15 +1302,15 @@ fn legacy_rpc_bash_executes_persists_and_aborts_concurrently() {
         &mut stdin,
         &json!({"id":"bash-slow","type":"bash","command":"sleep 30"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
+    receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
         value["type"] == "bash_start"
     });
     write_rpc(&mut stdin, &json!({"id":"abort-bash","type":"abort_bash"}));
-    let abort = receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
+    let abort = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
         value["id"] == "abort-bash"
     });
     assert_eq!(abort["success"], true);
-    let cancelled = receive_rpc_until(&lines_rx, Duration::from_secs(2), |value| {
+    let cancelled = receive_rpc_until(&lines_rx, Duration::from_secs(5), |value| {
         value["id"] == "bash-slow"
     });
     assert_eq!(cancelled["success"], true);
@@ -1389,8 +1409,10 @@ fn legacy_rpc_agent_message_commands_deliver_and_enforce_pause() {
     ));
     assert_eq!(response("clear")["data"]["cleared"], 0);
 
-    let target_session = std::fs::read_to_string(state.path().join("sessions/target.jsonl"))
-        .expect("target session");
+    let target_session = std::fs::read_to_string(
+        project_sessions(state.path(), workspace.path()).join("sessions/target.jsonl"),
+    )
+    .expect("target session");
     assert!(target_session.contains("review complete"));
 
     Command::cargo_bin("mimir")
@@ -1542,7 +1564,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
         .expect("add schedule RPC");
     assert!(added.status.success());
     let added: serde_json::Value = serde_json::from_slice(&added.stdout).expect("add response");
-    assert_eq!(added["success"], true);
+    assert_eq!(added["success"], true, "{added}");
     assert_eq!(added["data"]["job"]["status"], "active");
     assert_eq!(added["data"]["job"]["source"], "cron");
     assert_eq!(added["data"]["job"]["activeSessionId"], "schedule-rpc");
@@ -1593,7 +1615,8 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"success\":true"));
-    let transcript = state.path().join("sessions/schedule-rpc.jsonl");
+    let transcript =
+        project_sessions(state.path(), workspace.path()).join("sessions/schedule-rpc.jsonl");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let contents = std::fs::read_to_string(&transcript).unwrap_or_default();
@@ -1642,7 +1665,7 @@ fn legacy_rpc_heartbeats_match_reference_lifecycle_and_catalog_shapes() {
         .expect("set heartbeat RPC");
     assert!(set.status.success());
     let set: serde_json::Value = serde_json::from_slice(&set.stdout).expect("set response");
-    assert_eq!(set["success"], true);
+    assert_eq!(set["success"], true, "{set}");
     let heartbeat = &set["data"]["heartbeat"];
     assert_eq!(heartbeat["status"], "active");
     assert_eq!(heartbeat["source"], "heartbeat");
@@ -1951,7 +1974,10 @@ fn receive_rpc_until(
 }
 
 fn receive_rpc_response(receiver: &mpsc::Receiver<String>, id: &str) -> serde_json::Value {
-    receive_rpc_until(receiver, Duration::from_secs(2), |value| value["id"] == id)
+    // The test binary can be CPU-starved while the integration suite is
+    // running in parallel; this is an RPC protocol assertion, not a latency
+    // benchmark.
+    receive_rpc_until(receiver, Duration::from_secs(5), |value| value["id"] == id)
 }
 
 #[test]

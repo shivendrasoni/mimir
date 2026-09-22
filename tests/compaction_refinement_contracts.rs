@@ -7,6 +7,7 @@ use std::{
 
 use assert_cmd::Command;
 use mimir::{
+    learning,
     model::{Content, Message, ModelResponse, StopReason},
     provider::FakeProvider,
     refinement::{self, RefineOptions},
@@ -45,6 +46,20 @@ fn seed_turn(workspace: &TempDir, state: &TempDir, prompt: &str, answer: &str) {
         .args(["--fake-response", answer, "--print", prompt])
         .assert()
         .success();
+}
+
+fn project_sessions(state: &TempDir, workspace: &TempDir) -> std::path::PathBuf {
+    learning::project_session_root(state.path(), workspace.path())
+        .expect("project session root")
+        .join("sessions")
+}
+
+fn session_harness(workspace: &TempDir, session: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .join(".mimir/learning/harness/sessions")
+        .join(session)
+        .join("harness_state.json")
 }
 
 fn migration_refinement_proposal() -> String {
@@ -161,8 +176,8 @@ fn manual_compact_returns_reference_shape_and_durably_rewrites_context() {
             .any(|message| { message["content"][0]["text"] == "old decision" })
     );
 
-    let session =
-        std::fs::read_to_string(state.path().join("sessions/main.jsonl")).expect("session JSONL");
+    let session = std::fs::read_to_string(project_sessions(&state, &workspace).join("main.jsonl"))
+        .expect("session JSONL");
     let first: Value = serde_json::from_str(session.lines().next().expect("compaction line"))
         .expect("compaction JSON");
     assert_eq!(first["payload"]["type"], "compaction");
@@ -288,9 +303,7 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
         .expect("harness path");
     assert_eq!(
         std::path::Path::new(harness_path),
-        std::fs::canonicalize(state.path())
-            .expect("canonical state")
-            .join("harness/sessions/main/harness_state.json")
+        session_harness(&workspace, "main")
     );
     let harness: Value =
         serde_json::from_slice(&std::fs::read(harness_path).expect("harness state"))
@@ -307,8 +320,8 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
     assert!(status.success(), "RPC process exited with {status}");
 
     std::fs::copy(
-        state.path().join("sessions/main.jsonl"),
-        state.path().join("sessions/clone.jsonl"),
+        project_sessions(&state, &workspace).join("main.jsonl"),
+        project_sessions(&state, &workspace).join("clone.jsonl"),
     )
     .expect("clone persisted session");
     let rollback_output = Command::cargo_bin("mimir")
@@ -327,7 +340,7 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
         String::from_utf8_lossy(&rollback_output.stderr)
     );
     let rollback = response_by_id(&rollback_output.stdout, "rollback");
-    assert_eq!(rollback["success"], true);
+    assert_eq!(rollback["success"], true, "rollback response: {rollback}");
     assert_eq!(rollback["data"]["rollbackOf"], refinement_id);
     assert_eq!(rollback["data"]["appliedEdits"][0]["action"], "delete");
     assert_eq!(rollback["data"]["appliedEdits"][0]["applied"], true);
@@ -338,13 +351,16 @@ fn refine_rollback_uses_the_recorded_path_after_the_session_is_cloned() {
     assert!(
         !state
             .path()
-            .join("harness/sessions/clone/harness_state.json")
+            .join(".mimir/learning/harness/sessions/clone/harness_state.json")
             .exists()
     );
 
-    let history =
-        std::fs::read_to_string(state.path().join("harness/sessions/main/refinements.jsonl"))
-            .expect("durable refinement history");
+    let history = std::fs::read_to_string(
+        workspace
+            .path()
+            .join(".mimir/learning/harness/sessions/main/refinements.jsonl"),
+    )
+    .expect("durable refinement history");
     assert_eq!(history.lines().count(), 2);
     assert!(history.contains(&refinement_id));
 }

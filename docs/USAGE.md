@@ -57,7 +57,7 @@ Referenced paths are validated against the workspace and are made explicit to th
 
 ## TypeSafe skill and tool-pool selection
 
-TypeSafe is one cohesive configuration and is off by default. Turn it on to send the current text request plus bounded skill and tool names/descriptions to Jev. One shared request can load a confident skill and independently judge which configured tools may be needed anywhere in the run. Parameter schemas are not sent to TypeSafe.
+TypeSafe is one cohesive configuration. When `TYPESAFE_API_KEY` is present it is active automatically unless `--typesafe off` is supplied; explicit `--typesafe on` and `--typesafe off` win. It sends bounded skill/tool selection state during a turn and, after a completed task, a separate bounded local transcript projection to Jev. Parameter schemas, thinking, images, binary data, tool arguments, and credentials are not sent.
 
 The runtime applies a tool shortlist only when every omitted tool is below the calibrated uncertainty band and the reduction saves at least 256 estimated provider tokens. Invalid output, timeout, configuration, service failure, an uncertain omission, a small pool, or an unavailable recovery tool keeps the full configured pool. `search_tools` remains visible in an active shortlist and can discover and activate omitted built-in, extension, or MCP tools for the next model step. `search_skills` and autonomous `finish_task` also remain visible.
 
@@ -71,7 +71,7 @@ There are only two states: `on` and `off`. There is no shadow mode, assist mode,
 mimir --typesafe off
 ```
 
-`MIMIR_TYPESAFE=on|off` is the environment equivalent. Model, timeout, and feature-specific policy live inside one `TypeSafeConfig`; they are intentionally not separate CLI flags, so future TypeSafe capabilities do not add unrelated top-level runtime fields.
+`MIMIR_TYPESAFE=on|off` is the environment equivalent. Model, timeout, and feature-specific policy—including the nested `TypeSafeLearningConfig`—live inside one `TypeSafeConfig`; they are intentionally not separate CLI flags.
 
 Selection diagnostics persist decisions, bounded probabilities, shared token usage, estimated TypeSafe cost, latency, tool counts, estimated context savings, request byte count, and request SHA-256—not the request text or API key. Outcome events record task completion, skill corrections, and tool recovery. The original request plus bounded skill and tool names/descriptions are sent to TypeSafe when the integration is on, so enable it only where that data transfer is acceptable.
 

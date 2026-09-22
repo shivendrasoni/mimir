@@ -94,7 +94,30 @@ pub async fn prepare_state_path(root: &Path, path: &Path) -> Result<()> {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tokio::fs::create_dir(&current).await?;
+                    match tokio::fs::create_dir(&current).await {
+                        Ok(()) => {}
+                        // Another process may create the exact component after
+                        // our metadata read. Re-inspect it rather than treating
+                        // the benign race as a state failure.
+                        Err(create_error)
+                            if create_error.kind() == std::io::ErrorKind::AlreadyExists =>
+                        {
+                            let metadata = tokio::fs::symlink_metadata(&current).await?;
+                            if metadata.file_type().is_symlink() {
+                                return Err(MimirError::Session {
+                                    path: current,
+                                    message: "state directory must not be a symlink".into(),
+                                });
+                            }
+                            if !metadata.is_dir() {
+                                return Err(MimirError::Session {
+                                    path: current,
+                                    message: "state path component is not a directory".into(),
+                                });
+                            }
+                        }
+                        Err(create_error) => return Err(create_error.into()),
+                    }
                     reject_symlink(&current).await?;
                 }
                 Err(error) => return Err(error.into()),
@@ -141,5 +164,32 @@ pub async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn concurrent_preparation_accepts_only_the_real_directory_winner() {
+        let root = TempDir::new().expect("root");
+        let root_path = root.path().to_owned();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let root_path = root_path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.spawn(async move {
+                barrier.wait().await;
+                let path = root_path.join("projects/example/state.json");
+                prepare_state_path(&root_path, &path).await
+            });
+        }
+        while let Some(result) = workers.join_next().await {
+            result.expect("worker").expect("concurrent preparation");
+        }
+        assert!(root.path().join("projects/example").is_dir());
     }
 }

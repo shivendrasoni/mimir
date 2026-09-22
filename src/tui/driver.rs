@@ -754,8 +754,32 @@ pub async fn run_tui_with_autonomous(
     let mut frame_cache = TerminalFrameCache::default();
     let mut last_ctrl_c_press = None;
     let mut shift_held = false;
+    let mut next_learning_tick = Instant::now();
 
     loop {
+        // TUI learning work stays idle-only and detached from rendering or the
+        // active agent. A durable claim makes this safe across terminals and
+        // one-shot invocations; failures remain invisible to the task path.
+        if Instant::now() >= next_learning_tick {
+            next_learning_tick = Instant::now() + Duration::from_secs(2);
+            let idle = !runtime.is_running()
+                && !app
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .run_active();
+            if idle && let Some(workspace) = runtime_factory.workspace_root() {
+                let learning_runtime = Arc::clone(&runtime);
+                let learning_state = state_root.clone();
+                tokio::spawn(async move {
+                    let _ = learning::process_one_learning_job(
+                        learning_runtime.as_ref(),
+                        &workspace,
+                        &learning_state,
+                    )
+                    .await;
+                });
+            }
+        }
         render_frame(&app, &mut frame_cache)?;
         if app
             .lock()
@@ -1355,17 +1379,6 @@ async fn run_tui_prompt_loop(
             app.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push_system_message(status);
-        }
-        if let Some(workspace) = learning_workspace
-            && learning::request_feedback_if_informative(&workspace)
-                .await
-                .unwrap_or(false)
-        {
-            app.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push_system_message(
-                    "Did this achieve the goal? Use /learn feedback yes or /learn feedback no.",
-                );
         }
         app.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2033,7 +2046,7 @@ async fn run_tui_learning(
                 )
                 .await;
             format!(
-                "Learning candidate {} is {:?}: {}. Did this achieve the goal? Use /learn feedback yes or /learn feedback no.",
+                "Learning candidate {} is {:?}: {}. Optional manual outcome override: /learn feedback yes|no.",
                 candidate.id, candidate.status, candidate.summary
             )
         }

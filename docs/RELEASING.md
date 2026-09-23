@@ -10,7 +10,7 @@ With the manifest at `0.20.0` and the latest local release tag at `v0.2.0`, the 
 
 ## Packages and versions
 
-The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. MIT-licensed versions 0.5.0, 0.11.0, 0.13.0, and 0.19.0 were published and later yanked. Version 0.20.0 establishes the PolyForm Noncommercial 1.0.0 license boundary. After a newly licensed version is published, Rust users will be able to install it with:
+The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. MIT-licensed versions 0.5.0, 0.11.0, 0.13.0, and 0.19.0 were published and later yanked. Version 0.20.0 establishes the PolyForm Noncommercial 1.0.0 license boundary. Rust users can install the current crates.io release with:
 
 ```bash
 cargo install mimir-ai

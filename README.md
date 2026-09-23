@@ -21,14 +21,20 @@ If the optional [RTK](https://github.com/rtk-ai/rtk) binary is on `PATH`, Mimir 
 
 ## Install
 
-Binary releases are not currently published. Build and install Mimir from source:
+Install the current source release from crates.io:
+
+```bash
+cargo install mimir-ai
+```
+
+To build and install Mimir from a checkout:
 
 ```bash
 rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
 cargo install --path . --force
 ```
 
-For an uninstalled build, run `cargo build --release`; the binary is `target/release/mimir`. Previously published crates.io versions of `mimir-ai` have been yanked; build from source until a newly licensed version is published. See [GitHub Releases](https://github.com/shivendrasoni/mimir/releases) for future binaries and [Releasing](docs/RELEASING.md) for packaging and release-workflow details.
+For an uninstalled build, run `cargo build --release`; the binary is `target/release/mimir`. Version 0.20.0 and later uses the PolyForm Noncommercial License; the older MIT-licensed crates.io versions remain yanked. Binary releases are not currently published on GitHub. See [GitHub Releases](https://github.com/shivendrasoni/mimir/releases) for future binaries and [Releasing](docs/RELEASING.md) for packaging and release-workflow details.
 
 ## Quick start
 

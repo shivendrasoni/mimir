@@ -6,11 +6,11 @@ CI is paused for pushes and pull requests. When manually dispatched, it verifies
 
 Releases also run only when manually dispatched. The release workflow creates a tagged commit with the next minor version in `Cargo.toml` and `Cargo.lock`. Each native target independently passes Clippy, tests, and a release build before uploading its archive and SHA-256 checksum to the GitHub Releases page.
 
-With the manifest at `0.9.0` and the latest local release tag at `v0.2.0`, the next manual release starts at `v0.9.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
+With the manifest at `0.20.0` and the latest local release tag at `v0.2.0`, the next manual release starts at `v0.20.0`. A platform failure withholds only that platform's artifacts. The generated version commit is kept on the release tag instead of being pushed back to `main`. Windows verification and artifacts are temporarily disabled.
 
 ## Packages and versions
 
-The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. The package has not been published yet. After its first publication, Rust users will be able to install it with:
+The publishable crates.io package is named `mimir-ai`; the library and installed executable remain `mimir`. MIT-licensed versions 0.5.0, 0.11.0, 0.13.0, and 0.19.0 were published and later yanked. Version 0.20.0 establishes the PolyForm Noncommercial 1.0.0 license boundary. After a newly licensed version is published, Rust users will be able to install it with:
 
 ```bash
 cargo install mimir-ai

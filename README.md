@@ -28,7 +28,7 @@ rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
 cargo install --path . --force
 ```
 
-For an uninstalled build, run `cargo build --release`; the binary is `target/release/mimir`. The publishable crates.io package is named `mimir-ai`, but it has not been published yet. See [GitHub Releases](https://github.com/shivendrasoni/mimir/releases) for future binaries and [Releasing](docs/RELEASING.md) for packaging and release-workflow details.
+For an uninstalled build, run `cargo build --release`; the binary is `target/release/mimir`. Previously published crates.io versions of `mimir-ai` have been yanked; build from source until a newly licensed version is published. See [GitHub Releases](https://github.com/shivendrasoni/mimir/releases) for future binaries and [Releasing](docs/RELEASING.md) for packaging and release-workflow details.
 
 ## Quick start
 
@@ -83,6 +83,12 @@ Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the 
 - [Mimir vs Codex — matched GPT-5.6 Terra model, 6 tasks, 3 repeats](benchmarks/2026-09-12-mimir-vs-codex.pdf)
 
 Each report records the run identifiers, benchmark commit, harness and model versions, outcome scores, timing, token usage, scope violations, and adapter failures used for the comparison.
+
+## License
+
+Mimir 0.20.0 and later is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, study, modify, and share it for permitted noncommercial purposes. Commercial use requires a separate license from the copyright holder.
+
+Previously published `mimir-ai` versions 0.5.0, 0.11.0, 0.13.0, and 0.19.0 remain available under the MIT terms included with those versions. See [Licensing](LICENSING.md) for the transition details.
 
 ## Quality gates
 

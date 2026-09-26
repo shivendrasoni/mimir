@@ -259,6 +259,7 @@ impl BashRunner {
             self.policy.allowed_programs.as_deref(),
             self.policy.allow_any_program,
         )?;
+        enforce_enterprise_allowlist(command)?;
         if !self.policy.agent_mode.automatically_approves()
             && let Some(approvals) = &self.policy.approvals
             && let Some(request) = approvals.requires_approval(command)?
@@ -359,10 +360,7 @@ fn validate_allowlisted_command(
             message: "command contains control characters".into(),
         });
     }
-    let program = command
-        .split_whitespace()
-        .find(|token| *token != "RTK_DISABLED=1")
-        .unwrap_or_default();
+    let program = command_program(command);
     if program.is_empty() {
         return Err(ToolError::InvalidArguments {
             tool: "bash".into(),
@@ -386,6 +384,39 @@ fn validate_allowlisted_command(
         });
     }
     Ok(())
+}
+
+fn enforce_enterprise_allowlist(command: &str) -> Result<(), ToolError> {
+    let program = command_program(command);
+    match crate::enterprise::shell_program_allowed(program) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ToolError::Disabled {
+            tool: format!("bash program {program}"),
+        }),
+        Err(error) => Err(ToolError::Execution {
+            tool: "bash".into(),
+            message: format!("enterprise policy gate failed: {error}"),
+        }),
+    }
+}
+
+fn command_program(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .find(|token| *token != "RTK_DISABLED=1")
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn validate_enterprise_allowlist(
+    command: &str,
+    allowed: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(), ToolError> {
+    let Some(allowed) = allowed else {
+        return Ok(());
+    };
+    let allowed = allowed.iter().cloned().collect::<Vec<_>>();
+    validate_allowlisted_command(command, Some(&allowed), false)
 }
 
 fn spawn_shell(command: &str, workspace: &Path) -> Result<Child, ToolError> {
@@ -647,11 +678,13 @@ async fn terminate_group(child: &mut Child) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
 
     use tempfile::TempDir;
 
-    use super::{rewrite_with_rtk_binary, validate_allowlisted_command};
+    use super::{
+        rewrite_with_rtk_binary, validate_allowlisted_command, validate_enterprise_allowlist,
+    };
 
     fn fake_rtk(root: &TempDir, body: &str) -> std::path::PathBuf {
         let path = root.path().join("rtk");
@@ -727,5 +760,18 @@ mod tests {
             validate_allowlisted_command("RTK_DISABLED=1 git status", Some(&allowed), false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn enterprise_shell_allowlist_is_a_final_intersection() {
+        let unrestricted = None;
+        assert!(validate_enterprise_allowlist("printf ok", unrestricted).is_ok());
+
+        let empty = BTreeSet::new();
+        assert!(validate_enterprise_allowlist("printf denied", Some(&empty)).is_err());
+
+        let allowed = BTreeSet::from(["git".to_owned()]);
+        assert!(validate_enterprise_allowlist("git status", Some(&allowed)).is_ok());
+        assert!(validate_enterprise_allowlist("printf denied", Some(&allowed)).is_err());
     }
 }

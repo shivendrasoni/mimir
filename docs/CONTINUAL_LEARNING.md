@@ -54,6 +54,7 @@ mimir learning candidates
 mimir learning feedback yes|no [--note <bounded-note>]
 mimir learning rollback <candidate-id>
 mimir learning contribution enable|disable
+mimir learning connect
 mimir learning check
 mimir learning update
 mimir learning submit <candidate-id>
@@ -66,4 +67,14 @@ mimir learning pin [version]
 /learn check|update|submit <id>|pin [version]
 ```
 
-Fleet endpoints and the Ed25519 public key are operator configuration: `MIMIR_LEARNING_PACK_URL`, `MIMIR_LEARNING_PUBLIC_KEY`, and `MIMIR_LEARNING_CONTRIBUTION_URL`. `--offline` disables update and submission while cached compatible packs remain available.
+For an enrolled client, run `mimir learning connect` once in each project. Mimir
+uses the existing Harness installation credential to provision a least-privilege,
+project-scoped Betterloop connection, then stores the URLs, verification key, and
+client credential privately in the untracked `.mimir/learning/fleet_connection.json`.
+No endpoint, public key, or token is copied by hand. `mimir learning check` reports
+whether that connection is ready.
+
+`MIMIR_LEARNING_PACK_URL`, `MIMIR_LEARNING_PUBLIC_KEY`,
+`MIMIR_LEARNING_CONTRIBUTION_URL`, and `MIMIR_LEARNING_TOKEN` remain an explicit
+operator override for non-enrolled deployments. `--offline` disables update and
+submission while cached compatible packs remain available.

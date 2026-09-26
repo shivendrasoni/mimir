@@ -2123,9 +2123,10 @@ async fn run_tui_learning(
             )
         }
         "check" => format!(
-            "Fleet learning transport: endpoint={}, public_key={}, active_pack={}",
+            "Fleet learning transport: endpoint={}, public_key={}, token={}, active_pack={}",
             std::env::var_os("MIMIR_LEARNING_PACK_URL").is_some(),
             std::env::var_os("MIMIR_LEARNING_PUBLIC_KEY").is_some(),
+            std::env::var_os("MIMIR_LEARNING_TOKEN").is_some(),
             learning::load_active_fleet_pack(state_root)
                 .await?
                 .map_or_else(|| "none".into(), |item| item.pack.version)
@@ -2141,7 +2142,20 @@ async fn run_tui_learning(
                     "MIMIR_LEARNING_PUBLIC_KEY is not configured".into(),
                 )
             })?;
-            let path = learning::fetch_and_install_signed_pack(state_root, &endpoint, &key).await?;
+            let token = std::env::var("MIMIR_LEARNING_TOKEN").map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "MIMIR_LEARNING_TOKEN is not configured".into(),
+                )
+            })?;
+            let path = learning::fetch_and_install_signed_pack(
+                state_root,
+                &endpoint,
+                &key,
+                &token,
+                std::env::var("MIMIR_LEARNING_ALLOW_INSECURE_LOCAL")
+                    .is_ok_and(|value| value == "1"),
+            )
+            .await?;
             format!("Fleet learning pack activated at {}", path.display())
         }
         "submit" => {
@@ -2155,7 +2169,20 @@ async fn run_tui_learning(
                     "MIMIR_LEARNING_CONTRIBUTION_URL is not configured".into(),
                 )
             })?;
-            learning::submit_fleet_contribution(workspace, &endpoint, id).await?;
+            let token = std::env::var("MIMIR_LEARNING_TOKEN").map_err(|_| {
+                crate::error::MimirError::Configuration(
+                    "MIMIR_LEARNING_TOKEN is not configured".into(),
+                )
+            })?;
+            learning::submit_fleet_contribution(
+                workspace,
+                &endpoint,
+                &token,
+                std::env::var("MIMIR_LEARNING_ALLOW_INSECURE_LOCAL")
+                    .is_ok_and(|value| value == "1"),
+                id,
+            )
+            .await?;
             format!("Redacted learning candidate {id} submitted")
         }
         "pin" => {

@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod diagnostics;
+pub mod enterprise;
 pub mod error;
 pub mod extensions;
 pub mod learning;

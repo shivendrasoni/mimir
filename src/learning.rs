@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::{
     atomic::{canonical_state_root, path_lock, prepare_state_path, read_json, write_json},
     diagnostics::{DiagnosticOutcome, DiagnosticSummary},
+    enterprise::FleetLearningConnection,
     error::{MimirError, Result},
     refinement::{RefinementEdit, RefinementKind},
     runtime::AgentRuntime,
@@ -551,6 +552,44 @@ pub fn project_marker_path(project_root: &Path) -> PathBuf {
 #[must_use]
 pub fn project_learning_dir(project_root: &Path) -> PathBuf {
     project_root.join(".mimir/learning")
+}
+
+#[must_use]
+pub fn fleet_connection_path(project_root: &Path) -> PathBuf {
+    project_learning_dir(project_root).join("fleet_connection.json")
+}
+
+pub async fn save_fleet_connection(
+    project_root: &Path,
+    connection: &FleetLearningConnection,
+) -> Result<PathBuf> {
+    let project_root = std::fs::canonicalize(project_root)?;
+    ensure_project_marker(&project_root).await?;
+    let path = fleet_connection_path(&project_root);
+    prepare_state_path(&project_root, &path).await?;
+    write_json(&path, connection).await?;
+    set_private_permissions(&path).await?;
+    ensure_git_exclude(&project_root)?;
+    Ok(path)
+}
+
+pub async fn load_fleet_connection(workspace: &Path) -> Result<Option<FleetLearningConnection>> {
+    let project_root = discover_project_root(workspace)?;
+    let path = fleet_connection_path(&project_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    prepare_state_path(&project_root, &path).await?;
+    let connection = read_json::<FleetLearningConnection>(&path).await?;
+    if connection
+        .as_ref()
+        .is_some_and(|value| value.schema != 1 || value.client_token.is_empty())
+    {
+        return Err(MimirError::Configuration(
+            "invalid project fleet learning connection".into(),
+        ));
+    }
+    Ok(connection)
 }
 
 #[must_use]
@@ -1166,11 +1205,14 @@ pub fn build_fleet_contribution(
 pub async fn submit_fleet_contribution(
     workspace: &Path,
     endpoint: &str,
+    token: &str,
+    allow_insecure_local: bool,
     candidate_id: Uuid,
 ) -> Result<()> {
-    if !endpoint.starts_with("https://") {
+    validate_fleet_endpoint(endpoint, "fleet contribution", allow_insecure_local)?;
+    if token.trim().is_empty() {
         return Err(MimirError::Configuration(
-            "fleet contribution endpoint must use HTTPS".into(),
+            "fleet contribution token is not configured".into(),
         ));
     }
     let project_root = discover_project_root(workspace)?;
@@ -1200,6 +1242,7 @@ pub async fn submit_fleet_contribution(
         })?;
     let response = client
         .post(endpoint)
+        .bearer_auth(token)
         .json(&contribution)
         .send()
         .await
@@ -1278,10 +1321,13 @@ pub async fn fetch_and_install_signed_pack(
     state_root: &Path,
     endpoint: &str,
     public_key_base64: &str,
+    token: &str,
+    allow_insecure_local: bool,
 ) -> Result<PathBuf> {
-    if !endpoint.starts_with("https://") {
+    validate_fleet_endpoint(endpoint, "fleet learning", allow_insecure_local)?;
+    if token.trim().is_empty() {
         return Err(MimirError::Configuration(
-            "fleet learning endpoint must use HTTPS".into(),
+            "fleet learning token is not configured".into(),
         ));
     }
     let public_key = STANDARD.decode(public_key_base64.as_bytes()).map_err(|_| {
@@ -1297,9 +1343,14 @@ pub async fn fetch_and_install_signed_pack(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| MimirError::Configuration(format!("fleet pack client failed: {error}")))?;
-    let response = client.get(endpoint).send().await.map_err(|error| {
-        MimirError::Configuration(format!("fleet pack download failed: {error}"))
-    })?;
+    let response = client
+        .get(endpoint)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| {
+            MimirError::Configuration(format!("fleet pack download failed: {error}"))
+        })?;
     if !response.status().is_success() {
         return Err(MimirError::Configuration(format!(
             "fleet pack download returned HTTP {}",
@@ -1325,6 +1376,21 @@ pub async fn fetch_and_install_signed_pack(
     }
     let envelope: SignedLearningPack = serde_json::from_slice(&bytes)?;
     install_signed_pack(state_root, &envelope, &public_key).await
+}
+
+fn validate_fleet_endpoint(endpoint: &str, label: &str, allow_insecure_local: bool) -> Result<()> {
+    if endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    let local_http = endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("http://localhost")
+        || endpoint.starts_with("http://[::1]");
+    if local_http && allow_insecure_local {
+        return Ok(());
+    }
+    Err(MimirError::Configuration(format!(
+        "{label} endpoint must use HTTPS; set MIMIR_LEARNING_ALLOW_INSECURE_LOCAL=1 only for a loopback development server"
+    )))
 }
 
 pub async fn load_active_fleet_pack(state_root: &Path) -> Result<Option<SignedLearningPack>> {

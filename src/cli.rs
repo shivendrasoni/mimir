@@ -37,6 +37,7 @@ use crate::{
         RuntimeDiagnosticRunCollector, append_analysis, diagnostics_root, list_runs, load_bundle,
         query_events, replay_bundle,
     },
+    enterprise::{self, EnterpriseManager},
     error::{MimirError, Result},
     extensions::{
         AgentRuntimeChildExecutor, AuthStoreModelCatalog, AuthenticatedModelCatalog, Capability,
@@ -658,6 +659,21 @@ fn resolved_cli_base_url(cli: &Cli, provider: &str) -> Option<String> {
 enum Command {
     /// Validate paths and report credential presence without revealing it.
     Doctor,
+    /// Enroll this OS user installation with a Betterloop-managed harness profile.
+    Enroll {
+        code: String,
+        #[arg(
+            long,
+            env = "MIMIR_CONTROL_PLANE_URL",
+            default_value = "https://api.betterloop.dev"
+        )]
+        control_plane_url: String,
+    },
+    /// Inspect, synchronize, override, or remove enterprise management.
+    Enterprise {
+        #[command(subcommand)]
+        action: EnterpriseCommand,
+    },
     /// Store an API key or start a supported OAuth login flow.
     Login {
         #[arg(default_value = "anthropic")]
@@ -802,6 +818,41 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum EnterpriseCommand {
+    /// Show enrollment and active signed-release status.
+    Status,
+    /// Explain the effective bindings, skills, and metadata categories.
+    Explain,
+    /// Synchronize and atomically activate the latest valid signed profile.
+    Sync,
+    /// Inspect or change developer overrides for default bindings.
+    Overrides {
+        #[command(subcommand)]
+        action: EnterpriseOverrideCommand,
+    },
+    /// Remove this installation's local enterprise credential and signed caches.
+    Unenroll,
+}
+
+#[derive(Debug, Subcommand)]
+enum EnterpriseOverrideCommand {
+    /// List local developer overrides.
+    List,
+    /// Disable a default binding. Mandatory bindings cannot be disabled.
+    Disable {
+        binding_key: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Re-enable a default binding.
+    Enable {
+        binding_key: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum AuthCommand {
     Status,
 }
@@ -857,6 +908,8 @@ enum LearningCommand {
     Rollback { id: Uuid },
     /// Inspect signed fleet-pack transport configuration.
     Check,
+    /// Use the existing Harness enrollment to provision this project's fleet connection.
+    Connect,
     /// Download, verify, and atomically activate the configured fleet pack.
     Update,
     /// Submit one active candidate through the opt-in redacted channel.
@@ -1922,6 +1975,10 @@ pub async fn entrypoint() -> Result<()> {
     if let Some(command) = &cli.command {
         return run_management(&cli, command).await;
     }
+    let _ = enterprise::prepare_runtime(cli.offline).await?;
+    if !cli.offline {
+        enterprise::spawn_periodic_sync();
+    }
     if cli.output == OutputMode::Daemon {
         if cli.prompt.is_some() || !cli.prompt_segments.is_empty() {
             return Err(MimirError::Configuration(
@@ -2207,7 +2264,11 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
     }
     let state = if matches!(
         command,
-        Command::Login { .. } | Command::Logout { .. } | Command::Auth { .. }
+        Command::Login { .. }
+            | Command::Logout { .. }
+            | Command::Auth { .. }
+            | Command::Enroll { .. }
+            | Command::Enterprise { .. }
     ) {
         cli.state_dir.clone()
     } else {
@@ -2215,6 +2276,41 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
     };
     match command {
         Command::Doctor => doctor(cli).await,
+        Command::Enroll {
+            code,
+            control_plane_url,
+        } => print_json(
+            &EnterpriseManager::global()?
+                .enroll(control_plane_url, code)
+                .await?,
+        ),
+        Command::Enterprise { action } => {
+            let manager = EnterpriseManager::global()?;
+            let value = match action {
+                EnterpriseCommand::Status => manager.status()?,
+                EnterpriseCommand::Explain => manager.explain()?,
+                EnterpriseCommand::Sync => manager.sync_with_backoff().await?,
+                EnterpriseCommand::Overrides {
+                    action: EnterpriseOverrideCommand::List,
+                } => manager.list_overrides()?,
+                EnterpriseCommand::Overrides {
+                    action:
+                        EnterpriseOverrideCommand::Disable {
+                            binding_key,
+                            reason,
+                        },
+                } => manager.set_override(binding_key, true, reason).await?,
+                EnterpriseCommand::Overrides {
+                    action:
+                        EnterpriseOverrideCommand::Enable {
+                            binding_key,
+                            reason,
+                        },
+                } => manager.set_override(binding_key, false, reason).await?,
+                EnterpriseCommand::Unenroll => manager.unenroll().await?,
+            };
+            print_json(&value)
+        }
         Command::Login {
             provider,
             api_key,
@@ -2728,27 +2824,52 @@ async fn run_learning_management(
         LearningCommand::Rollback { id } => print_json(&serde_json::to_value(
             learning::rollback_candidate(&cli.workspace, *id).await?,
         )?),
-        LearningCommand::Check => print_json(&json!({
-            "schema_version": learning::LEARNING_SCHEMA_VERSION,
-            "endpoint_configured": std::env::var_os("MIMIR_LEARNING_PACK_URL").is_some(),
-            "public_key_configured": std::env::var_os("MIMIR_LEARNING_PUBLIC_KEY").is_some(),
-            "contribution_endpoint_configured": std::env::var_os("MIMIR_LEARNING_CONTRIBUTION_URL").is_some(),
-            "active_pack": learning::load_active_fleet_pack(state_root).await?.map(|item| item.pack.version),
-        })),
+        LearningCommand::Check => {
+            let saved = learning::load_fleet_connection(&cli.workspace).await?;
+            let environment_configured = std::env::var_os("MIMIR_LEARNING_PACK_URL").is_some()
+                && std::env::var_os("MIMIR_LEARNING_PUBLIC_KEY").is_some()
+                && std::env::var_os("MIMIR_LEARNING_CONTRIBUTION_URL").is_some()
+                && std::env::var_os("MIMIR_LEARNING_TOKEN").is_some();
+            print_json(&json!({
+                "schema_version": learning::LEARNING_SCHEMA_VERSION,
+                "connection_configured": saved.is_some() || environment_configured,
+                "connection_source": if saved.is_some() { "enrollment" } else if environment_configured { "environment" } else { "none" },
+                "active_pack": learning::load_active_fleet_pack(state_root).await?.map(|item| item.pack.version),
+            }))
+        }
+        LearningCommand::Connect => {
+            let marker = learning::initialize_project(&cli.workspace).await?;
+            let project_root = learning::discover_project_root(&cli.workspace)?;
+            let project_label = project_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Mimir project");
+            let connection = EnterpriseManager::global()?
+                .connect_fleet_learning(marker.project_id, project_label)
+                .await?;
+            let path = learning::save_fleet_connection(&project_root, &connection).await?;
+            print_json(&json!({
+                "connected": true,
+                "project_id": connection.project_id,
+                "path": path,
+                "local_development": connection.local_development,
+            }))
+        }
         LearningCommand::Update => {
             if cli.offline {
                 return Err(MimirError::Configuration(
                     "fleet learning update is unavailable in offline mode".into(),
                 ));
             }
-            let endpoint = std::env::var("MIMIR_LEARNING_PACK_URL").map_err(|_| {
-                MimirError::Configuration("MIMIR_LEARNING_PACK_URL is not configured".into())
-            })?;
-            let public_key = std::env::var("MIMIR_LEARNING_PUBLIC_KEY").map_err(|_| {
-                MimirError::Configuration("MIMIR_LEARNING_PUBLIC_KEY is not configured".into())
-            })?;
-            let path =
-                learning::fetch_and_install_signed_pack(state_root, &endpoint, &public_key).await?;
+            let connection = fleet_learning_transport(&cli.workspace).await?;
+            let path = learning::fetch_and_install_signed_pack(
+                state_root,
+                &connection.pack_url,
+                &connection.public_key_base64,
+                &connection.client_token,
+                connection.local_development,
+            )
+            .await?;
             print_json(&json!({"updated": true, "path": path}))
         }
         LearningCommand::Submit { id } => {
@@ -2757,18 +2878,62 @@ async fn run_learning_management(
                     "fleet learning contribution is unavailable in offline mode".into(),
                 ));
             }
-            let endpoint = std::env::var("MIMIR_LEARNING_CONTRIBUTION_URL").map_err(|_| {
-                MimirError::Configuration(
-                    "MIMIR_LEARNING_CONTRIBUTION_URL is not configured".into(),
-                )
-            })?;
-            learning::submit_fleet_contribution(&cli.workspace, &endpoint, *id).await?;
+            let connection = fleet_learning_transport(&cli.workspace).await?;
+            learning::submit_fleet_contribution(
+                &cli.workspace,
+                &connection.contribution_url,
+                &connection.client_token,
+                connection.local_development,
+                *id,
+            )
+            .await?;
             print_json(&json!({"submitted": true, "candidate_id": id}))
         }
         LearningCommand::Pin { version } => print_json(&serde_json::to_value(
             learning::pin_fleet_version(&cli.workspace, version.as_deref()).await?,
         )?),
     }
+}
+
+#[derive(Clone)]
+struct FleetLearningTransport {
+    pack_url: String,
+    contribution_url: String,
+    public_key_base64: String,
+    client_token: String,
+    local_development: bool,
+}
+
+async fn fleet_learning_transport(workspace: &Path) -> Result<FleetLearningTransport> {
+    if let (Ok(pack_url), Ok(contribution_url), Ok(public_key_base64), Ok(client_token)) = (
+        std::env::var("MIMIR_LEARNING_PACK_URL"),
+        std::env::var("MIMIR_LEARNING_CONTRIBUTION_URL"),
+        std::env::var("MIMIR_LEARNING_PUBLIC_KEY"),
+        std::env::var("MIMIR_LEARNING_TOKEN"),
+    ) {
+        return Ok(FleetLearningTransport {
+            pack_url,
+            contribution_url,
+            public_key_base64,
+            client_token,
+            local_development: std::env::var("MIMIR_LEARNING_ALLOW_INSECURE_LOCAL")
+                .is_ok_and(|value| value == "1"),
+        });
+    }
+    let connection = learning::load_fleet_connection(workspace)
+        .await?
+        .ok_or_else(|| {
+            MimirError::Configuration(
+                "fleet learning is not connected; run `mimir learning connect` after Harness enrollment".into(),
+            )
+        })?;
+    Ok(FleetLearningTransport {
+        pack_url: connection.pack_url,
+        contribution_url: connection.contribution_url,
+        public_key_base64: connection.public_key_base64,
+        client_token: connection.client_token,
+        local_development: connection.local_development,
+    })
 }
 
 async fn resolved_config(cli: &Cli, state: &Path) -> Result<Value> {
@@ -7549,8 +7714,34 @@ async fn build_runtime_for_session(
     let auth = build.auth_store()?;
     let stored_provider_build = activate_first_stored_provider(build, &auth).await?;
     let activated_build = activate_migrated_preferences(&stored_provider_build, &activation);
-    let (effective_build, restored_thinking_level) =
+    let (mut effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
+    if let Some(allowed) = enterprise::allowed_values("restrict_models", "allowed")? {
+        let selector = format!("{}/{}", effective_build.provider, effective_build.model);
+        if !allowed.contains(&selector) && !allowed.contains(&effective_build.model) {
+            return Err(MimirError::Configuration(format!(
+                "enterprise policy does not permit model {selector}"
+            )));
+        }
+    }
+    if let Some(allowed) = enterprise::allowed_values("restrict_tools", "allowed")? {
+        effective_build.tool_allowlist = Some(
+            effective_build
+                .tool_allowlist
+                .as_ref()
+                .map_or(allowed.clone(), |local| {
+                    local.intersection(&allowed).cloned().collect()
+                }),
+        );
+    }
+    if let Some(allowed) = enterprise::allowed_values("restrict_shell_programs", "allowed")? {
+        effective_build
+            .allowed_programs
+            .retain(|program| allowed.contains(program));
+        if effective_build.allowed_programs.is_empty() {
+            effective_build.allow_process = false;
+        }
+    }
     let build = &effective_build;
     let extensions = if build.agent_mode.is_plan() {
         Vec::new()
@@ -7620,13 +7811,18 @@ async fn build_runtime_for_session(
             model_definition.context_window,
         )
     };
-    let thinking_level = resolve_runtime_thinking_level(
+    let mut thinking_level = resolve_runtime_thinking_level(
         build.thinking,
         restored_thinking_level,
         &supported_thinking_levels,
         &build.provider,
         &build.model,
     )?;
+    if let Some(maximum) = enterprise::maximum_thinking_level()?
+        && thinking_level > maximum
+    {
+        thinking_level = maximum;
+    }
     if build.agent_mode.is_plan() && extension_provider_selected {
         return Err(MimirError::Configuration(
             "plan mode supports native providers only".into(),
@@ -7669,9 +7865,13 @@ async fn build_runtime_for_session(
             .map_err(|error| MimirError::Configuration(error.to_string()))?
     };
     skills.extend(resources.skills.clone());
+    // Managed skills are part of the signed native policy and intentionally do
+    // not honor the local --no-skills compatibility switch.
+    skills.extend(enterprise::managed_skills()?);
     skills.sort_by(|left, right| left.name.cmp(&right.name));
+    let has_skills = !skills.is_empty();
     let skill_runtime = SkillRuntime::new(skills);
-    if !build.no_skills {
+    if has_skills {
         tool_registry
             .register_skill_search(&skill_runtime)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
@@ -10469,14 +10669,14 @@ mod tui_model_selection_tests {
     use serde_json::json;
 
     use super::{
-        AutonomousLimitOverrides, Cli, Command, ConfigCommand, LimitValue, OutputMode,
-        PackageCommand, RuntimeBuildConfig, RuntimePromptHandler, ScheduleCommand, UpdateAction,
-        activate_first_stored_provider, autonomous_status_value, build_runtime_for_session,
-        daemon_runtime_error, ensure_fresh_session, parse_recovered_goal_create,
-        parse_recovered_refine_args, resolve_autonomous_limits, resolve_extension_flags,
-        resolve_runtime_thinking_level, resolve_session_root, resolve_tui_model_selection,
-        run_once_autonomous, run_self_update, runtime_model_definition, send_public_command,
-        tui_model_options, validate_run_options,
+        AutonomousLimitOverrides, Cli, Command, ConfigCommand, EnterpriseCommand,
+        EnterpriseOverrideCommand, LimitValue, OutputMode, PackageCommand, RuntimeBuildConfig,
+        RuntimePromptHandler, ScheduleCommand, UpdateAction, activate_first_stored_provider,
+        autonomous_status_value, build_runtime_for_session, daemon_runtime_error,
+        ensure_fresh_session, parse_recovered_goal_create, parse_recovered_refine_args,
+        resolve_autonomous_limits, resolve_extension_flags, resolve_runtime_thinking_level,
+        resolve_session_root, resolve_tui_model_selection, run_once_autonomous, run_self_update,
+        runtime_model_definition, send_public_command, tui_model_options, validate_run_options,
     };
 
     #[test]
@@ -10622,6 +10822,35 @@ mod tui_model_selection_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Login { ref provider, .. }) if provider == "anthropic"
+        ));
+    }
+
+    #[test]
+    fn enterprise_enrollment_and_override_commands_parse() {
+        let enroll =
+            Cli::try_parse_from(["mimir", "enroll", "mec_example"]).expect("enterprise enrollment");
+        assert!(matches!(
+            enroll.command,
+            Some(Command::Enroll { ref code, .. }) if code == "mec_example"
+        ));
+
+        let override_command = Cli::try_parse_from([
+            "mimir",
+            "enterprise",
+            "overrides",
+            "disable",
+            "observe.failures",
+            "--reason",
+            "local workflow",
+        ])
+        .expect("enterprise override");
+        assert!(matches!(
+            override_command.command,
+            Some(Command::Enterprise {
+                action: EnterpriseCommand::Overrides {
+                    action: EnterpriseOverrideCommand::Disable { .. }
+                }
+            })
         ));
     }
 

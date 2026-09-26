@@ -37,6 +37,7 @@ use crate::{
         RuntimeDiagnosticRunCollector, append_analysis, diagnostics_root, list_runs, load_bundle,
         query_events, replay_bundle,
     },
+    enterprise::{self, EnterpriseManager},
     error::{MimirError, Result},
     extensions::{
         AgentRuntimeChildExecutor, AuthStoreModelCatalog, AuthenticatedModelCatalog, Capability,
@@ -404,7 +405,9 @@ struct RuntimeBuildConfig {
     allow_process: bool,
     agent_mode: AgentMode,
     allowed_programs: Vec<String>,
+    enterprise_shell_restricted: bool,
     tool_allowlist: Option<BTreeSet<String>>,
+    tool_allowlist_strict: bool,
     no_builtin_tools: bool,
     extension_paths: Vec<PathBuf>,
     no_extensions: bool,
@@ -450,6 +453,7 @@ impl RuntimeBuildConfig {
             allow_process: cli.allow_process,
             agent_mode: cli.agent_mode.map(Into::into).unwrap_or_default(),
             allowed_programs: cli.allowed_programs.clone(),
+            enterprise_shell_restricted: false,
             tool_allowlist: if cli.no_tools {
                 Some(BTreeSet::new())
             } else if cli.tools.is_empty() {
@@ -457,6 +461,7 @@ impl RuntimeBuildConfig {
             } else {
                 Some(cli.tools.iter().cloned().collect())
             },
+            tool_allowlist_strict: !cli.tools.is_empty(),
             no_builtin_tools: cli.no_builtin_tools,
             extension_paths: cli.extension.clone(),
             no_extensions: cli.no_extensions,
@@ -506,6 +511,59 @@ impl RuntimeBuildConfig {
     fn auth_store(&self) -> Result<AuthStore> {
         self.auth_store.clone().map_or_else(AuthStore::global, Ok)
     }
+}
+
+fn apply_enterprise_build_policy(build: &mut RuntimeBuildConfig) -> Result<()> {
+    let allowed_models = enterprise::allowed_values("restrict_models", "allowed")?;
+    let allowed_tools = enterprise::allowed_values("restrict_tools", "allowed")?;
+    let allowed_shell_programs = enterprise::allowed_values("restrict_shell_programs", "allowed")?;
+    apply_enterprise_build_policy_values(
+        build,
+        allowed_models.as_ref(),
+        allowed_tools.as_ref(),
+        allowed_shell_programs.as_ref(),
+    )
+}
+
+fn apply_enterprise_build_policy_values(
+    build: &mut RuntimeBuildConfig,
+    allowed_models: Option<&BTreeSet<String>>,
+    allowed_tools: Option<&BTreeSet<String>>,
+    allowed_shell_programs: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    if let Some(allowed) = allowed_models {
+        let selector = format!("{}/{}", build.provider, build.model);
+        if !allowed.contains(&selector) && !allowed.contains(&build.model) {
+            return Err(MimirError::Configuration(format!(
+                "enterprise policy does not permit model {selector}"
+            )));
+        }
+    }
+    if let Some(allowed) = allowed_tools {
+        let local_selection_is_explicit = build.tool_allowlist.is_some();
+        build.tool_allowlist = Some(build.tool_allowlist.as_ref().map_or_else(
+            || allowed.clone(),
+            |local| local.intersection(allowed).cloned().collect(),
+        ));
+        build.tool_allowlist_strict &= local_selection_is_explicit;
+    }
+    if let Some(allowed) = allowed_shell_programs {
+        let local_allowlist_was_empty = build.allowed_programs.is_empty();
+        if build.agent_mode == AgentMode::Auto && local_allowlist_was_empty {
+            build.allowed_programs = allowed.iter().cloned().collect();
+        } else {
+            build
+                .allowed_programs
+                .retain(|program| allowed.contains(program));
+        }
+        build.enterprise_shell_restricted = true;
+        build.allow_process = match build.agent_mode {
+            AgentMode::Auto => !build.allowed_programs.is_empty(),
+            AgentMode::Default => build.allow_process && !build.allowed_programs.is_empty(),
+            AgentMode::Plan => false,
+        };
+    }
+    Ok(())
 }
 
 fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
@@ -658,6 +716,21 @@ fn resolved_cli_base_url(cli: &Cli, provider: &str) -> Option<String> {
 enum Command {
     /// Validate paths and report credential presence without revealing it.
     Doctor,
+    /// Enroll this OS user installation with a Betterloop-managed harness profile.
+    Enroll {
+        code: String,
+        #[arg(
+            long,
+            env = "MIMIR_CONTROL_PLANE_URL",
+            default_value = "https://api.betterloop.dev"
+        )]
+        control_plane_url: String,
+    },
+    /// Inspect, synchronize, override, or remove enterprise management.
+    Enterprise {
+        #[command(subcommand)]
+        action: EnterpriseCommand,
+    },
     /// Store an API key or start a supported OAuth login flow.
     Login {
         #[arg(default_value = "anthropic")]
@@ -798,6 +871,41 @@ enum Command {
     Benchmark {
         #[command(subcommand)]
         action: BenchmarkCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnterpriseCommand {
+    /// Show enrollment and active signed-release status.
+    Status,
+    /// Explain the effective bindings, skills, and metadata categories.
+    Explain,
+    /// Synchronize and atomically activate the latest valid signed profile.
+    Sync,
+    /// Inspect or change developer overrides for default bindings.
+    Overrides {
+        #[command(subcommand)]
+        action: EnterpriseOverrideCommand,
+    },
+    /// Remove this installation's local enterprise credential and signed caches.
+    Unenroll,
+}
+
+#[derive(Debug, Subcommand)]
+enum EnterpriseOverrideCommand {
+    /// List local developer overrides.
+    List,
+    /// Disable a default binding. Mandatory bindings cannot be disabled.
+    Disable {
+        binding_key: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Re-enable a default binding.
+    Enable {
+        binding_key: String,
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -1922,6 +2030,10 @@ pub async fn entrypoint() -> Result<()> {
     if let Some(command) = &cli.command {
         return run_management(&cli, command).await;
     }
+    let _ = enterprise::prepare_runtime(cli.offline).await?;
+    if !cli.offline {
+        enterprise::spawn_periodic_sync();
+    }
     if cli.output == OutputMode::Daemon {
         if cli.prompt.is_some() || !cli.prompt_segments.is_empty() {
             return Err(MimirError::Configuration(
@@ -2117,6 +2229,7 @@ async fn dispatch_run(
             }
             build.provider = provider;
             build.model = model;
+            apply_enterprise_build_policy(&mut build)?;
             run_rpc(RpcSessionContext {
                 runtime,
                 bash_runner: build_bash_runner(&build)?,
@@ -2147,7 +2260,10 @@ async fn dispatch_run(
             let initial_selection = tui_model_key(&initial_provider, &initial_model);
             let mut models = tui_model_options(&initial_provider, &initial_model);
             let state = resolve_state_dir(&cli.state_dir)?;
-            let tui_build = RuntimeBuildConfig::from_cli(cli);
+            let mut tui_build = RuntimeBuildConfig::from_cli(cli);
+            tui_build.provider.clone_from(&initial_provider);
+            tui_build.model.clone_from(&initial_model);
+            apply_enterprise_build_policy(&mut tui_build)?;
             let session_root = resolve_session_root(&tui_build, &state)?;
             let mut sessions = list_run_session_ids(&tui_build, &session_root)
                 .await
@@ -2207,7 +2323,11 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
     }
     let state = if matches!(
         command,
-        Command::Login { .. } | Command::Logout { .. } | Command::Auth { .. }
+        Command::Login { .. }
+            | Command::Logout { .. }
+            | Command::Auth { .. }
+            | Command::Enroll { .. }
+            | Command::Enterprise { .. }
     ) {
         cli.state_dir.clone()
     } else {
@@ -2215,6 +2335,41 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
     };
     match command {
         Command::Doctor => doctor(cli).await,
+        Command::Enroll {
+            code,
+            control_plane_url,
+        } => print_json(
+            &EnterpriseManager::global()?
+                .enroll(control_plane_url, code)
+                .await?,
+        ),
+        Command::Enterprise { action } => {
+            let manager = EnterpriseManager::global()?;
+            let value = match action {
+                EnterpriseCommand::Status => manager.status()?,
+                EnterpriseCommand::Explain => manager.explain()?,
+                EnterpriseCommand::Sync => manager.sync_with_backoff().await?,
+                EnterpriseCommand::Overrides {
+                    action: EnterpriseOverrideCommand::List,
+                } => manager.list_overrides()?,
+                EnterpriseCommand::Overrides {
+                    action:
+                        EnterpriseOverrideCommand::Disable {
+                            binding_key,
+                            reason,
+                        },
+                } => manager.set_override(binding_key, true, reason).await?,
+                EnterpriseCommand::Overrides {
+                    action:
+                        EnterpriseOverrideCommand::Enable {
+                            binding_key,
+                            reason,
+                        },
+                } => manager.set_override(binding_key, false, reason).await?,
+                EnterpriseCommand::Unenroll => manager.unenroll().await?,
+            };
+            print_json(&value)
+        }
         Command::Login {
             provider,
             api_key,
@@ -6444,7 +6599,8 @@ async fn run_daemon_management(
     }
     match action {
         DaemonCommand::Serve => {
-            let build = RuntimeBuildConfig::from_cli(cli);
+            let mut build = RuntimeBuildConfig::from_cli(cli);
+            apply_enterprise_build_policy(&mut build)?;
             build_runtime_for_session(&build, &cli.session).await?;
             let handle = DaemonServer::spawn(
                 config,
@@ -7418,7 +7574,8 @@ fn build_bash_runner(build: &RuntimeBuildConfig) -> Result<Arc<BashRunner>> {
     let policy = ToolPolicy {
         allow_process: !build.agent_mode.is_plan()
             && (build.allow_process || build.agent_mode == AgentMode::Auto),
-        allow_any_program: build.agent_mode == AgentMode::Auto,
+        allow_any_program: build.agent_mode == AgentMode::Auto
+            && !build.enterprise_shell_restricted,
         agent_mode: build.agent_mode,
         allowed_programs: Some(build.allowed_programs.clone()),
         approvals: Some(Arc::new(
@@ -7549,8 +7706,9 @@ async fn build_runtime_for_session(
     let auth = build.auth_store()?;
     let stored_provider_build = activate_first_stored_provider(build, &auth).await?;
     let activated_build = activate_migrated_preferences(&stored_provider_build, &activation);
-    let (effective_build, restored_thinking_level) =
+    let (mut effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
+    apply_enterprise_build_policy(&mut effective_build)?;
     let build = &effective_build;
     let extensions = if build.agent_mode.is_plan() {
         Vec::new()
@@ -7620,13 +7778,18 @@ async fn build_runtime_for_session(
             model_definition.context_window,
         )
     };
-    let thinking_level = resolve_runtime_thinking_level(
+    let mut thinking_level = resolve_runtime_thinking_level(
         build.thinking,
         restored_thinking_level,
         &supported_thinking_levels,
         &build.provider,
         &build.model,
     )?;
+    if let Some(maximum) = enterprise::maximum_thinking_level()?
+        && thinking_level > maximum
+    {
+        thinking_level = maximum;
+    }
     if build.agent_mode.is_plan() && extension_provider_selected {
         return Err(MimirError::Configuration(
             "plan mode supports native providers only".into(),
@@ -7669,9 +7832,13 @@ async fn build_runtime_for_session(
             .map_err(|error| MimirError::Configuration(error.to_string()))?
     };
     skills.extend(resources.skills.clone());
+    // Managed skills are part of the signed native policy and intentionally do
+    // not honor the local --no-skills compatibility switch.
+    skills.extend(enterprise::managed_skills()?);
     skills.sort_by(|left, right| left.name.cmp(&right.name));
+    let has_skills = !skills.is_empty();
     let skill_runtime = SkillRuntime::new(skills);
-    if !build.no_skills {
+    if has_skills {
         tool_registry
             .register_skill_search(&skill_runtime)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
@@ -7797,7 +7964,7 @@ async fn build_runtime_for_session(
         && !build.agent_mode.is_plan()
     {
         let missing = tool_registry.retain_named(allowed);
-        if !missing.is_empty() {
+        if build.tool_allowlist_strict && !missing.is_empty() {
             return Err(MimirError::Configuration(format!(
                 "unknown tool selection: {}",
                 missing.join(", ")
@@ -7929,9 +8096,16 @@ impl AutonomousGateRunner {
         let workspace = std::fs::canonicalize(&cli.workspace).map_err(|error| {
             MimirError::Configuration(format!("workspace is inaccessible: {error}"))
         })?;
+        let mut build = RuntimeBuildConfig::from_cli(cli);
+        apply_enterprise_build_policy(&mut build)?;
+        if !build.allow_process || build.allowed_programs.is_empty() {
+            return Err(MimirError::Configuration(
+                "enterprise policy does not permit the configured autonomous quality gates".into(),
+            ));
+        }
         let policy = ToolPolicy {
             allow_process: true,
-            allowed_programs: Some(cli.allowed_programs.clone()),
+            allowed_programs: Some(build.allowed_programs),
             command_timeout: std::time::Duration::from_millis(
                 cli.autonomous_gate_timeout_ms.unwrap_or(300_000),
             ),
@@ -9634,11 +9808,12 @@ async fn handle_legacy_bash(
     command: Option<&str>,
 ) -> Value {
     if !context.build.allow_process {
-        return legacy_error(
-            id,
-            "bash",
-            "bash is disabled; pass --allow-process to enable it",
-        );
+        let message = if context.build.enterprise_shell_restricted {
+            "bash is disabled by enterprise policy"
+        } else {
+            "bash is disabled; pass --allow-process to enable it"
+        };
+        return legacy_error(id, "bash", message);
     }
     let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) else {
         return legacy_error(id, "bash", "command must be a non-empty string");
@@ -10450,7 +10625,7 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
 
 #[cfg(test)]
 mod tui_model_selection_tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
     use crate::{
         auth::{AuthStore, OAuthCredential},
@@ -10469,14 +10644,15 @@ mod tui_model_selection_tests {
     use serde_json::json;
 
     use super::{
-        AutonomousLimitOverrides, Cli, Command, ConfigCommand, LimitValue, OutputMode,
-        PackageCommand, RuntimeBuildConfig, RuntimePromptHandler, ScheduleCommand, UpdateAction,
-        activate_first_stored_provider, autonomous_status_value, build_runtime_for_session,
-        daemon_runtime_error, ensure_fresh_session, parse_recovered_goal_create,
-        parse_recovered_refine_args, resolve_autonomous_limits, resolve_extension_flags,
-        resolve_runtime_thinking_level, resolve_session_root, resolve_tui_model_selection,
-        run_once_autonomous, run_self_update, runtime_model_definition, send_public_command,
-        tui_model_options, validate_run_options,
+        AutonomousLimitOverrides, Cli, Command, ConfigCommand, EnterpriseCommand,
+        EnterpriseOverrideCommand, LimitValue, OutputMode, PackageCommand, RuntimeBuildConfig,
+        RuntimePromptHandler, ScheduleCommand, UpdateAction, activate_first_stored_provider,
+        apply_enterprise_build_policy_values, autonomous_status_value, build_bash_runner,
+        build_runtime_for_session, daemon_runtime_error, ensure_fresh_session,
+        parse_recovered_goal_create, parse_recovered_refine_args, resolve_autonomous_limits,
+        resolve_extension_flags, resolve_runtime_thinking_level, resolve_session_root,
+        resolve_tui_model_selection, run_once_autonomous, run_self_update,
+        runtime_model_definition, send_public_command, tui_model_options, validate_run_options,
     };
 
     #[test]
@@ -10622,6 +10798,35 @@ mod tui_model_selection_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Login { ref provider, .. }) if provider == "anthropic"
+        ));
+    }
+
+    #[test]
+    fn enterprise_enrollment_and_override_commands_parse() {
+        let enroll =
+            Cli::try_parse_from(["mimir", "enroll", "mec_example"]).expect("enterprise enrollment");
+        assert!(matches!(
+            enroll.command,
+            Some(Command::Enroll { ref code, .. }) if code == "mec_example"
+        ));
+
+        let override_command = Cli::try_parse_from([
+            "mimir",
+            "enterprise",
+            "overrides",
+            "disable",
+            "observe.failures",
+            "--reason",
+            "local workflow",
+        ])
+        .expect("enterprise override");
+        assert!(matches!(
+            override_command.command,
+            Some(Command::Enterprise {
+                action: EnterpriseCommand::Overrides {
+                    action: EnterpriseOverrideCommand::Disable { .. }
+                }
+            })
         ));
     }
 
@@ -11135,7 +11340,9 @@ mod tui_model_selection_tests {
             allow_process: false,
             agent_mode: AgentMode::Default,
             allowed_programs: Vec::new(),
+            enterprise_shell_restricted: false,
             tool_allowlist: None,
+            tool_allowlist_strict: false,
             no_builtin_tools: false,
             extension_paths: Vec::new(),
             no_extensions: false,
@@ -11166,6 +11373,71 @@ mod tui_model_selection_tests {
             default_thinking_level: ThinkingLevel::Off,
             auth_store: None,
         }
+    }
+
+    #[test]
+    fn mandatory_empty_shell_allowlist_overrides_local_process_flags() {
+        let mut config = build("fake", "fake-model");
+        config.allow_process = true;
+        config.allowed_programs = vec!["printf".into()];
+
+        apply_enterprise_build_policy_values(&mut config, None, None, Some(&BTreeSet::new()))
+            .expect("enterprise policy");
+
+        assert!(!config.allow_process);
+        assert!(config.allowed_programs.is_empty());
+        assert!(config.enterprise_shell_restricted);
+    }
+
+    #[test]
+    fn mandatory_shell_allowlist_intersects_local_permissions() {
+        let mut config = build("fake", "fake-model");
+        config.allow_process = true;
+        config.allowed_programs = vec!["git".into(), "printf".into()];
+        let allowed = BTreeSet::from(["git".into(), "rg".into()]);
+
+        apply_enterprise_build_policy_values(&mut config, None, None, Some(&allowed))
+            .expect("enterprise policy");
+
+        assert!(config.allow_process);
+        assert_eq!(config.allowed_programs, ["git"]);
+        assert!(config.enterprise_shell_restricted);
+    }
+
+    #[test]
+    fn enterprise_tool_allowlist_is_an_upper_bound_not_a_required_catalog() {
+        let allowed = BTreeSet::from(["read_file".into(), "optional_tool".into()]);
+        let mut managed_only = build("fake", "fake-model");
+
+        apply_enterprise_build_policy_values(&mut managed_only, None, Some(&allowed), None)
+            .expect("enterprise policy");
+
+        assert_eq!(managed_only.tool_allowlist.as_ref(), Some(&allowed));
+        assert!(!managed_only.tool_allowlist_strict);
+
+        let mut explicit_local = build("fake", "fake-model");
+        explicit_local.tool_allowlist = Some(BTreeSet::from(["optional_tool".into()]));
+        explicit_local.tool_allowlist_strict = true;
+        apply_enterprise_build_policy_values(&mut explicit_local, None, Some(&allowed), None)
+            .expect("enterprise policy");
+        assert!(explicit_local.tool_allowlist_strict);
+    }
+
+    #[tokio::test]
+    async fn mandatory_shell_allowlist_bounds_auto_mode() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let mut config = build("fake", "fake-model");
+        config.workspace = workspace.path().into();
+        config.agent_mode = AgentMode::Auto;
+        let allowed = BTreeSet::from(["git".into()]);
+
+        apply_enterprise_build_policy_values(&mut config, None, None, Some(&allowed))
+            .expect("enterprise policy");
+        let runner = build_bash_runner(&config).expect("bounded runner");
+
+        assert!(config.allow_process);
+        assert_eq!(config.allowed_programs, ["git"]);
+        assert!(runner.execute("printf bypass").await.is_err());
     }
 
     #[tokio::test]

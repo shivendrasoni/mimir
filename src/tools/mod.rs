@@ -662,6 +662,16 @@ impl ToolRegistry {
     }
 
     fn enforce_mode(&self, name: &str) -> Result<(), ToolError> {
+        match crate::enterprise::tool_allowed(name) {
+            Ok(true) => {}
+            Ok(false) => return Err(ToolError::Disabled { tool: name.into() }),
+            Err(error) => {
+                return Err(ToolError::Execution {
+                    tool: name.into(),
+                    message: format!("enterprise policy gate failed: {error}"),
+                });
+            }
+        }
         if name == "finish_task"
             && !self
                 .task_completion

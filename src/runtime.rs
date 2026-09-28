@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -42,6 +42,43 @@ use crate::{
 const AGENT_MESSAGE_PREFIX: &str = "Agent-to-agent message received.\nSource: agent_message\n";
 const MAX_PENDING_AGENT_MESSAGES: usize = 20;
 const PROVENANCE_SYSTEM_GUIDANCE: &str = "For source-derived writes or edits, set provenance.required=true and list every exact workspace-relative source path in derivedFrom. toolCallId is optional; omit uncertain ids. Read missing sources before retrying.";
+
+fn duration_bucket(duration: Duration) -> String {
+    if duration < Duration::from_millis(100) {
+        "lt_100ms"
+    } else if duration < Duration::from_secs(1) {
+        "lt_1s"
+    } else if duration < Duration::from_secs(10) {
+        "lt_10s"
+    } else {
+        "gte_10s"
+    }
+    .into()
+}
+
+#[cfg(test)]
+mod managed_lifecycle_tests {
+    use super::duration_bucket;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_buckets_match_enterprise_wire_values() {
+        assert_eq!(duration_bucket(Duration::from_millis(99)), "lt_100ms");
+        assert_eq!(duration_bucket(Duration::from_millis(100)), "lt_1s");
+        assert_eq!(duration_bucket(Duration::from_millis(999)), "lt_1s");
+        assert_eq!(duration_bucket(Duration::from_secs(1)), "lt_10s");
+        assert_eq!(duration_bucket(Duration::from_secs(10)), "gte_10s");
+    }
+}
+
+fn enterprise_tool_allowlist() -> Option<BTreeSet<String>> {
+    crate::enterprise::allowed_values("restrict_tools", "allowed")
+        .unwrap_or_else(|_| Some(BTreeSet::new()))
+}
+
+fn tool_name_visible(name: &str, allowlist: Option<&BTreeSet<String>>) -> bool {
+    name == "finish_task" || allowlist.is_none_or(|allowed| allowed.contains(name))
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -378,6 +415,7 @@ pub struct AgentRuntime {
     extension_flags: RwLock<BTreeMap<String, serde_json::Value>>,
     active_tools: RwLock<Option<BTreeSet<String>>>,
     extension_session_started: AtomicBool,
+    managed_lifecycle_started: StdMutex<BTreeMap<String, Instant>>,
     events: RuntimeEventBus,
 }
 
@@ -555,6 +593,7 @@ impl AgentRuntime {
             extension_flags: RwLock::new(BTreeMap::new()),
             active_tools: RwLock::new(None),
             extension_session_started: AtomicBool::new(false),
+            managed_lifecycle_started: StdMutex::new(BTreeMap::new()),
             events: RuntimeEventBus::default(),
         })
     }
@@ -814,8 +853,10 @@ impl AgentRuntime {
     pub async fn extension_host_snapshot(&self) -> ExtensionHostSnapshot {
         let manager = self.extensions.read().await.clone();
         let definitions = self.tools.definitions();
+        let enterprise_allowed = enterprise_tool_allowlist();
         let configured = definitions
             .iter()
+            .filter(|definition| tool_name_visible(&definition.name, enterprise_allowed.as_ref()))
             .map(|definition| definition.name.clone())
             .collect::<BTreeSet<_>>();
         let active_tools = self
@@ -823,7 +864,10 @@ impl AgentRuntime {
             .read()
             .await
             .clone()
-            .unwrap_or_else(|| configured.clone());
+            .unwrap_or_else(|| configured.clone())
+            .into_iter()
+            .filter(|name| configured.contains(name))
+            .collect::<BTreeSet<_>>();
         let selection = self.selection.read().await;
         let messages = self.messages.lock().await;
         let estimated_tokens = messages
@@ -833,6 +877,7 @@ impl AgentRuntime {
             .fold(0_u64, u64::saturating_add);
         let all_tools = definitions
             .into_iter()
+            .filter(|definition| tool_name_visible(&definition.name, enterprise_allowed.as_ref()))
             .map(|definition| ExtensionToolInfo {
                 name: definition.name,
                 description: definition.description,
@@ -999,10 +1044,14 @@ impl AgentRuntime {
                 .await?;
             }
             ExtensionHostAction::SetActiveTools { names } => {
+                let enterprise_allowed = enterprise_tool_allowlist();
                 let available = self
                     .tools
                     .definitions()
                     .into_iter()
+                    .filter(|definition| {
+                        tool_name_visible(&definition.name, enterprise_allowed.as_ref())
+                    })
                     .map(|definition| definition.name)
                     .collect::<BTreeSet<_>>();
                 let selected = names.iter().cloned().collect::<BTreeSet<_>>();
@@ -1081,6 +1130,7 @@ impl AgentRuntime {
         typesafe_shortlist: Option<&BTreeSet<String>>,
     ) -> Vec<crate::model::ToolDefinition> {
         let definitions = self.tools.definitions();
+        let enterprise_allowed = enterprise_tool_allowlist();
         let active = self.active_tools.read().await;
         let recovery_available = definitions
             .iter()
@@ -1097,6 +1147,7 @@ impl AgentRuntime {
                     .is_none_or(|active| active.contains(&definition.name))
                     && typesafe_shortlist
                         .is_none_or(|shortlist| shortlist.contains(&definition.name))
+                    && tool_name_visible(&definition.name, enterprise_allowed.as_ref())
             })
             .collect()
     }
@@ -1116,6 +1167,7 @@ impl AgentRuntime {
             && typesafe_shortlist
                 .filter(|_| recovery_available)
                 .is_none_or(|shortlist| shortlist.contains(name))
+            && crate::enterprise::tool_visible(name).unwrap_or(false)
     }
 
     /// Renders a registered custom message and emits its bounded terminal lines.
@@ -1365,10 +1417,12 @@ impl AgentRuntime {
 
     /// Returns the effective active tool names used for the next provider request.
     pub async fn active_tool_names(&self) -> Vec<String> {
+        let enterprise_allowed = enterprise_tool_allowlist();
         let configured = self
             .tools
             .definitions()
             .into_iter()
+            .filter(|definition| tool_name_visible(&definition.name, enterprise_allowed.as_ref()))
             .map(|definition| definition.name)
             .collect::<BTreeSet<_>>();
         self.active_tools
@@ -1377,6 +1431,7 @@ impl AgentRuntime {
             .clone()
             .unwrap_or(configured)
             .into_iter()
+            .filter(|name| tool_name_visible(name, enterprise_allowed.as_ref()))
             .collect()
     }
 
@@ -1410,6 +1465,11 @@ impl AgentRuntime {
                 "provider and model must not be blank".into(),
             ));
         }
+        if !crate::enterprise::model_allowed(provider_id, model)? {
+            return Err(MimirError::Configuration(format!(
+                "enterprise policy does not permit model {provider_id}/{model}"
+            )));
+        }
         let supported_thinking_levels = normalize_thinking_levels(&supported_thinking_levels);
         let mut selection = self.selection.write().await;
         let thinking_level =
@@ -1439,6 +1499,8 @@ impl AgentRuntime {
     /// Returns a persistence error when the effective level cannot be recorded.
     pub async fn set_thinking_level(&self, requested: ThinkingLevel) -> Result<ThinkingLevel> {
         let mut selection = self.selection.write().await;
+        let requested = crate::enterprise::maximum_thinking_level()?
+            .map_or(requested, |maximum| requested.min(maximum));
         let effective = clamp_thinking_level(requested, &selection.supported_thinking_levels);
         if effective == selection.thinking_level {
             return Ok(effective);
@@ -1470,8 +1532,11 @@ impl AgentRuntime {
             .iter()
             .position(|level| *level == selection.thinking_level)
             .unwrap_or(0);
-        let next = selection.supported_thinking_levels
+        let mut next = selection.supported_thinking_levels
             [(current + 1) % selection.supported_thinking_levels.len()];
+        if let Some(maximum) = crate::enterprise::maximum_thinking_level()? {
+            next = next.min(maximum);
+        }
         persist_model_selection(
             self.store.as_ref(),
             &selection.provider_id,
@@ -2686,12 +2751,20 @@ impl AgentRuntime {
                     "extension selected a blank model".into(),
                 ));
             }
+            if !crate::enterprise::model_allowed(&provider_id, &model)? {
+                return Err(MimirError::Configuration(format!(
+                    "enterprise policy does not permit model {provider_id}/{model}"
+                )));
+            }
             let supported = self
                 .selection
                 .read()
                 .await
                 .supported_thinking_levels
                 .clone();
+            if let Some(maximum) = crate::enterprise::maximum_thinking_level()? {
+                thinking_level = thinking_level.min(maximum);
+            }
             thinking_level = clamp_thinking_level(thinking_level, &supported);
             let thinking_effort = thinking_level_map
                 .as_ref()
@@ -3575,6 +3648,7 @@ impl AgentRuntime {
         sink: &dyn EventSink,
         snapshot: ExtensionHostSnapshot,
     ) -> Result<Vec<crate::extensions::LifecycleOutcome>> {
+        self.observe_managed_lifecycle(&event, sink).await;
         let Some(manager) = self.extensions.read().await.clone() else {
             return Ok(Vec::new());
         };
@@ -3593,6 +3667,84 @@ impl AgentRuntime {
             collected.push(dispatched.outcome);
         }
         Ok(collected)
+    }
+
+    async fn observe_managed_lifecycle(&self, event: &LifecycleEvent, sink: &dyn EventSink) {
+        let (hook, failed, timer_start, timer_end) = match event {
+            LifecycleEvent::SessionStart { .. } => ("session_start", false, None, None),
+            LifecycleEvent::SessionShutdown { .. } => ("session_shutdown", false, None, None),
+            LifecycleEvent::AgentStart { .. } => {
+                ("agent_start", false, Some("agent".to_owned()), None)
+            }
+            LifecycleEvent::AgentEnd { success, .. } => {
+                ("agent_end", !success, None, Some("agent".to_owned()))
+            }
+            LifecycleEvent::TurnStart { turn_index, .. } => (
+                "turn_start",
+                false,
+                Some(format!("turn:{turn_index}")),
+                None,
+            ),
+            LifecycleEvent::TurnEnd { turn_index, .. } => {
+                ("turn_end", false, None, Some(format!("turn:{turn_index}")))
+            }
+            LifecycleEvent::BeforeProviderRequest { .. } => (
+                "before_provider_request",
+                false,
+                Some("provider".into()),
+                None,
+            ),
+            LifecycleEvent::AfterProviderResponse { success, .. } => (
+                "after_provider_response",
+                !success,
+                None,
+                Some("provider".into()),
+            ),
+            LifecycleEvent::ToolExecutionStart { tool_call_id, .. } => (
+                "tool_execution_start",
+                false,
+                Some(format!("tool:{tool_call_id}")),
+                None,
+            ),
+            LifecycleEvent::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            } => (
+                "tool_execution_end",
+                *is_error,
+                None,
+                Some(format!("tool:{tool_call_id}")),
+            ),
+            LifecycleEvent::RefineComplete { .. } => ("refine_complete", false, None, None),
+            _ => return,
+        };
+        let duration_bucket = {
+            let mut started = self
+                .managed_lifecycle_started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(key) = timer_start {
+                started.insert(key, Instant::now());
+            }
+            timer_end
+                .and_then(|key| started.remove(&key))
+                .map(|start| duration_bucket(start.elapsed()))
+        };
+        match crate::enterprise::observe_lifecycle(hook, failed, duration_bucket.as_deref()) {
+            Ok(effect) if effect.notify_failure => {
+                sink.emit(RuntimeEvent::ExtensionUi {
+                    extension: "enterprise_policy".into(),
+                    request: UiRequest::Notify {
+                        level: "warning".into(),
+                        message: "A managed harness operation reported a failure.".into(),
+                    },
+                })
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("warning: managed lifecycle observation failed: {error}"),
+        }
     }
 
     async fn start_extension_session_with_sink(

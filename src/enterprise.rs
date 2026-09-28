@@ -24,9 +24,12 @@ use crate::{
     error::{MimirError, Result},
     model::ThinkingLevel,
     resources::Skill,
+    tools::ToolInventoryItem,
 };
 
 const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_INVENTORY_ITEMS: usize = 2_048;
+const MAX_INVENTORY_ALLOWED_PROGRAMS: usize = 256;
 const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CONFIG_FILE: &str = "enrollment.json";
 const PROFILE_FILE: &str = "profile.json";
@@ -63,6 +66,10 @@ pub struct FleetLearningConnection {
     pub local_development: bool,
 }
 
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "the hand-written Debug output intentionally exposes only bounded connection metadata"
+)]
 impl std::fmt::Debug for FleetLearningConnection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -190,6 +197,27 @@ struct ComplianceEvent {
 struct PolicyEvaluation {
     allowed: bool,
     events: Vec<ComplianceEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManagedLifecycleEffect {
+    pub notify_failure: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalProcessInventory {
+    enabled: bool,
+    allowed_programs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolInventoryReport<'a> {
+    schema: u8,
+    release_id: Uuid,
+    mimir_version: &'static str,
+    fingerprint: &'a str,
+    tools: &'a [ToolInventoryItem],
+    local_process: LocalProcessInventory,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,9 +403,27 @@ impl EnterpriseManager {
                 "signed profile envelope exceeds size limit".into(),
             ));
         }
-        let envelope: SignedHarnessProfileEnvelope = serde_json::from_slice(&bytes)?;
-        let profile = verify_envelope(&envelope, &enrollment.signing_public_key_base64)?;
-        validate_profile(&profile)?;
+        let envelope: SignedHarnessProfileEnvelope = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.report_profile_rejected(&enrollment, "invalid_envelope")
+                    .await;
+                return Err(error.into());
+            }
+        };
+        let profile = match verify_envelope(&envelope, &enrollment.signing_public_key_base64) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.report_profile_rejected(&enrollment, "invalid_signature_or_payload")
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_profile(&profile) {
+            self.report_profile_rejected(&enrollment, "unsupported_or_invalid_profile")
+                .await;
+            return Err(error);
+        }
         self.activate_envelope(&envelope)?;
         enrollment.etag = etag;
         write_secure_json(&self.root.join(CONFIG_FILE), &enrollment)?;
@@ -440,6 +486,7 @@ impl EnterpriseManager {
                 "critical": binding.critical,
                 "disabled": override_disabled(&overrides, binding),
                 "order": binding.order,
+                "parameters": binding.parameters,
             })).collect::<Vec<_>>(),
             "skills": profile.skills.iter().map(|skill| json!({
                 "id": skill.id,
@@ -640,6 +687,14 @@ impl EnterpriseManager {
         self.send_events(enrollment, &[event]).await
     }
 
+    async fn report_profile_rejected(&self, enrollment: &Enrollment, error_code: &str) {
+        if let Ok(active) = self.load_profile() {
+            let _ = self
+                .report_event(enrollment, &active, "profile_rejected", Some(error_code))
+                .await;
+        }
+    }
+
     async fn send_events(&self, enrollment: &Enrollment, events: &[ComplianceEvent]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -663,6 +718,45 @@ impl EnterpriseManager {
         Ok(())
     }
 
+    async fn send_tool_inventory(
+        &self,
+        enrollment: &Enrollment,
+        profile: &CompiledHarnessProfile,
+        fingerprint: &str,
+        tools: &[ToolInventoryItem],
+        process_enabled: bool,
+        allowed_programs: &[String],
+    ) -> Result<()> {
+        validate_tool_inventory_bounds(fingerprint, tools.len(), allowed_programs.len())?;
+        let endpoint = validate_endpoint(&enrollment.endpoint)?;
+        let response = self
+            .client
+            .put(
+                endpoint
+                    .join("v1/harness/tool-inventory")
+                    .map_err(configuration_error)?,
+            )
+            .bearer_auth(&enrollment.installation_token)
+            .json(&ToolInventoryReport {
+                schema: 1,
+                release_id: profile.release_id,
+                mimir_version: env!("CARGO_PKG_VERSION"),
+                fingerprint,
+                tools,
+                local_process: LocalProcessInventory {
+                    enabled: process_enabled,
+                    allowed_programs: allowed_programs.to_vec(),
+                },
+            })
+            .send()
+            .await
+            .map_err(http_error)?;
+        if !response.status().is_success() {
+            return Err(server_error("tool inventory", response).await);
+        }
+        Ok(())
+    }
+
     fn report_events_best_effort(&self, enrollment: Enrollment, events: Vec<ComplianceEvent>) {
         if events.is_empty() {
             return;
@@ -675,6 +769,64 @@ impl EnterpriseManager {
             let _ = manager.send_events(&enrollment, &events).await;
         });
     }
+}
+
+fn validate_tool_inventory_bounds(
+    fingerprint: &str,
+    tool_count: usize,
+    allowed_program_count: usize,
+) -> Result<()> {
+    if fingerprint.len() != 64
+        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || tool_count > MAX_TOOL_INVENTORY_ITEMS
+        || allowed_program_count > MAX_INVENTORY_ALLOWED_PROGRAMS
+    {
+        return Err(MimirError::Configuration(
+            "tool inventory exceeds its metadata bounds".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reports only bounded tool metadata. Delivery never changes local policy or
+/// prevents the runtime from starting.
+pub fn report_tool_inventory_best_effort(
+    fingerprint: &str,
+    tools: &[ToolInventoryItem],
+    process_enabled: bool,
+    allowed_programs: &[String],
+) {
+    if !is_enrolled().unwrap_or(false) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let fingerprint = fingerprint.to_owned();
+    let tools = tools.to_vec();
+    let allowed_programs = allowed_programs.to_vec();
+    runtime.spawn(async move {
+        let result = async {
+            let manager = EnterpriseManager::global()?;
+            let enrollment = manager.load_enrollment()?;
+            let profile = manager.load_profile()?;
+            enforce_expiry(&profile)?;
+            manager
+                .send_tool_inventory(
+                    &enrollment,
+                    &profile,
+                    &fingerprint,
+                    &tools,
+                    process_enabled,
+                    &allowed_programs,
+                )
+                .await
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("warning: enterprise tool inventory report failed: {error}");
+        }
+    });
 }
 
 /// Synchronizes an enrollment at startup, then verifies offline-expiry policy.
@@ -741,6 +893,21 @@ pub fn tool_allowed(tool: &str) -> Result<bool> {
         return Ok(true);
     }
     evaluate_allowlist_policy("restrict_tools", "allowed", tool, "tool_not_allowed")
+}
+
+/// Content-free visibility check used while constructing provider tool lists.
+/// Unlike the invocation gate this does not emit a policy-decision event.
+pub fn tool_visible(tool: &str) -> Result<bool> {
+    if tool == "finish_task" {
+        return Ok(true);
+    }
+    Ok(allowed_values("restrict_tools", "allowed")?.is_none_or(|allowed| allowed.contains(tool)))
+}
+
+pub fn model_allowed(provider: &str, model: &str) -> Result<bool> {
+    let selector = format!("{provider}/{model}");
+    Ok(allowed_values("restrict_models", "allowed")?
+        .is_none_or(|allowed| allowed.contains(&selector) || allowed.contains(model)))
 }
 
 /// Final native shell-program gate. The attempted command and its arguments never leave Mimir.
@@ -914,6 +1081,81 @@ pub fn maximum_thinking_level() -> Result<Option<ThinkingLevel>> {
         })
 }
 
+/// Applies content-free managed observability bindings for one lifecycle event.
+/// Delivery is best effort and cannot change the runtime outcome.
+pub fn observe_lifecycle(
+    hook: &str,
+    failed: bool,
+    duration_bucket: Option<&str>,
+) -> Result<ManagedLifecycleEffect> {
+    if !is_enrolled()? {
+        return Ok(ManagedLifecycleEffect::default());
+    }
+    let manager = EnterpriseManager::global()?;
+    let enrollment = manager.load_enrollment()?;
+    let profile = manager.load_profile()?;
+    enforce_expiry(&profile)?;
+    let overrides = manager.load_overrides()?;
+    let (effect, events) = evaluate_lifecycle(&profile, &overrides, hook, failed, duration_bucket);
+    manager.report_events_best_effort(enrollment, events);
+    Ok(effect)
+}
+
+fn evaluate_lifecycle(
+    profile: &CompiledHarnessProfile,
+    overrides: &OverrideStore,
+    hook: &str,
+    failed: bool,
+    duration_bucket: Option<&str>,
+) -> (ManagedLifecycleEffect, Vec<ComplianceEvent>) {
+    let mut events = Vec::new();
+    let mut effect = ManagedLifecycleEffect::default();
+    for binding in profile
+        .bindings
+        .iter()
+        .filter(|binding| binding.hook == hook && !override_disabled(overrides, binding))
+    {
+        let (event_type, reported_duration, error_code) = match binding.action.as_str() {
+            "record_metadata" => (Some("lifecycle_observed"), None, None),
+            "measure_duration"
+                if duration_bucket.is_some() && telemetry_enabled(profile, "duration_bucket") =>
+            {
+                (Some("duration_observed"), duration_bucket, None)
+            }
+            "notify_failure" if failed => {
+                effect.notify_failure = true;
+                if telemetry_enabled(profile, "failure_code") {
+                    (
+                        Some("failure_observed"),
+                        None,
+                        Some("managed_lifecycle_failure"),
+                    )
+                } else {
+                    (None, None, None)
+                }
+            }
+            _ => (None, None, None),
+        };
+        if let Some(event_type) = event_type {
+            events.push(ComplianceEvent {
+                schema: 1,
+                event_id: Uuid::new_v4(),
+                release_id: profile.release_id,
+                binding_key: Some(binding.key.clone()),
+                hook: Some(binding.hook.clone()),
+                action: Some(binding.action.clone()),
+                event_type: event_type.into(),
+                occurred_at: Utc::now(),
+                duration_bucket: reported_duration.map(str::to_owned),
+                decision: None,
+                error_code: error_code.map(str::to_owned),
+                mimir_version: env!("CARGO_PKG_VERSION").into(),
+            });
+        }
+    }
+    (effect, events)
+}
+
 fn verify_envelope(
     envelope: &SignedHarnessProfileEnvelope,
     public_key_base64: &str,
@@ -974,6 +1216,7 @@ fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
                 "compiled binding exceeds bounds".into(),
             ));
         }
+        validate_binding(binding)?;
         if profile.revoked_catalog_items.contains(&format!(
             "{}@{}",
             binding.action.replace('_', "-"),
@@ -995,6 +1238,120 @@ fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
                 skill.id
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_binding(binding: &HarnessBinding) -> Result<()> {
+    let version_supported = binding.catalog_version == "1.0.0";
+    if !version_supported {
+        return Err(MimirError::Configuration(format!(
+            "compiled binding {} uses unsupported {} catalog version {}",
+            binding.key, binding.action, binding.catalog_version
+        )));
+    }
+    let compatible = match binding.action.as_str() {
+        "record_metadata" => &[
+            "session_start",
+            "session_shutdown",
+            "agent_start",
+            "agent_end",
+            "turn_start",
+            "turn_end",
+            "tool_execution_start",
+            "tool_execution_end",
+            "after_provider_response",
+            "refine_complete",
+        ][..],
+        "measure_duration" => &[
+            "agent_end",
+            "turn_end",
+            "tool_execution_end",
+            "after_provider_response",
+        ][..],
+        "notify_failure" => &["agent_end", "tool_execution_end", "after_provider_response"][..],
+        "restrict_tools" => &["tool_call"][..],
+        "restrict_shell_programs" => &["user_bash"][..],
+        "restrict_models" => &["model_select"][..],
+        "limit_thinking_level" => &["thinking_level_select"][..],
+        unsupported => {
+            return Err(MimirError::Configuration(format!(
+                "compiled binding {} uses unsupported action {unsupported}",
+                binding.key
+            )));
+        }
+    };
+    if !compatible.contains(&binding.hook.as_str()) {
+        return Err(MimirError::Configuration(format!(
+            "compiled binding {} uses action {} on incompatible hook {}",
+            binding.key, binding.action, binding.hook
+        )));
+    }
+    validate_binding_parameters(binding)
+}
+
+fn validate_binding_parameters(binding: &HarnessBinding) -> Result<()> {
+    match binding.action.as_str() {
+        "record_metadata" | "measure_duration" | "notify_failure" => {
+            if binding
+                .parameters
+                .as_object()
+                .is_none_or(|value| !value.is_empty())
+            {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} must use empty parameters",
+                    binding.key
+                )));
+            }
+        }
+        "restrict_tools" | "restrict_shell_programs" | "restrict_models" => {
+            let Some(values) = binding.parameters.get("allowed").and_then(Value::as_array) else {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} requires an allowed array",
+                    binding.key
+                )));
+            };
+            if values.len() > 1_024
+                || values.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_none_or(|value| value.is_empty() || value.len() > 256)
+                })
+            {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} has an invalid allowed array",
+                    binding.key
+                )));
+            }
+            let unique = values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>();
+            if unique.len() != values.len()
+                || binding.parameters.as_object().is_none_or(|o| o.len() != 1)
+            {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} has duplicate or unknown allowlist parameters",
+                    binding.key
+                )));
+            }
+        }
+        "limit_thinking_level" => {
+            let Some(maximum) = binding.parameters.get("maximum").and_then(Value::as_str) else {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} requires maximum",
+                    binding.key
+                )));
+            };
+            parse_thinking_level(maximum)?;
+            if binding.parameters.as_object().is_none_or(|o| o.len() != 1) {
+                return Err(MimirError::Configuration(format!(
+                    "compiled binding {} has unknown thinking parameters",
+                    binding.key
+                )));
+            }
+        }
+        _ => unreachable!("supported action match is exhaustive"),
     }
     Ok(())
 }
@@ -1083,6 +1440,10 @@ fn enterprise_state_dir() -> Result<PathBuf> {
 }
 
 fn is_enrolled() -> Result<bool> {
+    #[cfg(test)]
+    if std::env::var_os("MIMIR_ENTERPRISE_STATE_DIR").is_none() {
+        return Ok(false);
+    }
     Ok(enterprise_state_dir()?.join(CONFIG_FILE).is_file())
 }
 
@@ -1239,6 +1600,19 @@ mod tests {
         }
     }
 
+    fn observation(key: &str, hook: &str, action: &str) -> HarnessBinding {
+        HarnessBinding {
+            key: key.into(),
+            hook: hook.into(),
+            action: action.into(),
+            catalog_version: "1.0.0".into(),
+            enforcement: Enforcement::Default,
+            order: 100,
+            critical: false,
+            parameters: json!({}),
+        }
+    }
+
     fn enrollment(endpoint: String, profile: &CompiledHarnessProfile) -> Enrollment {
         Enrollment {
             schema: 1,
@@ -1320,6 +1694,121 @@ mod tests {
     }
 
     #[test]
+    fn profile_validation_rejects_advertised_but_unsupported_actions() {
+        let mut profile = profile_with(
+            vec![HarnessBinding {
+                key: "unsupported.block".into(),
+                hook: "tool_call".into(),
+                action: "block".into(),
+                catalog_version: "1.0.0".into(),
+                enforcement: Enforcement::Mandatory,
+                order: 1,
+                critical: true,
+                parameters: json!({"reason_code": "denied"}),
+            }],
+            &[],
+        );
+        assert!(validate_profile(&profile).is_err());
+        profile.bindings[0] = restriction(
+            "policy.tools",
+            "tool_call",
+            "restrict_tools",
+            &["read_file", "read_file"],
+        );
+        assert!(validate_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn profile_validation_accepts_dormant_future_tool_selections() {
+        let profile = profile_with(
+            vec![restriction(
+                "policy.tools",
+                "tool_call",
+                "restrict_tools",
+                &["read_file", "future_unavailable_tool"],
+            )],
+            &[],
+        );
+        assert!(validate_profile(&profile).is_ok());
+    }
+
+    #[test]
+    fn expired_critical_profiles_fail_closed_but_noncritical_defaults_do_not() {
+        let mut critical = profile_with(
+            vec![restriction(
+                "policy.tools",
+                "tool_call",
+                "restrict_tools",
+                &["read_file"],
+            )],
+            &[],
+        );
+        critical.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(enforce_expiry(&critical).is_err());
+
+        let mut noncritical = profile_with(
+            vec![observation(
+                "observe.lifecycle",
+                "agent_end",
+                "record_metadata",
+            )],
+            &[],
+        );
+        noncritical.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(enforce_expiry(&noncritical).is_ok());
+    }
+
+    #[test]
+    fn observability_events_match_wire_contract_and_privacy_gates() {
+        let bindings = vec![
+            observation("observe.lifecycle", "agent_end", "record_metadata"),
+            observation("observe.duration", "agent_end", "measure_duration"),
+            observation("observe.failure", "agent_end", "notify_failure"),
+        ];
+        let profile = profile_with(bindings.clone(), &["duration_bucket", "failure_code"]);
+        let (effect, events) = evaluate_lifecycle(
+            &profile,
+            &OverrideStore::default(),
+            "agent_end",
+            true,
+            Some("lt_1s"),
+        );
+        assert!(effect.notify_failure);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "lifecycle_observed");
+        assert_eq!(events[0].duration_bucket, None);
+        assert_eq!(events[1].event_type, "duration_observed");
+        assert_eq!(events[1].duration_bucket.as_deref(), Some("lt_1s"));
+        assert_eq!(events[2].event_type, "failure_observed");
+        assert_eq!(
+            events[2].error_code.as_deref(),
+            Some("managed_lifecycle_failure")
+        );
+
+        let private_profile = profile_with(bindings, &[]);
+        let (effect, events) = evaluate_lifecycle(
+            &private_profile,
+            &OverrideStore::default(),
+            "agent_end",
+            true,
+            Some("lt_1s"),
+        );
+        assert!(effect.notify_failure);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "lifecycle_observed");
+        assert!(events[0].duration_bucket.is_none());
+        assert!(events[0].error_code.is_none());
+    }
+
+    #[test]
+    fn observability_catalog_version_is_exact() {
+        let mut binding = observation("observe.lifecycle", "agent_end", "record_metadata");
+        assert!(validate_binding(&binding).is_ok());
+        binding.catalog_version = "1.1.0".into();
+        assert!(validate_binding(&binding).is_err());
+    }
+
+    #[test]
     fn enterprise_state_files_are_owner_only() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let manager = EnterpriseManager::at(temporary.path().join("enterprise")).expect("manager");
@@ -1344,6 +1833,97 @@ mod tests {
     fn endpoint_rejects_unencrypted_remote_control_planes() {
         assert!(validate_endpoint("http://example.com").is_err());
         assert!(validate_endpoint("http://localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn tool_inventory_bounds_match_the_control_plane_contract() {
+        let fingerprint = "a".repeat(64);
+        assert!(
+            validate_tool_inventory_bounds(
+                &fingerprint,
+                MAX_TOOL_INVENTORY_ITEMS,
+                MAX_INVENTORY_ALLOWED_PROGRAMS,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_inventory_bounds(
+                &fingerprint,
+                MAX_TOOL_INVENTORY_ITEMS + 1,
+                MAX_INVENTORY_ALLOWED_PROGRAMS,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_inventory_bounds(
+                &fingerprint,
+                MAX_TOOL_INVENTORY_ITEMS,
+                MAX_INVENTORY_ALLOWED_PROGRAMS + 1,
+            )
+            .is_err()
+        );
+        assert!(validate_tool_inventory_bounds(&"z".repeat(64), 0, 0).is_err());
+    }
+
+    #[test]
+    fn tool_inventory_json_matches_the_frozen_wire_shape() {
+        let tool = ToolInventoryItem {
+            id: "read_file".into(),
+            label: "Read file".into(),
+            source: crate::tools::ToolInventorySource {
+                kind: "builtin".into(),
+                id: "mimir".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+            capabilities: vec!["workspace_read".into()],
+            risk: "read_only".into(),
+            availability: "available".into(),
+            availability_reason_code: None,
+            required_by_runtime: false,
+        };
+        let fingerprint = "a".repeat(64);
+        let tools = vec![tool];
+        let report = ToolInventoryReport {
+            schema: 1,
+            release_id: Uuid::nil(),
+            mimir_version: env!("CARGO_PKG_VERSION"),
+            fingerprint: &fingerprint,
+            tools: &tools,
+            local_process: LocalProcessInventory {
+                enabled: true,
+                allowed_programs: vec!["git".into()],
+            },
+        };
+        let value = serde_json::to_value(report).expect("inventory json");
+        let top = value.as_object().expect("top-level object");
+        assert_eq!(
+            top.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "fingerprint",
+                "local_process",
+                "mimir_version",
+                "release_id",
+                "schema",
+                "tools",
+            ])
+        );
+        let item = value["tools"][0].as_object().expect("tool object");
+        assert_eq!(
+            item.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "availability",
+                "capabilities",
+                "id",
+                "label",
+                "required_by_runtime",
+                "risk",
+                "source",
+            ])
+        );
+        assert_eq!(value["tools"][0]["risk"], "read_only");
+        assert_eq!(value["tools"][0]["source"]["kind"], "builtin");
+        assert_eq!(value["tools"][0]["availability"], "available");
+        assert_eq!(value["local_process"]["allowed_programs"][0], "git");
     }
 
     #[test]

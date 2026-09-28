@@ -82,7 +82,7 @@ impl BashTool {
     pub fn new(workspace: &Path, policy: ToolPolicy) -> Result<Self, ToolError> {
         let mut runner_policy = policy.clone();
         runner_policy.allow_process = true;
-        runner_policy.allow_any_program = true;
+        runner_policy.allow_any_program = policy.allowed_programs.is_none();
         runner_policy.approvals = None;
         Ok(Self {
             runner: BashRunner::new(workspace, runner_policy)?,
@@ -236,6 +236,10 @@ impl BashRunner {
         self.execute_inner(command, Some(output), None).await
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "command approval, managed-policy parsing, execution, cancellation, and capture remain in one audited path"
+    )]
     async fn execute_inner(
         &self,
         command: &str,
@@ -254,12 +258,27 @@ impl BashRunner {
                 message: "command must not be blank".into(),
             });
         }
-        validate_allowlisted_command(
-            command,
-            self.policy.allowed_programs.as_deref(),
-            self.policy.allow_any_program,
-        )?;
-        enforce_enterprise_allowlist(command)?;
+        let enterprise_allowed =
+            crate::enterprise::allowed_values("restrict_shell_programs", "allowed").map_err(
+                |error| ToolError::Execution {
+                    tool: "bash".into(),
+                    message: format!("enterprise policy gate failed: {error}"),
+                },
+            )?;
+        let local_programs_restricted = !self.policy.allow_any_program;
+        let managed_argv = (local_programs_restricted || enterprise_allowed.is_some())
+            .then(|| parse_managed_command(command))
+            .transpose()?;
+        if let Some(argv) = &managed_argv {
+            if local_programs_restricted {
+                validate_allowlisted_program(
+                    &argv[0],
+                    self.policy.allowed_programs.as_deref(),
+                    false,
+                )?;
+            }
+            enforce_enterprise_program(&argv[0])?;
+        }
         if !self.policy.agent_mode.automatically_approves()
             && let Some(approvals) = &self.policy.approvals
             && let Some(request) = approvals.requires_approval(command)?
@@ -286,10 +305,14 @@ impl BashRunner {
         // the original command; RTK only rewrites that approved command into
         // an output-filtering proxy invocation. Missing, outdated, denied, or
         // slow RTK installations therefore degrade to the original command.
-        let rewritten = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => None,
-            rewritten = rewrite_with_rtk(command, self.paths.root()) => rewritten,
+        let rewritten = if managed_argv.is_none() {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => None,
+                rewritten = rewrite_with_rtk(command, self.paths.root()) => rewritten,
+            }
+        } else {
+            None
         };
         let command = rewritten.as_deref().unwrap_or(command);
         let result = if cancellation.is_cancelled() {
@@ -302,9 +325,15 @@ impl BashRunner {
                 timed_out: false,
             })
         } else {
-            let child = spawn_shell(command, self.paths.root()).inspect_err(|_error| {
-                self.running.store(false, Ordering::Release);
-            })?;
+            let child = managed_argv
+                .as_ref()
+                .map_or_else(
+                    || spawn_shell(command, self.paths.root()),
+                    |argv| spawn_program(argv, self.paths.root()),
+                )
+                .inspect_err(|_error| {
+                    self.running.store(false, Ordering::Release);
+                })?;
             capture_shell(
                 child,
                 self.policy.command_timeout,
@@ -340,6 +369,7 @@ impl BashRunner {
     }
 }
 
+#[cfg(test)]
 fn validate_allowlisted_command(
     command: &str,
     allowed_programs: Option<&[String]>,
@@ -386,8 +416,32 @@ fn validate_allowlisted_command(
     Ok(())
 }
 
-fn enforce_enterprise_allowlist(command: &str) -> Result<(), ToolError> {
-    let program = command_program(command);
+fn validate_allowlisted_program(
+    program: &str,
+    allowed_programs: Option<&[String]>,
+    allow_any_program: bool,
+) -> Result<(), ToolError> {
+    if allow_any_program {
+        return Ok(());
+    }
+    let allowed_programs = allowed_programs
+        .filter(|programs| !programs.is_empty())
+        .ok_or_else(|| ToolError::Disabled {
+            tool: "bash: no programs were explicitly allowlisted".into(),
+        })?;
+    if allowed_programs
+        .iter()
+        .any(|candidate| candidate == program)
+    {
+        Ok(())
+    } else {
+        Err(ToolError::Disabled {
+            tool: format!("bash program {program}"),
+        })
+    }
+}
+
+fn enforce_enterprise_program(program: &str) -> Result<(), ToolError> {
     match crate::enterprise::shell_program_allowed(program) {
         Ok(true) => Ok(()),
         Ok(false) => Err(ToolError::Disabled {
@@ -400,6 +454,93 @@ fn enforce_enterprise_allowlist(command: &str) -> Result<(), ToolError> {
     }
 }
 
+fn parse_managed_command(command: &str) -> Result<Vec<String>, ToolError> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut current = String::new();
+    let mut argv = Vec::new();
+    let characters = command.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if escaped {
+            current.push(character);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(character);
+                }
+            }
+            Quote::Double => match character {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                '`' => return Err(managed_shell_error()),
+                '$' if characters.get(index + 1) == Some(&'(') => {
+                    return Err(managed_shell_error());
+                }
+                _ => current.push(character),
+            },
+            Quote::None => match character {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => escaped = true,
+                ' ' | '\t' => {
+                    if !current.is_empty() {
+                        argv.push(std::mem::take(&mut current));
+                    }
+                }
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '\n' | '\r' => {
+                    return Err(managed_shell_error());
+                }
+                '$' if characters.get(index + 1) == Some(&'(') => {
+                    return Err(managed_shell_error());
+                }
+                _ => current.push(character),
+            },
+        }
+        index += 1;
+    }
+    if escaped || !matches!(quote, Quote::None) {
+        return Err(managed_shell_error());
+    }
+    if !current.is_empty() {
+        argv.push(current);
+    }
+    let Some(program) = argv.first() else {
+        return Err(managed_shell_error());
+    };
+    if program.contains('/')
+        || program.contains('=')
+        || !program
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
+    {
+        return Err(managed_shell_error());
+    }
+    Ok(argv)
+}
+
+fn managed_shell_error() -> ToolError {
+    ToolError::InvalidArguments {
+        tool: "bash".into(),
+        message: "managed shell policy permits one allowlisted program with literal arguments; shell chaining, redirection, substitution, environment prefixes, and executable paths are disabled"
+            .into(),
+    }
+}
+
+#[cfg(test)]
 fn command_program(command: &str) -> &str {
     command
         .split_whitespace()
@@ -439,6 +580,26 @@ fn spawn_shell(command: &str, workspace: &Path) -> Result<Child, ToolError> {
         tool: "bash".into(),
         message: error.to_string(),
     })
+}
+
+fn spawn_program(argv: &[String], workspace: &Path) -> Result<Child, ToolError> {
+    let (program, arguments) = argv.split_first().ok_or_else(managed_shell_error)?;
+    let mut process = Command::new(program);
+    process
+        .args(arguments)
+        .current_dir(workspace)
+        .env_clear()
+        .env("PATH", shell_path())
+        .env("LANG", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        std::os::unix::process::CommandExt::process_group(process.as_std_mut(), 0);
+    }
+    process.spawn().map_err(ToolError::Io)
 }
 
 fn shell_path() -> OsString {
@@ -683,7 +844,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        rewrite_with_rtk_binary, validate_allowlisted_command, validate_enterprise_allowlist,
+        parse_managed_command, rewrite_with_rtk_binary, validate_allowlisted_command,
+        validate_enterprise_allowlist,
     };
 
     fn fake_rtk(root: &TempDir, body: &str) -> std::path::PathBuf {
@@ -773,5 +935,28 @@ mod tests {
         let allowed = BTreeSet::from(["git".to_owned()]);
         assert!(validate_enterprise_allowlist("git status", Some(&allowed)).is_ok());
         assert!(validate_enterprise_allowlist("printf denied", Some(&allowed)).is_err());
+    }
+
+    #[test]
+    fn managed_shell_accepts_one_literal_argv() {
+        assert_eq!(
+            parse_managed_command("git commit -m 'safe message'").expect("argv"),
+            vec!["git", "commit", "-m", "safe message"]
+        );
+    }
+
+    #[test]
+    fn managed_shell_rejects_shell_composition_and_paths() {
+        for command in [
+            "git status; uname",
+            "git status && uname",
+            "git status | cat",
+            "git status > output",
+            "git $(printf status)",
+            "MODE=unsafe git status",
+            "/usr/bin/git status",
+        ] {
+            assert!(parse_managed_command(command).is_err(), "{command}");
+        }
     }
 }

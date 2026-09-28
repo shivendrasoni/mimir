@@ -23,6 +23,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::ToolDefinition;
@@ -131,6 +132,76 @@ pub struct ToolObservation {
     pub content: String,
 }
 
+/// Content-free metadata reported to the enterprise control plane so policy
+/// authors can select real runtime tools without copying provider schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInventorySource {
+    pub kind: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInventoryItem {
+    pub id: String,
+    pub label: String,
+    pub source: ToolInventorySource,
+    pub capabilities: Vec<String>,
+    pub risk: String,
+    pub availability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability_reason_code: Option<String>,
+    pub required_by_runtime: bool,
+}
+
+impl ToolInventoryItem {
+    fn builtin(name: &str) -> Self {
+        let (capabilities, risk) = match name {
+            "read_file" | "list_files" | "search" | "search_skills" | "search_tools" => {
+                (vec!["workspace_read"], "read_only")
+            }
+            "write_file" | "edit_file" | "write_plan" | "remember" => {
+                (vec!["workspace_write"], "write")
+            }
+            "bash" | "run_process" | "ipython" => (vec!["process"], "process"),
+            "ask_user" => (vec!["user_interaction"], "read_only"),
+            "finish_task" => (vec!["completion"], "read_only"),
+            name if name.starts_with("rlm_") => (vec!["orchestration"], "external"),
+            "extension_invoke" => (vec!["extension_bridge"], "unknown"),
+            _ => (vec!["unknown"], "unknown"),
+        };
+        Self {
+            id: name.to_owned(),
+            label: inventory_label(name),
+            source: ToolInventorySource {
+                kind: "builtin".into(),
+                id: "mimir".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+            capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+            risk: risk.into(),
+            availability: "available".into(),
+            availability_reason_code: None,
+            required_by_runtime: name == "finish_task",
+        }
+    }
+}
+
+fn inventory_label(name: &str) -> String {
+    let mut words = name.split('_');
+    let first = words.next().unwrap_or_default();
+    let mut label = first.to_owned();
+    if let Some(character) = label.get_mut(0..1) {
+        character.make_ascii_uppercase();
+    }
+    for word in words {
+        label.push(' ');
+        label.push_str(word);
+    }
+    label
+}
+
 impl ToolObservation {
     fn success(summary: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -164,6 +235,9 @@ pub enum ToolError {
 #[async_trait]
 trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    fn inventory(&self) -> ToolInventoryItem {
+        ToolInventoryItem::builtin(&self.definition().name)
+    }
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError>;
 
     async fn execute_cancellable(
@@ -290,7 +364,7 @@ impl ToolRegistry {
         manager: &Arc<crate::extensions::ExtensionManager>,
     ) -> Result<(), ToolError> {
         self.deny_plan_registration("extension tools")?;
-        for descriptor in manager.tools() {
+        for (extension, extension_version, descriptor) in manager.tools_with_sources() {
             if self.tools.contains_key(&descriptor.name) {
                 return Err(ToolError::Execution {
                     tool: descriptor.name,
@@ -299,6 +373,8 @@ impl ToolRegistry {
             }
             self.register(extension::RegisteredExtensionTool::new(
                 Arc::clone(manager),
+                extension,
+                extension_version,
                 descriptor,
             ));
         }
@@ -590,6 +666,24 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Returns deterministic metadata-only inventory in execution-name order.
+    #[must_use]
+    pub fn inventory(&self) -> Vec<ToolInventoryItem> {
+        self.tools.values().map(|tool| tool.inventory()).collect()
+    }
+
+    /// Returns the SHA-256 fingerprint of the canonical metadata inventory.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the inventory's string-and-boolean data cannot be serialized.
+    #[must_use]
+    pub fn inventory_fingerprint(&self) -> String {
+        let bytes = serde_json::to_vec(&self.inventory())
+            .expect("tool inventory contains only serializable bounded metadata");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     pub fn set_autonomous_completion_enabled(&self, enabled: bool) {
         if let Some(signal) = &self.task_completion {
             signal.set_enabled(enabled);
@@ -781,4 +875,25 @@ fn truncate_utf8(value: &str, limit: usize) -> (String, bool) {
         end -= 1;
     }
     (value[..end].to_owned(), true)
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::{ToolPolicy, ToolRegistry};
+
+    #[test]
+    fn builtin_inventory_is_deterministic_and_content_free() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let registry =
+            ToolRegistry::with_default_tools(root.path(), ToolPolicy::default()).expect("registry");
+        let first = registry.inventory();
+        let second = registry.inventory();
+        assert_eq!(first, second);
+        assert_eq!(registry.inventory_fingerprint().len(), 64);
+        let encoded = serde_json::to_string(&first).expect("inventory json");
+        assert!(!encoded.contains("parameters"));
+        assert!(!encoded.contains("description"));
+        assert!(first.iter().any(|item| item.id == "read_file"));
+        assert!(first.iter().any(|item| item.required_by_runtime));
+    }
 }

@@ -826,6 +826,10 @@ pub struct ExtensionRuntime {
 }
 
 impl ExtensionRuntime {
+    pub(crate) const fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
     pub async fn load(
         manifest: ExtensionManifest,
         workspace_root: &Path,

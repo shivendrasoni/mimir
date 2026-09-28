@@ -2777,6 +2777,10 @@ fn run_self_update(action: UpdateAction, force: bool) -> Result<()> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the command dispatcher keeps the learning-management JSON contract in one audited match"
+)]
 async fn run_learning_management(
     cli: &Cli,
     action: &LearningCommand,
@@ -7714,33 +7718,13 @@ async fn build_runtime_for_session(
     let auth = build.auth_store()?;
     let stored_provider_build = activate_first_stored_provider(build, &auth).await?;
     let activated_build = activate_migrated_preferences(&stored_provider_build, &activation);
-    let (mut effective_build, restored_thinking_level) =
+    let (effective_build, restored_thinking_level) =
         restored_runtime_build(&activated_build, &session_root, session).await?;
-    if let Some(allowed) = enterprise::allowed_values("restrict_models", "allowed")? {
-        let selector = format!("{}/{}", effective_build.provider, effective_build.model);
-        if !allowed.contains(&selector) && !allowed.contains(&effective_build.model) {
-            return Err(MimirError::Configuration(format!(
-                "enterprise policy does not permit model {selector}"
-            )));
-        }
-    }
-    if let Some(allowed) = enterprise::allowed_values("restrict_tools", "allowed")? {
-        effective_build.tool_allowlist = Some(
-            effective_build
-                .tool_allowlist
-                .as_ref()
-                .map_or(allowed.clone(), |local| {
-                    local.intersection(&allowed).cloned().collect()
-                }),
-        );
-    }
-    if let Some(allowed) = enterprise::allowed_values("restrict_shell_programs", "allowed")? {
-        effective_build
-            .allowed_programs
-            .retain(|program| allowed.contains(program));
-        if effective_build.allowed_programs.is_empty() {
-            effective_build.allow_process = false;
-        }
+    if !enterprise::model_allowed(&effective_build.provider, &effective_build.model)? {
+        return Err(MimirError::Configuration(format!(
+            "enterprise policy does not permit model {}/{}",
+            effective_build.provider, effective_build.model
+        )));
     }
     let build = &effective_build;
     let extensions = if build.agent_mode.is_plan() {
@@ -7921,11 +7905,6 @@ async fn build_runtime_for_session(
             activation.blocked_model_providers().len()
         );
     }
-    if let Some(allowed) = &build.tool_allowlist
-        && !build.agent_mode.is_plan()
-    {
-        let _ = tool_registry.retain_named(allowed);
-    }
     let file_store = if build.no_session {
         None
     } else {
@@ -8003,6 +7982,17 @@ async fn build_runtime_for_session(
                 missing.join(", ")
             )));
         }
+    }
+    if !build.offline {
+        let inventory = tool_registry.inventory();
+        let fingerprint = tool_registry.inventory_fingerprint();
+        enterprise::report_tool_inventory_best_effort(
+            &fingerprint,
+            &inventory,
+            !build.agent_mode.is_plan()
+                && (build.allow_process || build.agent_mode == AgentMode::Auto),
+            &build.allowed_programs,
+        );
     }
     let tools = Arc::new(tool_registry);
     let mut config = RuntimeConfig::default_for_model(&build.model);
@@ -9864,10 +9854,11 @@ async fn handle_legacy_bash(
         "excludeFromContext": false
     }));
     let runner = context.bash_runner.clone();
+    let execution_runner = runner.clone();
     let runtime = context.runtime.clone();
     let activity = context.activity.clone();
-    context.bash_worker = Some(tokio::spawn(async move {
-        match runner.execute(&command).await {
+    let worker = tokio::spawn(async move {
+        match execution_runner.execute(&command).await {
             Ok(result) => {
                 let persistence = runtime.record_bash_execution(&command, &result).await;
                 activity.lock().await.bash_running = false;
@@ -9903,7 +9894,15 @@ async fn handle_legacy_bash(
                 emit_rpc_value(&legacy_error(id, "bash", &error.to_string()));
             }
         }
-    }));
+    });
+    // Do not accept a following abort command until the runner has installed
+    // its cancellation token (or the command has already completed). Without
+    // this handoff, a fast client can observe bash_start and race abort_bash
+    // ahead of BashRunner::execute.
+    while !runner.is_running() && !worker.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    context.bash_worker = Some(worker);
     Value::Null
 }
 

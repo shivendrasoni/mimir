@@ -587,6 +587,22 @@ async fn acp_never_bypasses_runtime_tool_permissions() {
 
 #[tokio::test]
 async fn acp_preserves_persistent_ipython_state_and_execute_updates() {
+    if std::env::var_os("MIMIR_ACP_HERMETIC_CHILD").is_none() {
+        let enterprise_state = TempDir::new().expect("enterprise test state");
+        let status = Command::new(std::env::current_exe().expect("ACP test executable"))
+            .args([
+                "--exact",
+                "acp_preserves_persistent_ipython_state_and_execute_updates",
+                "--nocapture",
+            ])
+            .env("MIMIR_ACP_HERMETIC_CHILD", "1")
+            .env("MIMIR_ENTERPRISE_STATE_DIR", enterprise_state.path())
+            .status()
+            .expect("rerun ACP test with isolated enterprise state");
+        assert!(status.success(), "isolated ACP test failed");
+        return;
+    }
+
     let root = TempDir::new().expect("tempdir");
     let state = TempDir::new().expect("state");
     let policy = ToolPolicy {

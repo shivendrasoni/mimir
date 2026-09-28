@@ -124,6 +124,20 @@ impl ProcessTool {
                 tool: format!("run_process:{}", input.program),
             });
         }
+        match crate::enterprise::shell_program_allowed(&input.program) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ToolError::Disabled {
+                    tool: format!("run_process:{}", input.program),
+                });
+            }
+            Err(error) => {
+                return Err(ToolError::Execution {
+                    tool: "run_process".into(),
+                    message: format!("enterprise policy gate failed: {error}"),
+                });
+            }
+        }
         self.validate_workspace_arguments(&input.args)?;
         let command = std::iter::once(input.program.as_str())
             .chain(input.args.iter().map(String::as_str))

@@ -19,7 +19,10 @@ use crate::{
     model::ToolDefinition,
 };
 
-use super::{ObservationStatus, Tool, ToolError, ToolObservation, truncate_utf8};
+use super::{
+    ObservationStatus, Tool, ToolError, ToolInventoryItem, ToolInventorySource, ToolObservation,
+    truncate_utf8,
+};
 
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_PARALLEL_DISCOVERIES: usize = 8;
@@ -251,6 +254,23 @@ fn register_descriptors(
 impl Tool for RegisteredMcpTool {
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
+    }
+
+    fn inventory(&self) -> ToolInventoryItem {
+        ToolInventoryItem {
+            id: self.definition.name.clone(),
+            label: self.remote_name.clone(),
+            source: ToolInventorySource {
+                kind: "mcp".into(),
+                id: self.server.clone(),
+                version: None,
+            },
+            capabilities: vec!["external_service".into()],
+            risk: "external".into(),
+            availability: "available".into(),
+            availability_reason_code: None,
+            required_by_runtime: false,
+        }
     }
 
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {

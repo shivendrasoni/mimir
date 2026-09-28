@@ -90,7 +90,19 @@ impl Tool for SearchToolsTool {
             });
         }
 
-        let activated = rank(query, &self.tools, input.limit)
+        let enterprise_allowed = crate::enterprise::allowed_values("restrict_tools", "allowed")
+            .unwrap_or_else(|_| Some(std::collections::BTreeSet::new()));
+        let visible = self
+            .tools
+            .iter()
+            .filter(|tool| {
+                enterprise_allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(&tool.name))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let activated = rank(query, &visible, input.limit)
             .into_iter()
             .map(|tool| {
                 json!({

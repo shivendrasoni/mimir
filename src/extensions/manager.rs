@@ -258,6 +258,20 @@ impl ExtensionManager {
             .collect()
     }
 
+    pub fn tools_with_sources(&self) -> Vec<(String, String, ToolDescriptor)> {
+        self.tools
+            .values()
+            .map(|(extension, value)| {
+                let version = self
+                    .runtimes
+                    .get(extension)
+                    .map(|runtime| runtime.manifest().version.clone())
+                    .unwrap_or_default();
+                (extension.clone(), version, value.clone())
+            })
+            .collect()
+    }
+
     pub fn commands(&self) -> Vec<CommandDescriptor> {
         self.commands
             .values()

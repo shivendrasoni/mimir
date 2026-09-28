@@ -15,13 +15,22 @@ use crate::{
 
 pub(super) struct RegisteredExtensionTool {
     manager: Arc<ExtensionManager>,
+    extension: String,
+    extension_version: String,
     descriptor: ToolDescriptor,
 }
 
 impl RegisteredExtensionTool {
-    pub(super) fn new(manager: Arc<ExtensionManager>, descriptor: ToolDescriptor) -> Self {
+    pub(super) fn new(
+        manager: Arc<ExtensionManager>,
+        extension: String,
+        extension_version: String,
+        descriptor: ToolDescriptor,
+    ) -> Self {
         Self {
             manager,
+            extension,
+            extension_version,
             descriptor,
         }
     }
@@ -34,6 +43,24 @@ impl Tool for RegisteredExtensionTool {
             name: self.descriptor.name.clone(),
             description: self.descriptor.description.clone(),
             parameters: self.descriptor.parameters.clone(),
+        }
+    }
+
+    fn inventory(&self) -> super::ToolInventoryItem {
+        super::ToolInventoryItem {
+            id: self.descriptor.name.clone(),
+            label: self.descriptor.label.clone(),
+            source: super::ToolInventorySource {
+                kind: "extension".into(),
+                id: self.extension.clone(),
+                version: (!self.extension_version.is_empty())
+                    .then(|| self.extension_version.clone()),
+            },
+            capabilities: vec!["extension_declared_tool".into()],
+            risk: "unknown".into(),
+            availability: "available".into(),
+            availability_reason_code: None,
+            required_by_runtime: false,
         }
     }
 
@@ -117,6 +144,23 @@ impl Tool for ExtensionInvokeTool {
                 }),
                 &["extension", "command"],
             ),
+        }
+    }
+
+    fn inventory(&self) -> super::ToolInventoryItem {
+        super::ToolInventoryItem {
+            id: "extension_invoke".into(),
+            label: "Extension invoke".into(),
+            source: super::ToolInventorySource {
+                kind: "extension".into(),
+                id: "extension_bridge".into(),
+                version: None,
+            },
+            capabilities: vec!["extension_bridge".into()],
+            risk: "unknown".into(),
+            availability: "available".into(),
+            availability_reason_code: None,
+            required_by_runtime: false,
         }
     }
 

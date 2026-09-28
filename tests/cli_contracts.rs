@@ -10,14 +10,38 @@ use predicates::prelude::*;
 use serde_json::json;
 use tempfile::TempDir;
 
+fn isolated_enterprise_state_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "mimir-cli-contracts-{}-not-enrolled",
+        std::process::id()
+    ))
+}
+
+fn mimir_command() -> Command {
+    let mut command = Command::cargo_bin("mimir").expect("binary");
+    command.env(
+        "MIMIR_ENTERPRISE_STATE_DIR",
+        isolated_enterprise_state_dir(),
+    );
+    command
+}
+
+fn mimir_std_command() -> StdCommand {
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"));
+    command.env(
+        "MIMIR_ENTERPRISE_STATE_DIR",
+        isolated_enterprise_state_dir(),
+    );
+    command
+}
+
 fn project_sessions(state: &std::path::Path, workspace: &std::path::Path) -> std::path::PathBuf {
     mimir::learning::project_session_root(state, workspace).expect("project session root")
 }
 
 #[test]
 fn help_exposes_the_operational_surface() {
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .arg("--help")
         .assert()
         .success()
@@ -30,8 +54,7 @@ fn help_exposes_the_operational_surface() {
 
 #[test]
 fn providers_output_uses_stable_snake_case_auth_names() {
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(["providers"])
         .assert()
         .success()
@@ -62,8 +85,7 @@ fn provider_defaults_and_base_url_environment_are_provider_scoped() {
         "--provider",
         "anthropic",
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("OPENAI_BASE_URL", "https://wrong-for-anthropic.invalid")
         .env_remove("ANTHROPIC_BASE_URL")
         .args(common)
@@ -74,8 +96,7 @@ fn provider_defaults_and_base_url_environment_are_provider_scoped() {
         .stdout(predicate::str::contains(
             "base_url_source: provider_default",
         ));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("MIMIR_MODEL", "claude-explicit-env")
         .env("ANTHROPIC_BASE_URL", "https://anthropic.example.test")
         .args(common)
@@ -86,8 +107,7 @@ fn provider_defaults_and_base_url_environment_are_provider_scoped() {
         .stdout(predicate::str::contains(
             "base_url_source: anthropic_environment",
         ));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("MIMIR_MODEL", "ignored-env-model")
         .env("ANTHROPIC_BASE_URL", "https://ignored-env.invalid")
         .args(common)
@@ -116,8 +136,7 @@ fn google_base_url_uses_gemini_environment_with_explicit_precedence() {
         "--provider",
         "google",
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("OPENAI_BASE_URL", "https://wrong.invalid")
         .env("GEMINI_BASE_URL", "https://gemini.example.test")
         .args(common)
@@ -128,8 +147,7 @@ fn google_base_url_uses_gemini_environment_with_explicit_precedence() {
         .stdout(predicate::str::contains(
             "base_url_source: google_environment",
         ));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("GEMINI_BASE_URL", "https://ignored.invalid")
         .args(common)
         .args([
@@ -147,8 +165,7 @@ fn anthropic_api_key_login_is_exposed_with_the_native_runtime() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
     let home = TempDir::new().expect("home");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args([
             "--workspace",
@@ -184,8 +201,7 @@ fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
         "--state-dir",
         second_state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(first)
         .args(["login", "openai", "--api-key-stdin"])
@@ -193,8 +209,7 @@ fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
         .assert()
         .success()
         .stdout(predicate::str::contains("cli-super-secret").not());
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(second)
         .args(["auth", "status"])
@@ -202,8 +217,7 @@ fn api_key_login_status_and_logout_work_without_echoing_the_secret() {
         .success()
         .stdout(predicate::str::contains("openai"))
         .stdout(predicate::str::contains("cli-super-secret").not());
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(first)
         .args(["logout", "openai"])
@@ -222,8 +236,7 @@ fn implicit_provider_uses_global_login_order_across_state_directories() {
     let runtime_state = TempDir::new().expect("runtime state");
     let home = TempDir::new().expect("home");
     for (provider, key) in [("openai", "first-key"), ("anthropic", "second-key")] {
-        Command::cargo_bin("mimir")
-            .expect("binary")
+        mimir_command()
             .env("HOME", home.path())
             .args([
                 "--workspace",
@@ -239,8 +252,7 @@ fn implicit_provider_uses_global_login_order_across_state_directories() {
             .success();
     }
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .env_remove("OPENAI_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")
@@ -278,8 +290,7 @@ fn migration_cli_plans_applies_and_rolls_back_without_printing_secrets() {
         state.path().to_str().expect("state path"),
     ];
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "migrate",
@@ -292,8 +303,7 @@ fn migration_cli_plans_applies_and_rolls_back_without_printing_secrets() {
         .stdout(predicate::str::contains("migration-secret").not())
         .stdout(predicate::str::contains("\"redacted\": true"));
 
-    let apply = Command::cargo_bin("mimir")
-        .expect("binary")
+    let apply = mimir_command()
         .args(common)
         .args([
             "migrate",
@@ -312,8 +322,7 @@ fn migration_cli_plans_applies_and_rolls_back_without_printing_secrets() {
         .to_owned();
     assert!(state.path().join("auth.json").exists());
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["migrate", "rollback", "--journal", &journal])
         .assert()
@@ -330,8 +339,7 @@ fn symlinked_state_root_is_rejected_before_management_commands_run() {
     let linked_state = parent.path().join("state-link");
     std::os::unix::fs::symlink(real_state.path(), &linked_state).expect("symlink");
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--workspace",
             workspace.path().to_str().expect("workspace path"),
@@ -350,8 +358,7 @@ fn symlinked_state_root_is_rejected_before_management_commands_run() {
 fn offline_print_mode_needs_no_api_key_and_persists_a_session() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env_remove("OPENAI_API_KEY")
         .args([
             "--provider",
@@ -381,8 +388,7 @@ fn offline_print_mode_needs_no_api_key_and_persists_a_session() {
 fn json_mode_emits_versioned_machine_readable_events() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--provider",
             "fake",
@@ -408,8 +414,7 @@ fn doctor_never_requires_or_prints_the_api_key() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
     let home = TempDir::new().expect("home");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .env("OPENAI_API_KEY", "super-secret-test-value")
         .args([
@@ -443,16 +448,14 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["login", "openai", "--api-key-stdin"])
         .write_stdin("stored-secret\n")
         .assert()
         .success();
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .env_remove("OPENAI_API_KEY")
         .args(common)
@@ -463,8 +466,7 @@ fn doctor_reports_stored_credentials_and_fake_mode_correctly() {
         .stdout(predicate::str::contains(
             "credential_source: stored_api_key",
         ));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .env_remove("OPENAI_API_KEY")
         .args(common)
@@ -480,8 +482,7 @@ fn anthropic_provider_requires_an_api_key_before_runtime_execution() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
     let home = TempDir::new().expect("home");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_OAUTH_TOKEN")
@@ -504,8 +505,7 @@ fn anthropic_provider_requires_an_api_key_before_runtime_execution() {
 fn rpc_mode_uses_json_rpc_envelopes_and_stable_errors() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--provider", "fake", "--workspace",
             workspace.path().to_str().expect("workspace path"), "--state-dir",
@@ -525,8 +525,7 @@ fn rpc_mode_uses_json_rpc_envelopes_and_stable_errors() {
 fn rpc_mode_accepts_the_stateful_legacy_jsonl_core() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args([
             "--provider",
             "fake",
@@ -582,8 +581,7 @@ fn rpc_mode_accepts_the_stateful_legacy_jsonl_core() {
 fn legacy_rpc_rejects_invalid_and_unknown_commands_without_panicking() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--provider",
             "fake",
@@ -616,8 +614,7 @@ fn legacy_rpc_rejects_invalid_and_unknown_commands_without_panicking() {
 fn legacy_rpc_manages_durable_session_lifecycle() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args([
             "--provider",
             "fake",
@@ -692,8 +689,7 @@ fn legacy_rpc_forks_before_the_selected_user_message() {
         "--fake-response",
         "answer",
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["--print", "fork this prompt"])
         .assert()
@@ -709,8 +705,7 @@ fn legacy_rpc_forks_before_the_selected_user_message() {
         .expect("user record");
     let entry_id = first["record_id"].as_str().expect("record id");
 
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args(common)
         .args(["--output", "rpc"])
         .write_stdin(format!(
@@ -744,9 +739,12 @@ fn legacy_rpc_forks_before_the_selected_user_message() {
     reason = "one linear subprocess scenario makes response and event ordering auditable"
 )]
 fn legacy_rpc_streams_events_and_accepts_control_while_running() {
+    // The full integration suite runs many subprocesses concurrently. These
+    // waits assert event ordering, not wall-clock latency.
+    const RPC_TIMEOUT: Duration = Duration::from_secs(10);
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+    let mut child = mimir_std_command()
         .args([
             "--provider",
             "fake",
@@ -791,9 +789,7 @@ fn legacy_rpc_streams_events_and_accepts_control_while_running() {
         &mut stdin,
         &json!({"jsonrpc":"2.0","id":"ready","method":"health"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
-        value["id"] == "ready"
-    });
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "ready");
 
     write_rpc(
         &mut stdin,
@@ -816,21 +812,16 @@ fn legacy_rpc_streams_events_and_accepts_control_while_running() {
         &mut stdin,
         &json!({"id":"f1","type":"follow_up","message":"after that"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "f1"
-    });
-    let first_end = receive_rpc_until(&lines_rx, Duration::from_secs(5), |value| {
-        value["type"] == "agent_end"
-    });
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "f1");
+    let first_end = receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["type"] == "agent_end");
     assert_eq!(first_end["error"], serde_json::Value::Null);
     assert_eq!(first_end["messages"].as_array().unwrap().len(), 4);
     assert_eq!(
         first_end["messages"][3]["content"][0]["text"],
         "steered answer"
     );
-    let follow_end = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
-        value["type"] == "agent_end"
-    });
+    let follow_end =
+        receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["type"] == "agent_end");
     assert_eq!(
         follow_end["messages"][1]["content"][0]["text"],
         "follow-up answer"
@@ -840,32 +831,23 @@ fn legacy_rpc_streams_events_and_accepts_control_while_running() {
         &mut stdin,
         &json!({"id":"p2","type":"prompt","message":"cancel me"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "p2"
-    });
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "p2");
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| {
         value["type"] == "turn_start"
     });
     write_rpc(
         &mut stdin,
         &json!({"id":"f2","type":"follow_up","message":"must be cleared"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "f2"
-    });
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "f2");
     std::thread::sleep(Duration::from_millis(50));
     write_rpc(&mut stdin, &json!({"id":"a1","type":"abort"}));
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "a1"
-    });
-    let aborted = receive_rpc_until(&lines_rx, Duration::from_secs(2), |value| {
-        value["type"] == "agent_end"
-    });
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "a1");
+    let aborted = receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["type"] == "agent_end");
     assert!(aborted["error"].as_str().unwrap().contains("cancelled"));
     write_rpc(&mut stdin, &json!({"id":"after-abort","type":"get_state"}));
-    let after_abort = receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "after-abort"
-    });
+    let after_abort =
+        receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "after-abort");
     assert_eq!(after_abort["data"]["isStreaming"], false);
     assert_eq!(
         after_abort["data"]["sessionActions"]["followUps"]
@@ -879,13 +861,9 @@ fn legacy_rpc_streams_events_and_accepts_control_while_running() {
         &mut stdin,
         &json!({"id":"p3","type":"prompt","message":"finish after EOF"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(1), |value| {
-        value["id"] == "p3"
-    });
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "p3");
     drop(stdin);
-    let eof_end = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
-        value["type"] == "agent_end"
-    });
+    let eof_end = receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["type"] == "agent_end");
     assert_eq!(eof_end["error"], serde_json::Value::Null);
     assert_eq!(eof_end["messages"][1]["content"][0]["text"], "EOF answer");
     let status = child.wait().expect("wait for RPC process");
@@ -901,7 +879,7 @@ fn legacy_rpc_streams_events_and_accepts_control_while_running() {
 fn legacy_rpc_queue_modes_are_configurable_and_all_mode_batches_follow_ups() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+    let mut child = mimir_std_command()
         .args([
             "--provider",
             "fake",
@@ -1033,8 +1011,7 @@ fn legacy_rpc_controls_compaction_lists_skill_commands_and_exports_safe_html() {
     )
     .expect("skill");
     let exported = workspace.path().join("session-export.html");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--provider",
             "fake",
@@ -1063,8 +1040,7 @@ fn legacy_rpc_controls_compaction_lists_skill_commands_and_exports_safe_html() {
         writeln!(input, "{value}").expect("serialize RPC input");
         input
     });
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args([
             "--provider",
             "fake",
@@ -1117,8 +1093,7 @@ fn legacy_rpc_controls_compaction_lists_skill_commands_and_exports_safe_html() {
 fn legacy_rpc_configures_auto_retry_and_streams_retry_lifecycle_events() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args([
             "--provider",
             "fake",
@@ -1171,8 +1146,7 @@ fn legacy_rpc_configures_auto_retry_and_streams_retry_lifecycle_events() {
             && value["messages"][1]["content"][0]["text"] == "recovered"
     }));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--provider",
             "fake",
@@ -1208,8 +1182,7 @@ fn legacy_rpc_bash_is_disabled_by_default_and_requires_an_allowlist() {
         "--output",
         "rpc",
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf denied\"}\n")
         .assert()
@@ -1218,8 +1191,7 @@ fn legacy_rpc_bash_is_disabled_by_default_and_requires_an_allowlist() {
         .stdout(predicate::str::contains("\"success\":false"))
         .stdout(predicate::str::contains("pass --allow-process"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["--allow-process", "--allowed-programs", "printf"])
         .write_stdin("{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf permitted\"}\n")
@@ -1236,9 +1208,12 @@ fn legacy_rpc_bash_is_disabled_by_default_and_requires_an_allowlist() {
     reason = "one subprocess scenario verifies bash execution, persistence, cancellation, and EOF cleanup"
 )]
 fn legacy_rpc_bash_executes_persists_and_aborts_concurrently() {
+    // This test shares CPU with many subprocess-heavy integration tests in the
+    // full suite; it verifies protocol behavior rather than response latency.
+    const RPC_TIMEOUT: Duration = Duration::from_secs(10);
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+    let mut child = mimir_std_command()
         .args([
             "--provider",
             "fake",
@@ -1280,18 +1255,14 @@ fn legacy_rpc_bash_executes_persists_and_aborts_concurrently() {
             "command":"printf captured"
         }),
     );
-    let completed = receive_rpc_until(&lines_rx, Duration::from_secs(10), |value| {
-        value["id"] == "bash-ok"
-    });
+    let completed = receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "bash-ok");
     assert_eq!(completed["success"], true);
     assert_eq!(completed["data"]["output"], "captured");
     assert_eq!(completed["data"]["exitCode"], 0);
     assert_eq!(completed["data"]["cancelled"], false);
 
     write_rpc(&mut stdin, &json!({"id":"messages","type":"get_messages"}));
-    let messages = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
-        value["id"] == "messages"
-    });
+    let messages = receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| value["id"] == "messages");
     let context = messages["data"]["messages"][0]["content"][0]["text"]
         .as_str()
         .expect("bash context");
@@ -1302,17 +1273,28 @@ fn legacy_rpc_bash_executes_persists_and_aborts_concurrently() {
         &mut stdin,
         &json!({"id":"bash-slow","type":"bash","command":"sleep 30"}),
     );
-    receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
+    receive_rpc_until(&lines_rx, RPC_TIMEOUT, |value| {
         value["type"] == "bash_start"
     });
     write_rpc(&mut stdin, &json!({"id":"abort-bash","type":"abort_bash"}));
-    let abort = receive_rpc_until(&lines_rx, Duration::from_secs(3), |value| {
-        value["id"] == "abort-bash"
-    });
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let mut abort = None;
+    let mut cancelled = None;
+    while abort.is_none() || cancelled.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = lines_rx
+            .recv_timeout(remaining)
+            .expect("abort and cancellation RPC output");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("RPC JSON line");
+        match value["id"].as_str() {
+            Some("abort-bash") => abort = Some(value),
+            Some("bash-slow") => cancelled = Some(value),
+            _ => {}
+        }
+    }
+    let abort = abort.expect("abort response");
     assert_eq!(abort["success"], true);
-    let cancelled = receive_rpc_until(&lines_rx, Duration::from_secs(5), |value| {
-        value["id"] == "bash-slow"
-    });
+    let cancelled = cancelled.expect("cancelled bash response");
     assert_eq!(cancelled["success"], true);
     assert_eq!(cancelled["data"]["cancelled"], true);
     assert_eq!(cancelled["data"]["exitCode"], serde_json::Value::Null);
@@ -1335,8 +1317,7 @@ fn legacy_rpc_agent_message_commands_deliver_and_enforce_pause() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "--session",
@@ -1359,8 +1340,7 @@ fn legacy_rpc_agent_message_commands_deliver_and_enforce_pause() {
         "{\"id\":\"send\",\"type\":\"send_message\",\"targetActiveSessionId\":\"target\",\"message\":\"review complete\"}\n",
         "{\"id\":\"clear\",\"type\":\"agent_messages_clear\"}\n"
     );
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args(common)
         .args([
             "--session",
@@ -1415,16 +1395,14 @@ fn legacy_rpc_agent_message_commands_deliver_and_enforce_pause() {
     .expect("target session");
     assert!(target_session.contains("review complete"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["daemon", "status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"active_leases\": 0"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["daemon", "stop"])
         .assert()
@@ -1444,8 +1422,7 @@ fn legacy_rpc_observe_streams_new_target_messages_and_unobserves() {
         state.path().to_str().expect("state path"),
     ];
     let run_target = |prompt: &str, response: &str| {
-        Command::cargo_bin("mimir")
-            .expect("binary")
+        mimir_command()
             .args(common)
             .args([
                 "--session",
@@ -1460,7 +1437,7 @@ fn legacy_rpc_observe_streams_new_target_messages_and_unobserves() {
     };
     run_target("initial prompt", "initial answer");
 
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+    let mut child = mimir_std_command()
         .args(common)
         .args([
             "--session",
@@ -1554,8 +1531,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
         "--output",
         "rpc",
     ];
-    let added = Command::cargo_bin("mimir")
-        .expect("binary")
+    let added = mimir_command()
         .args(common)
         .write_stdin(
             "{\"id\":\"add\",\"type\":\"add_schedule\",\"schedule\":\"every 10s\",\"prompt\":\"check the queue\"}\n",
@@ -1578,8 +1554,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
          {{\"id\":\"active\",\"type\":\"list_schedules\"}}\n\
          {{\"id\":\"all\",\"type\":\"list_schedules\",\"includeInactive\":true}}\n"
     );
-    let listed = Command::cargo_bin("mimir")
-        .expect("binary")
+    let listed = mimir_command()
         .args(common)
         .write_stdin(follow_up)
         .output()
@@ -1595,8 +1570,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
     assert_eq!(responses[2]["data"]["jobs"].as_array().unwrap().len(), 1);
     assert_eq!(responses[2]["data"]["jobs"][0]["status"], "cancelled");
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .write_stdin(
             "{\"id\":\"invalid\",\"type\":\"add_schedule\",\"schedule\":\"every 1s\",\"prompt\":\"too fast\"}\n",
@@ -1606,8 +1580,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
         .stdout(predicate::str::contains("\"success\":false"))
         .stdout(predicate::str::contains("at least 10 seconds"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .write_stdin(
             "{\"id\":\"due\",\"type\":\"add_schedule\",\"schedule\":\"in 0m\",\"prompt\":\"scheduled after EOF\"}\n",
@@ -1629,8 +1602,7 @@ fn legacy_rpc_schedules_are_durable_filterable_and_reference_shaped() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["daemon", "stop"])
         .assert()
@@ -1655,8 +1627,7 @@ fn legacy_rpc_heartbeats_match_reference_lifecycle_and_catalog_shapes() {
         "--output",
         "rpc",
     ];
-    let set = Command::cargo_bin("mimir")
-        .expect("binary")
+    let set = mimir_command()
         .args(common)
         .write_stdin(
             "{\"id\":\"set\",\"type\":\"set_heartbeat\",\"schedule\":\"10m\",\"prompt\":\"inspect the queue\",\"deliveryMode\":\"follow_up\"}\n",
@@ -1691,8 +1662,7 @@ fn legacy_rpc_heartbeats_match_reference_lifecycle_and_catalog_shapes() {
          {{\"id\":\"after-clear\",\"type\":\"get_heartbeat\"}}\n\
          {{\"id\":\"invalid\",\"type\":\"set_heartbeat\",\"schedule\":\"in 5m\",\"prompt\":\"not recurring\"}}\n"
     );
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .args(common)
         .write_stdin(lifecycle)
         .output()
@@ -1730,8 +1700,7 @@ fn legacy_rpc_heartbeats_match_reference_lifecycle_and_catalog_shapes() {
             .contains("must be recurring")
     );
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["daemon", "stop"])
         .assert()
@@ -1743,8 +1712,7 @@ fn legacy_rpc_heartbeat_catalog_is_scoped_to_the_owned_session() {
     let workspace = TempDir::new().expect("workspace");
     let state = TempDir::new().expect("state");
     let run = |session: &str, input: &str| {
-        Command::cargo_bin("mimir")
-            .expect("binary")
+        mimir_command()
             .args([
                 "--provider",
                 "fake",
@@ -1789,8 +1757,7 @@ fn legacy_rpc_heartbeat_catalog_is_scoped_to_the_owned_session() {
     assert_eq!(heartbeats[0]["job"]["activeSessionId"], "owned");
     assert_eq!(heartbeats[0]["sessionName"], "Owned session");
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--workspace",
             workspace.path().to_str().expect("workspace path"),
@@ -1815,8 +1782,7 @@ fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
     let workspace_path = workspace.path().to_str().expect("workspace path");
     let state_path = state.path().to_str().expect("state path");
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .current_dir(workspace.path())
         .args([
@@ -1848,8 +1814,7 @@ fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
         "--output",
         "rpc",
     ];
-    let output = Command::cargo_bin("mimir")
-        .expect("binary")
+    let output = mimir_command()
         .env("HOME", home.path())
         .current_dir(workspace.path())
         .env_remove("ANTHROPIC_API_KEY")
@@ -1937,8 +1902,7 @@ fn legacy_rpc_model_and_thinking_controls_are_runtime_backed_and_durable() {
             .contains("thinking level")
     );
 
-    let restored = Command::cargo_bin("mimir")
-        .expect("binary")
+    let restored = mimir_command()
         .current_dir(workspace.path())
         .args(common)
         .write_stdin("{\"id\":\"state\",\"type\":\"get_state\"}\n")
@@ -1957,6 +1921,7 @@ fn write_rpc(stdin: &mut impl Write, value: &serde_json::Value) {
     stdin.flush().expect("flush RPC command");
 }
 
+#[track_caller]
 fn receive_rpc_until(
     lines: &mpsc::Receiver<String>,
     timeout: Duration,
@@ -1990,30 +1955,26 @@ fn management_commands_round_trip_without_a_provider() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["goal", "set", "finish migration", "--token-budget", "100"])
         .assert()
         .success()
         .stdout(predicate::str::contains("finish migration"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args(["goal", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"token_budget\": 100"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["schedule", "add", "heartbeat", "continue"])
         .assert()
         .success()
         .stdout(predicate::str::contains("heartbeat"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args([
@@ -2029,15 +1990,13 @@ fn management_commands_round_trip_without_a_provider() {
         .assert()
         .success()
         .stdout("saved\n");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["session", "list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("persisted"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args([
@@ -2066,8 +2025,7 @@ fn session_compat_commands_export_import_and_plan_switches() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env_remove("OPENAI_API_KEY")
         .args(common)
         .args([
@@ -2082,8 +2040,7 @@ fn session_compat_commands_export_import_and_plan_switches() {
         ])
         .assert()
         .success();
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "--session",
@@ -2098,15 +2055,13 @@ fn session_compat_commands_export_import_and_plan_switches() {
     let exported_text = std::fs::read_to_string(&exported).expect("reference export");
     assert!(exported_text.contains("\"type\":\"session\""));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["session", "switch", exported.to_str().expect("export path")])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"planned\": true"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["session", "import", exported.to_str().expect("export path")])
         .assert()
@@ -2120,8 +2075,7 @@ fn session_share_prints_only_safe_payload_metadata() {
     let state = TempDir::new().expect("state");
     let html = workspace.path().join("session.html");
     std::fs::write(&html, "<html>private transcript marker</html>").expect("share source");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--workspace",
             workspace.path().to_str().expect("workspace path"),
@@ -2152,8 +2106,7 @@ fn mcp_catalog_commands_persist_redacted_server_configuration() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "mcp",
@@ -2168,8 +2121,7 @@ fn mcp_catalog_commands_persist_redacted_server_configuration() {
         ])
         .assert()
         .success();
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "list"])
         .assert()
@@ -2177,15 +2129,13 @@ fn mcp_catalog_commands_persist_redacted_server_configuration() {
         .stdout(predicate::str::contains("Local mock"))
         .stdout(predicate::str::contains("PRIVATE_TOKEN"))
         .stdout(predicate::str::contains("do-not-print").not());
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "status", "local"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"configured\": true"));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "remove", "local"])
         .assert()
@@ -2253,8 +2203,7 @@ fn mcp_tools_and_call_use_the_local_stdio_client() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "mcp",
@@ -2269,15 +2218,13 @@ fn mcp_tools_and_call_use_the_local_stdio_client() {
         ])
         .assert()
         .success();
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "tools", "mock"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"name\": \"echo\""));
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args([
             "mcp",
@@ -2302,14 +2249,12 @@ fn mcp_builtin_remote_entries_surface_transport_and_oauth_metadata() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "add", "linear", "--builtin"])
         .assert()
         .success();
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args(common)
         .args(["mcp", "list"])
         .assert()
@@ -2331,8 +2276,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args([
@@ -2347,7 +2291,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
         .assert()
         .success();
 
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("mimir"))
+    let mut child = mimir_std_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "login", "acme", "--api-key-stdin"])
@@ -2371,8 +2315,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
     assert!(stdout.contains("\"auth_type\": \"api_key\""));
     assert!(!stdout.contains("super-secret-api-key"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "status", "acme"])
@@ -2381,8 +2324,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
         .stdout(predicate::str::contains("\"authenticated\": true"))
         .stdout(predicate::str::contains("\"source\": \"stored_api_key\""));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "logout", "acme"])
@@ -2390,8 +2332,7 @@ fn mcp_login_and_logout_manage_remote_api_key_credentials_without_echoing_secret
         .success()
         .stdout(predicate::str::contains("\"logged_out\": true"));
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "status", "acme"])
@@ -2411,16 +2352,14 @@ fn mcp_oauth_builtin_rejects_api_keys_without_echoing_the_secret() {
         "--state-dir",
         state.path().to_str().expect("state path"),
     ];
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "add", "notion", "--builtin"])
         .assert()
         .success();
 
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .env("HOME", home.path())
         .args(common)
         .args(["mcp", "login", "notion", "--api-key-stdin"])
@@ -2443,8 +2382,7 @@ fn session_export_rejects_symlinked_output_ancestors() {
     std::fs::create_dir(&real_output).expect("real output directory");
     let linked_output = workspace.path().join("linked-output");
     symlink(&real_output, &linked_output).expect("symlink output directory");
-    Command::cargo_bin("mimir")
-        .expect("binary")
+    mimir_command()
         .args([
             "--workspace",
             workspace.path().to_str().expect("workspace path"),

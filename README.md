@@ -67,6 +67,30 @@ mimir
 
 Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the workspace path picker. See [Using Mimir](docs/USAGE.md) for agent modes, tool permissions, file references, token limits, and machine-readable output.
 
+## Enterprise harness enrollment
+
+An administrator can issue a 15-minute, single-use enrollment code from Betterloop. Mimir needs only that code; it never reads the organization's Git configuration repository:
+
+```bash
+mimir enroll mec_...
+mimir enterprise status
+mimir enterprise explain
+mimir enterprise sync
+```
+
+The control-plane URL is built in and can be overridden for a private deployment with `MIMIR_CONTROL_PLANE_URL` or `--control-plane-url`. Enrollment installs a revocable per-installation credential and a signed compiled profile in the OS user configuration directory with owner-only permissions. Mimir verifies the Ed25519 signature, payload digest, schema, catalog references, version bounds, and expiry before atomic activation. It synchronizes on startup and every 15 minutes, keeps the previous valid release for recovery, and uses the last valid signed profile offline. Expired critical mandatory controls fail closed.
+
+Developers may override default bindings only. The free-form reason remains local; Betterloop receives only bounded override metadata:
+
+```bash
+mimir enterprise overrides list
+mimir enterprise overrides disable observe.failures --reason "handled by local notifier"
+mimir enterprise overrides enable observe.failures --reason "restore team default"
+mimir enterprise unenroll
+```
+
+Managed mandatory gates run natively and are unaffected by `--no-extensions`, `--no-skills`, or offline mode. Compliance events contain identifiers, versions, timestamps, counters, bounded decisions, and error codes only—never prompts, responses, paths, commands, arguments, results, credentials, or free-form errors.
+
 ## Documentation
 
 - [Using Mimir](docs/USAGE.md) — TUI, agent modes, workspace tools, and output formats

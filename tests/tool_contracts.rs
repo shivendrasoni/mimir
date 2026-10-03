@@ -1478,6 +1478,50 @@ async fn bash_runner_respects_disabled_policy_and_an_explicit_allowlist() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn managed_bash_preserves_literal_arguments_and_blocks_expansion() {
+    let root = TempDir::new().expect("tempdir");
+    let runner = BashRunner::new(
+        root.path(),
+        ToolPolicy {
+            allow_process: true,
+            allowed_programs: Some(vec!["printf".into(), "rg".into()]),
+            ..ToolPolicy::default()
+        },
+    )
+    .expect("runner");
+    let result = runner
+        .execute(r#"printf '<%s>' '' 'a\q' '$(touch marker)' '*.ts' "\$HOME""#)
+        .await
+        .expect("literal execution");
+    assert_eq!(result.output, "<><a\\q><$(touch marker)><*.ts><$HOME>");
+    assert!(!root.path().join("marker").exists());
+    for command in [
+        "printf $HOME",
+        "printf *.ts",
+        "printf ok; touch marker",
+        "printf ok\n",
+        "printf \"$(touch marker)\"",
+    ] {
+        runner
+            .execute(command)
+            .await
+            .expect_err("shell expansion must fail closed");
+    }
+    runner
+        .execute(&format!("{}printf ok", " ".repeat(65536)))
+        .await
+        .expect_err("bounds apply before whitespace trimming");
+    let denial = runner
+        .execute("ls docs")
+        .await
+        .expect_err("unapproved executable")
+        .to_string();
+    assert!(denial.contains("rg --files"), "{denial}");
+    assert!(!root.path().join("marker").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn model_bash_requires_approval_in_default_mode_and_runs_in_auto_mode() {
     let root = TempDir::new().expect("tempdir");
     let approvals = Arc::new(WorkspaceApprovalStore::new(root.path()).expect("approvals"));

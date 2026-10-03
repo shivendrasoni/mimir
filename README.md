@@ -106,3 +106,13 @@ cargo test --workspace --doc
 cargo build --release
 cargo audit --deny warnings --no-fetch
 ```
+
+## Shared prepared working environment
+
+Mimir 0.23.0 consumes Betterloop's signed working-environment profile alongside its existing enterprise rules. Administrators select platform templates and exact versioned organization skills, agent roles, rules and hook scripts from a Git registry. Repository discovery stays local and does not execute package scripts. Startup context supplies orientation and catalogs; relevant guidance and full skills are retrieved through the local bridge.
+
+After enrollment, run `mimir enterprise prepare` from a repository, inspect `mimir enterprise environment`, and refresh approved policy with `mimir enterprise sync`. Use `--workspace /absolute/repository` and `--state-dir /absolute/state` when selecting these explicitly. Managed MCP catalogs, grants and readiness receipts live below `STATE/projects/SHA256(canonical-workspace)/working-environment/`, independently of the developer's user MCP catalog. `enterprise remove-environment` removes only unchanged managed entries for the selected workspace; it does not unenroll Mimir or affect another project's managed environment.
+
+New managed stdio MCP servers use bounded newline-delimited JSON; existing user catalogs retain their earlier framing. Connections capture reviewed configuration before discovery and recheck ownership and current signed grants on use and reconnect. Required resources that fail initialization or policy checks prevent a ready report. Readiness remains client-reported evidence bound to the tested signed release.
+
+Reviewed agent activation delivers role instructions and preserves native permissions. Registry hooks may deny operations but cannot grant approval. Task selection, completion and continuity workflows remain advisory where no complete native boundary exists. Merge, deployment and other external delivery still require developer authorization.

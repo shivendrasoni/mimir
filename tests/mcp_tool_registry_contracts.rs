@@ -186,3 +186,74 @@ async fn an_unavailable_server_does_not_block_other_runtime_tools() {
             .any(|tool| tool.name == "read_file")
     );
 }
+
+#[tokio::test]
+async fn changed_catalog_cannot_rebind_an_existing_tool_to_another_workspace() {
+    let workspace = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let first = workspace.path().join("a.sh");
+    let second = workspace.path().join("b.sh");
+    let first_log = workspace.path().join("a.jsonl");
+    let second_log = workspace.path().join("b.jsonl");
+    make_script(&first, &fake_mcp_script(&first_log));
+    make_script(&second, &fake_mcp_script(&second_log));
+    let catalog = McpServerCatalog::new(state.path()).unwrap();
+    catalog
+        .upsert(stdio_entry("knowledge", "Knowledge", &first))
+        .await
+        .unwrap();
+    let mut registry =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).unwrap();
+    let report = registry.register_mcp_servers(state.path()).await.unwrap();
+    let name = &report.registered_tools[0];
+    registry
+        .execute(name, json!({"query":"first"}))
+        .await
+        .unwrap();
+    assert!(
+        registry
+            .execute(name, json!({"query":"closed"}))
+            .await
+            .is_err()
+    );
+    catalog
+        .upsert(stdio_entry("knowledge", "Knowledge", &second))
+        .await
+        .unwrap();
+    assert!(
+        registry
+            .execute(name, json!({"query":"must not reconnect B"}))
+            .await
+            .is_err()
+    );
+    assert!(!second_log.exists());
+    catalog
+        .upsert(stdio_entry("knowledge", "Knowledge", &first))
+        .await
+        .unwrap();
+    registry
+        .execute(name, json!({"query":"restored A"}))
+        .await
+        .unwrap();
+    assert!(!second_log.exists());
+}
+
+#[tokio::test]
+async fn owned_server_without_signed_receipt_is_never_discovered_as_unmanaged() {
+    let workspace = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let script = workspace.path().join("must-not-run.sh");
+    let log = workspace.path().join("must-not-read.jsonl");
+    make_script(&script, &fake_mcp_script(&log));
+    let catalog = McpServerCatalog::new(state.path()).unwrap();
+    catalog
+        .upsert(stdio_entry("bl_private", "Private", &script))
+        .await
+        .unwrap();
+    let mut registry =
+        ToolRegistry::with_default_tools(workspace.path(), ToolPolicy::default()).unwrap();
+    let report = registry.register_mcp_servers(state.path()).await.unwrap();
+    assert!(report.registered_tools.is_empty());
+    assert_eq!(report.unavailable.len(), 1);
+    assert!(!log.exists());
+}

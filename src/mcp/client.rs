@@ -49,6 +49,7 @@ pub struct McpClient {
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
     remote: Option<HttpTransport>,
+    json_lines: bool,
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
     max_frame_bytes: usize,
@@ -75,6 +76,14 @@ impl McpClient {
     pub async fn connect_with_bearer(
         config: &McpServerConfig,
         bearer_token: Option<&str>,
+    ) -> Result<Self> {
+        Self::connect_with_stdio_framing(config, bearer_token, false).await
+    }
+
+    pub(crate) async fn connect_with_stdio_framing(
+        config: &McpServerConfig,
+        bearer_token: Option<&str>,
+        json_lines: bool,
     ) -> Result<Self> {
         config.validate()?;
         if let Some(remote) = &config.remote {
@@ -112,6 +121,7 @@ impl McpClient {
             stdin: Some(stdin),
             stdout: Some(BufReader::new(stdout)),
             remote: None,
+            json_lines,
             stderr_tail,
             next_id: 1,
             max_frame_bytes: config.stdio.max_frame_bytes,
@@ -138,6 +148,7 @@ impl McpClient {
             stdin: None,
             stdout: None,
             remote: Some(transport),
+            json_lines: false,
             stderr_tail: Arc::new(Mutex::new(Vec::new())),
             next_id: 1,
             max_frame_bytes: remote.max_response_bytes,
@@ -301,11 +312,19 @@ impl McpClient {
                 let stdin = self.stdin.as_mut().ok_or_else(|| {
                     MimirError::Protocol("MCP stdio transport is unavailable".into())
                 })?;
-                write_message(stdin, &request).await?;
+                if self.json_lines {
+                    super::protocol::write_json_line(stdin, &request).await?;
+                } else {
+                    write_message(stdin, &request).await?;
+                }
                 let stdout = self.stdout.as_mut().ok_or_else(|| {
                     MimirError::Protocol("MCP stdio transport is unavailable".into())
                 })?;
-                read_message(stdout, self.max_frame_bytes).await?
+                if self.json_lines {
+                    super::protocol::read_json_line_response(stdout, self.max_frame_bytes).await?
+                } else {
+                    read_message(stdout, self.max_frame_bytes).await?
+                }
             };
         let response: JsonRpcResponse = serde_json::from_value(response)?;
         if response.jsonrpc != JSONRPC_VERSION {
@@ -345,7 +364,11 @@ impl McpClient {
                 .stdin
                 .as_mut()
                 .ok_or_else(|| MimirError::Protocol("MCP stdio transport is unavailable".into()))?;
-            write_message(stdin, &notification).await
+            if self.json_lines {
+                super::protocol::write_json_line(stdin, &notification).await
+            } else {
+                write_message(stdin, &notification).await
+            }
         }
     }
 

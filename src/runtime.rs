@@ -415,6 +415,7 @@ pub struct AgentRuntime {
     extension_flags: RwLock<BTreeMap<String, serde_json::Value>>,
     active_tools: RwLock<Option<BTreeSet<String>>>,
     extension_session_started: AtomicBool,
+    registry_session_context: tokio::sync::RwLock<String>,
     managed_lifecycle_started: StdMutex<BTreeMap<String, Instant>>,
     events: RuntimeEventBus,
 }
@@ -593,6 +594,7 @@ impl AgentRuntime {
             extension_flags: RwLock::new(BTreeMap::new()),
             active_tools: RwLock::new(None),
             extension_session_started: AtomicBool::new(false),
+            registry_session_context: tokio::sync::RwLock::new(String::new()),
             managed_lifecycle_started: StdMutex::new(BTreeMap::new()),
             events: RuntimeEventBus::default(),
         })
@@ -3339,11 +3341,26 @@ impl AgentRuntime {
     async fn combined_system_prompt(&self, active_skill_context: Option<&str>) -> String {
         let harness = self.harness_context.read().await;
         let workspace = self.tools.workspace_context();
-        let mut parts = Vec::with_capacity(5);
+        let registry_context = self.registry_session_context.read().await;
+        let mut parts = Vec::with_capacity(6);
+        if !registry_context.is_empty() {
+            parts.push(registry_context.as_str());
+        }
         if !self.config.system_prompt.is_empty() {
             parts.push(self.config.system_prompt.as_str());
         }
         parts.push(workspace.as_str());
+        let working_environment_context = crate::enterprise::working_environment()
+            .ok()
+            .flatten()
+            .and_then(|environment| {
+                crate::working_environment::repository_facts(self.tools.workspace_root())
+                    .ok()
+                    .map(|facts| crate::working_environment::startup_context(&environment, &facts))
+            });
+        if let Some(context) = working_environment_context.as_deref() {
+            parts.push(context);
+        }
         if !harness.is_empty() {
             parts.push(harness.as_str());
         }
@@ -3757,6 +3774,22 @@ impl AgentRuntime {
         if session_id.is_empty() || self.extension_session_started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let registry_context = match crate::registry::run_hooks(
+            self.tools.workspace_root(),
+            "session",
+            "session_start",
+            false,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                self.extension_session_started
+                    .store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        *self.registry_session_context.write().await = registry_context;
         if let Err(error) = self
             .dispatch_extension_event(
                 LifecycleEvent::SessionStart {

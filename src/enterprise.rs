@@ -113,6 +113,10 @@ pub struct SignedHarnessProfileEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledHarnessProfile {
     pub schema: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::working_environment::WorkingEnvironment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_artifacts: Vec<crate::registry::RegistryArtifact>,
     pub release_id: Uuid,
     pub organization_id: Uuid,
     pub team_id: Option<Uuid>,
@@ -161,6 +165,8 @@ pub struct ManagedSkill {
     pub description: String,
     pub instructions: String,
     pub content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +314,7 @@ impl EnterpriseManager {
             signing_public_key_base64: response.signing_public_key_base64,
             etag: None,
         };
+        validate_enrollment_scope(&profile, &enrollment)?;
         ensure_owner_only_dir(&self.root)?;
         write_secure_json(&self.root.join(CONFIG_FILE), &enrollment)?;
         self.activate_envelope(&response.profile)?;
@@ -419,7 +426,9 @@ impl EnterpriseManager {
                 return Err(error);
             }
         };
-        if let Err(error) = validate_profile(&profile) {
+        if let Err(error) = validate_profile(&profile)
+            .and_then(|()| validate_enrollment_scope(&profile, &enrollment))
+        {
             self.report_profile_rejected(&enrollment, "unsupported_or_invalid_profile")
                 .await;
             return Err(error);
@@ -493,6 +502,8 @@ impl EnterpriseManager {
                 "version": skill.version,
                 "enforcement": skill.enforcement,
             })).collect::<Vec<_>>(),
+            "environment": profile.environment,
+            "environment_origins": profile.source_metadata.get("environment_origins"),
             "telemetry": profile.telemetry,
         }))
     }
@@ -616,6 +627,7 @@ impl EnterpriseManager {
         let enrollment = self.load_enrollment()?;
         let profile = verify_envelope(&envelope, &enrollment.signing_public_key_base64)?;
         validate_profile(&profile)?;
+        validate_enrollment_scope(&profile, &enrollment)?;
         Ok(profile)
     }
 
@@ -693,6 +705,34 @@ impl EnterpriseManager {
                 .report_event(enrollment, &active, "profile_rejected", Some(error_code))
                 .await;
         }
+    }
+
+    /// Reports only bounded environment readiness; local repository content stays local.
+    pub async fn report_environment(&self, report: Value) -> Result<()> {
+        let enrollment = self.load_enrollment()?;
+        let profile = self.load_profile()?;
+        if report["release_id"] != json!(profile.release_id) {
+            return Err(MimirError::Configuration(
+                "Prepared environment release changed; retry prepare".into(),
+            ));
+        }
+        let endpoint = validate_endpoint(&enrollment.endpoint)?;
+        let response = self
+            .client
+            .put(
+                endpoint
+                    .join("v1/harness/environment")
+                    .map_err(configuration_error)?,
+            )
+            .bearer_auth(&enrollment.installation_token)
+            .json(&report)
+            .send()
+            .await
+            .map_err(http_error)?;
+        if !response.status().is_success() {
+            return Err(server_error("environment report", response).await);
+        }
+        Ok(())
     }
 
     async fn send_events(&self, enrollment: &Enrollment, events: &[ComplianceEvent]) -> Result<()> {
@@ -892,7 +932,8 @@ pub fn tool_allowed(tool: &str) -> Result<bool> {
     if tool == "finish_task" {
         return Ok(true);
     }
-    evaluate_allowlist_policy("restrict_tools", "allowed", tool, "tool_not_allowed")
+    let normalized = local_bridge_policy_alias(tool);
+    evaluate_allowlist_policy("restrict_tools", "allowed", &normalized, "tool_not_allowed")
 }
 
 /// Content-free visibility check used while constructing provider tool lists.
@@ -901,7 +942,8 @@ pub fn tool_visible(tool: &str) -> Result<bool> {
     if tool == "finish_task" {
         return Ok(true);
     }
-    Ok(allowed_values("restrict_tools", "allowed")?.is_none_or(|allowed| allowed.contains(tool)))
+    Ok(allowed_values("restrict_tools", "allowed")?
+        .is_none_or(|allowed| allowed.contains(&local_bridge_policy_alias(tool))))
 }
 
 pub fn model_allowed(provider: &str, model: &str) -> Result<bool> {
@@ -920,7 +962,31 @@ pub fn shell_program_allowed(program: &str) -> Result<bool> {
     )
 }
 
+/// Reads bounded reviewed artifacts from the active signed profile.
+///
+/// # Errors
+/// Returns an error for invalid or expired enrollment state.
+pub fn registry_artifacts() -> Result<Vec<crate::registry::RegistryArtifact>> {
+    if !is_enrolled()? {
+        return Ok(Vec::new());
+    }
+    let profile = EnterpriseManager::global()?.load_profile()?;
+    enforce_expiry(&profile)?;
+    Ok(profile.registry_artifacts)
+}
+
 pub fn managed_skills() -> Result<Vec<Skill>> {
+    managed_skills_inner(None)
+}
+
+/// Renders only approved factual parameters from local repository evidence.
+///
+/// # Errors
+/// Returns an error for invalid signed content or unavailable factual templates.
+pub fn managed_skills_for(workspace: &Path) -> Result<Vec<Skill>> {
+    managed_skills_inner(Some(workspace))
+}
+fn managed_skills_inner(workspace: Option<&Path>) -> Result<Vec<Skill>> {
     if !is_enrolled()? {
         return Ok(Vec::new());
     }
@@ -938,10 +1004,20 @@ pub fn managed_skills() -> Result<Vec<Skill>> {
                     skill.id
                 )));
             }
+            let instructions =
+                if let (Some(template), Some(workspace)) = (&skill.template_id, workspace) {
+                    crate::working_environment::render_reviewed_skill(
+                        template,
+                        &skill.instructions,
+                        &crate::working_environment::repository_facts(workspace)?,
+                    )?
+                } else {
+                    skill.instructions
+                };
             Ok(Skill::in_memory(
                 skill.id.clone(),
                 skill.description,
-                skill.instructions,
+                instructions,
                 PathBuf::from(format!("enterprise://{}@{}", skill.id, skill.version)),
             ))
         })
@@ -1192,7 +1268,7 @@ fn verify_envelope(
 }
 
 fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
-    if profile.schema != 1 {
+    if ![1, 3].contains(&profile.schema) || (profile.schema == 3) != profile.environment.is_some() {
         return Err(MimirError::Configuration(
             "unsupported compiled profile schema".into(),
         ));
@@ -1202,6 +1278,10 @@ fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
             "profile requires Mimir {} or newer",
             profile.minimum_mimir_version
         )));
+    }
+    crate::registry::validate(&profile.registry_artifacts)?;
+    if let Some(environment) = &profile.environment {
+        crate::working_environment::validate(environment)?;
     }
     let mut keys = BTreeSet::new();
     for binding in &profile.bindings {
@@ -1228,7 +1308,17 @@ fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
             )));
         }
     }
+    let mut skills = BTreeSet::new();
     for skill in &profile.skills {
+        if !skills.insert(&skill.id)
+            || skill.instructions.len() > 96 * 1024
+            || skill.content_sha256
+                != format!("{:x}", Sha256::digest(skill.instructions.as_bytes()))
+        {
+            return Err(MimirError::Configuration(
+                "Invalid or duplicate managed skill".into(),
+            ));
+        }
         if profile
             .revoked_catalog_items
             .contains(&format!("{}@{}", skill.id, skill.version))
@@ -1357,6 +1447,14 @@ fn validate_binding_parameters(binding: &HarnessBinding) -> Result<()> {
 }
 
 fn enforce_expiry(profile: &CompiledHarnessProfile) -> Result<()> {
+    if profile.schema == 3
+        && (profile.expires_at <= Utc::now()
+            || profile.created_at > Utc::now() + chrono::Duration::minutes(5))
+    {
+        return Err(MimirError::Configuration(
+            "Signed working environment is expired or not yet valid; sync before continuing".into(),
+        ));
+    }
     if profile.expires_at >= Utc::now() {
         return Ok(());
     }
@@ -1383,6 +1481,20 @@ fn override_disabled(store: &OverrideStore, binding: &HarnessBinding) -> bool {
             .iter()
             .find(|entry| entry.binding_key == binding.key)
             .is_some_and(|entry| entry.disabled)
+}
+
+fn validate_enrollment_scope(
+    profile: &CompiledHarnessProfile,
+    enrollment: &Enrollment,
+) -> Result<()> {
+    if profile.organization_id != enrollment.organization_id
+        || profile.team_id != Some(enrollment.team_id)
+    {
+        return Err(MimirError::Configuration(
+            "Signed profile differs from enrollment scope".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn status_json(enrollment: &Enrollment, profile: &CompiledHarnessProfile, updated: bool) -> Value {
@@ -1417,7 +1529,7 @@ fn validate_endpoint(value: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn enterprise_state_dir() -> Result<PathBuf> {
+pub(crate) fn enterprise_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("MIMIR_ENTERPRISE_STATE_DIR") {
         return Ok(PathBuf::from(path));
     }
@@ -1493,7 +1605,7 @@ fn set_owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn compare_versions(left: &str, right: &str) -> Result<i8> {
+pub(crate) fn compare_versions(left: &str, right: &str) -> Result<i8> {
     fn parse(value: &str) -> Result<[u64; 3]> {
         let core = value.split_once('-').map_or(value, |(core, _)| core);
         let parts = core
@@ -1559,6 +1671,37 @@ async fn server_error(operation: &str, response: reqwest::Response) -> MimirErro
     ))
 }
 
+/// Returns only verified configuration; installation credentials never cross this boundary.
+pub fn working_environment() -> Result<Option<crate::working_environment::WorkingEnvironment>> {
+    if !is_enrolled()? {
+        return Ok(None);
+    }
+    let profile = EnterpriseManager::global()?.load_profile()?;
+    enforce_expiry(&profile)?;
+    Ok(Some(
+        profile
+            .environment
+            .unwrap_or_else(crate::working_environment::defaults),
+    ))
+}
+
+fn local_bridge_policy_alias(tool: &str) -> String {
+    for name in [
+        "environment_status",
+        "repository_context",
+        "read_repository_guidance",
+        "list_agents",
+        "activate_agent",
+        "list_skills",
+        "activate_skill",
+    ] {
+        if tool == crate::tools::managed_mcp_tool_name("betterloop", name) {
+            return "search_skills".into();
+        }
+    }
+    tool.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1570,6 +1713,8 @@ mod tests {
     fn profile_with(bindings: Vec<HarnessBinding>, telemetry: &[&str]) -> CompiledHarnessProfile {
         CompiledHarnessProfile {
             schema: 1,
+            environment: None,
+            registry_artifacts: Vec::new(),
             release_id: Uuid::new_v4(),
             organization_id: Uuid::new_v4(),
             team_id: Some(Uuid::new_v4()),
@@ -1585,6 +1730,18 @@ mod tests {
             revoked_catalog_items: Vec::new(),
             source_metadata: json!({}),
         }
+    }
+
+    #[test]
+    fn enrollment_scope_rejects_other_team_or_organization_before_activation() {
+        let mut profile = profile_with(Vec::new(), &[]);
+        let enrollment = enrollment("http://127.0.0.1".into(), &profile);
+        assert!(validate_enrollment_scope(&profile, &enrollment).is_ok());
+        profile.team_id = Some(Uuid::new_v4());
+        assert!(validate_enrollment_scope(&profile, &enrollment).is_err());
+        profile.team_id = Some(enrollment.team_id);
+        profile.organization_id = Uuid::new_v4();
+        assert!(validate_enrollment_scope(&profile, &enrollment).is_err());
     }
 
     fn restriction(key: &str, hook: &str, action: &str, allowed: &[&str]) -> HarnessBinding {

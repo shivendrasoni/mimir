@@ -96,8 +96,8 @@ impl BashTool {
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolObservation, ToolError> {
         let input: BashInput = parse_input("bash", input)?;
-        let command = input.command.trim();
-        if command.is_empty() {
+        let command = input.command.as_str();
+        if command.trim_matches([' ', '\t']).is_empty() {
             return Err(ToolError::InvalidArguments {
                 tool: "bash".into(),
                 message: "command must not be blank".into(),
@@ -251,8 +251,8 @@ impl BashRunner {
                 tool: "bash".into(),
             });
         }
-        let command = command.trim();
-        if command.is_empty() {
+
+        if command.trim_matches([' ', '\t']).is_empty() {
             return Err(ToolError::InvalidArguments {
                 tool: "bash".into(),
                 message: "command must not be blank".into(),
@@ -270,14 +270,25 @@ impl BashRunner {
             .then(|| parse_managed_command(command))
             .transpose()?;
         if let Some(argv) = &managed_argv {
+            let discovery_allowed = (!local_programs_restricted
+                || self
+                    .policy
+                    .allowed_programs
+                    .as_ref()
+                    .is_some_and(|programs| programs.iter().any(|p| p == "rg")))
+                && enterprise_allowed
+                    .as_ref()
+                    .is_none_or(|programs| programs.contains("rg"));
             if local_programs_restricted {
                 validate_allowlisted_program(
                     &argv[0],
                     self.policy.allowed_programs.as_deref(),
                     false,
-                )?;
+                )
+                .map_err(|error| shell_denial_guidance(error, &argv[0], discovery_allowed))?;
             }
-            enforce_enterprise_program(&argv[0])?;
+            enforce_enterprise_program(&argv[0])
+                .map_err(|error| shell_denial_guidance(error, &argv[0], discovery_allowed))?;
         }
         if !self.policy.agent_mode.automatically_approves()
             && let Some(approvals) = &self.policy.approvals
@@ -441,6 +452,17 @@ fn validate_allowlisted_program(
     }
 }
 
+fn shell_denial_guidance(error: ToolError, program: &str, discovery_allowed: bool) -> ToolError {
+    match error {
+        ToolError::Disabled { tool } if program == "ls" && discovery_allowed => {
+            ToolError::Disabled {
+                tool: format!("{tool}; for file discovery, use rg --files <path>"),
+            }
+        }
+        other => other,
+    }
+}
+
 fn enforce_enterprise_program(program: &str) -> Result<(), ToolError> {
     match crate::enterprise::shell_program_allowed(program) {
         Ok(true) => Ok(()),
@@ -454,27 +476,25 @@ fn enforce_enterprise_program(program: &str) -> Result<(), ToolError> {
     }
 }
 
+// Kept equivalent to setup/src/shell-command.ts by the shared JSON fixture.
+// No expansion is performed; managed execution uses spawn_program(argv).
 fn parse_managed_command(command: &str) -> Result<Vec<String>, ToolError> {
+    const MAX_ARGUMENTS: usize = 4096;
     #[derive(Clone, Copy)]
     enum Quote {
         None,
         Single,
         Double,
     }
+    if command.len() > MAX_COMMAND_BYTES || command.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(managed_shell_error());
+    }
     let mut quote = Quote::None;
-    let mut escaped = false;
     let mut current = String::new();
+    let mut started = false;
     let mut argv = Vec::new();
-    let characters = command.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
-        if escaped {
-            current.push(character);
-            escaped = false;
-            index += 1;
-            continue;
-        }
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
         match quote {
             Quote::Single => {
                 if character == '\'' {
@@ -485,47 +505,75 @@ fn parse_managed_command(command: &str) -> Result<Vec<String>, ToolError> {
             }
             Quote::Double => match character {
                 '"' => quote = Quote::None,
-                '\\' => escaped = true,
-                '`' => return Err(managed_shell_error()),
-                '$' if characters.get(index + 1) == Some(&'(') => {
-                    return Err(managed_shell_error());
+                '$' | '`' => return Err(managed_shell_error()),
+                '\\' => {
+                    let Some(&next) = characters.peek() else {
+                        return Err(managed_shell_error());
+                    };
+                    if "\\\"$`".contains(next) {
+                        current.push(next);
+                        characters.next();
+                    } else {
+                        current.push(character);
+                    }
                 }
                 _ => current.push(character),
             },
             Quote::None => match character {
-                '\'' => quote = Quote::Single,
-                '"' => quote = Quote::Double,
-                '\\' => escaped = true,
                 ' ' | '\t' => {
-                    if !current.is_empty() {
+                    if started {
                         argv.push(std::mem::take(&mut current));
+                        if argv.len() > MAX_ARGUMENTS {
+                            return Err(managed_shell_error());
+                        }
+                        started = false;
                     }
                 }
-                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '\n' | '\r' => {
-                    return Err(managed_shell_error());
+                '\'' => {
+                    started = true;
+                    quote = Quote::Single;
                 }
-                '$' if characters.get(index + 1) == Some(&'(') => {
-                    return Err(managed_shell_error());
+                '"' => {
+                    started = true;
+                    quote = Quote::Double;
                 }
-                _ => current.push(character),
+                '\\' => {
+                    started = true;
+                    current.push(characters.next().ok_or_else(managed_shell_error)?);
+                }
+                c if ";&|<>()`$*?[]{}~#!".contains(c) => return Err(managed_shell_error()),
+                _ => {
+                    started = true;
+                    current.push(character);
+                }
             },
         }
-        index += 1;
     }
-    if escaped || !matches!(quote, Quote::None) {
+    if !matches!(quote, Quote::None) {
         return Err(managed_shell_error());
     }
-    if !current.is_empty() {
+    if started {
         argv.push(current);
+    }
+    if argv.len() > MAX_ARGUMENTS {
+        return Err(managed_shell_error());
     }
     let Some(program) = argv.first() else {
         return Err(managed_shell_error());
     };
-    if program.contains('/')
-        || program.contains('=')
+    let reserved = [
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "select", "in", "function", "time", "coproc", ".", "source", "eval", "exec", "command",
+        "builtin",
+    ];
+    if !program
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         || !program
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+        || reserved.contains(&program.as_str())
     {
         return Err(managed_shell_error());
     }
@@ -535,7 +583,7 @@ fn parse_managed_command(command: &str) -> Result<Vec<String>, ToolError> {
 fn managed_shell_error() -> ToolError {
     ToolError::InvalidArguments {
         tool: "bash".into(),
-        message: "managed shell policy permits one allowlisted program with literal arguments; shell chaining, redirection, substitution, environment prefixes, and executable paths are disabled"
+        message: "Shell policy cannot evaluate this command. Use one literal approved program per tool call. Quote patterns and paths, for example rg -g '*.md' docs. Split pipelines and chained commands into separate calls; substitutions, expansions and redirects are unsupported."
             .into(),
     }
 }
@@ -935,6 +983,35 @@ mod tests {
         let allowed = BTreeSet::from(["git".to_owned()]);
         assert!(validate_enterprise_allowlist("git status", Some(&allowed)).is_ok());
         assert!(validate_enterprise_allowlist("printf denied", Some(&allowed)).is_err());
+    }
+
+    #[test]
+    fn managed_shell_matches_shared_literal_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/shell-policy.json"))
+                .expect("fixture");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let command = case["command"].as_str().expect("command");
+            let result = parse_managed_command(command);
+            if case["argv"].is_null() {
+                assert!(result.is_err(), "accepted {command:?}");
+            } else {
+                let expected: Vec<String> =
+                    serde_json::from_value(case["argv"].clone()).expect("argv");
+                assert_eq!(result.expect(command), expected, "{command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn managed_shell_bounds_input() {
+        for command in [
+            format!("rg {}", "x".repeat(65536)),
+            format!("rg {}", "é".repeat(32768)),
+            format!("rg {}", "x ".repeat(4096)),
+        ] {
+            assert!(parse_managed_command(&command).is_err());
+        }
     }
 
     #[test]

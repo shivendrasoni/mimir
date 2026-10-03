@@ -37,3 +37,6 @@ pub mod tui;
 pub mod typesafe;
 
 mod atomic;
+
+pub mod registry;
+pub mod working_environment;

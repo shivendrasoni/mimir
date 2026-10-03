@@ -1,3 +1,4 @@
+pub(crate) use mcp::stable_tool_name as managed_mcp_tool_name;
 mod approval;
 mod bash;
 mod completion;
@@ -416,7 +417,7 @@ impl ToolRegistry {
         state_root: &Path,
     ) -> Result<McpRegistrationReport, ToolError> {
         self.deny_plan_registration("MCP tools")?;
-        let discovery = mcp::discover(state_root).await?;
+        let discovery = mcp::discover(state_root, &self.workspace_root).await?;
         let mut report = discovery.report;
         for tool in discovery.tools {
             let name = tool.definition().name;
@@ -731,7 +732,9 @@ impl ToolRegistry {
             tool: name.into(),
             message: "tool is not registered".into(),
         })?;
-        tool.execute(input).await
+        self.run_registry_before().await?;
+        let result = tool.execute(input).await;
+        self.run_registry_after(result).await
     }
 
     /// Executes a registered tool while propagating runtime cancellation to
@@ -752,9 +755,47 @@ impl ToolRegistry {
             tool: name.into(),
             message: "tool is not registered".into(),
         })?;
-        tool.execute_cancellable(input, cancellation).await
+        self.run_registry_before().await?;
+        let result = tool.execute_cancellable(input, cancellation).await;
+        self.run_registry_after(result).await
     }
 
+    async fn run_registry_before(&self) -> Result<(), ToolError> {
+        crate::registry::run_hooks(self.workspace_root(), "before_action", "tool_call", false)
+            .await
+            .map_err(|error| ToolError::Execution {
+                tool: "registry_hook".into(),
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+    async fn run_registry_after(
+        &self,
+        mut result: Result<ToolObservation, ToolError>,
+    ) -> Result<ToolObservation, ToolError> {
+        let context = crate::registry::run_hooks(
+            self.workspace_root(),
+            "after_action",
+            "tool_result",
+            result.as_ref().map_or(true, |observation| {
+                observation.status == ObservationStatus::Error
+            }),
+        )
+        .await
+        .map_err(|error| ToolError::Execution {
+            tool: "registry_hook".into(),
+            message: error.to_string(),
+        })?;
+        if let Ok(observation) = &mut result
+            && !context.is_empty()
+        {
+            observation
+                .content
+                .push_str("\n[Approved registry hook context]\n");
+            observation.content.push_str(&context);
+        }
+        result
+    }
     fn enforce_mode(&self, name: &str) -> Result<(), ToolError> {
         match crate::enterprise::tool_allowed(name) {
             Ok(true) => {}

@@ -3,7 +3,10 @@ use std::path::Path;
 use crate::{
     auth::{AuthCredential, AuthStore},
     error::{MimirError, Result},
-    mcp::{McpAuthCoordinator, McpClient, McpOAuthClient, McpServerCatalog},
+    mcp::{
+        McpAuthCoordinator, McpCatalogServer, McpClient, McpOAuthClient, McpServerCatalog,
+        McpServerConfig,
+    },
 };
 
 /// Resolves one catalog entry, applies its configured authentication precedence, refreshes
@@ -40,13 +43,41 @@ pub async fn connect_catalog_client_with_auth_store(
         .resolve(server)
         .await?
         .ok_or_else(|| MimirError::Configuration(format!("unknown MCP server: {server}")))?;
+    connect_config_client(state_root, server, config, auth_store, false).await
+}
+
+/// Connects the exact captured entry without resolving a mutable catalog key again.
+/// # Errors
+/// Returns configuration, credential or transport errors for this entry.
+pub(crate) async fn connect_catalog_entry(
+    entry: &McpCatalogServer,
+    state_root: &Path,
+    json_lines: bool,
+) -> Result<McpClient> {
+    connect_config_client(
+        state_root,
+        &entry.server,
+        entry.to_runtime_config()?,
+        AuthStore::global()?,
+        json_lines,
+    )
+    .await
+}
+
+async fn connect_config_client(
+    state_root: &Path,
+    server: &str,
+    config: McpServerConfig,
+    auth_store: AuthStore,
+    json_lines: bool,
+) -> Result<McpClient> {
     if !config.enabled {
         return Err(MimirError::Configuration(format!(
             "MCP server {server} is disabled"
         )));
     }
     let Some(remote) = config.remote.as_ref() else {
-        return McpClient::connect(&config).await;
+        return McpClient::connect_with_stdio_framing(&config, None, json_lines).await;
     };
     let has_authorization_header = config
         .headers
@@ -83,7 +114,14 @@ pub async fn connect_catalog_client_with_auth_store(
             let oauth = McpOAuthClient::new(remote.io_timeout, remote.max_response_bytes)?;
             let bundle = oauth.refresh(remote, &metadata, &credential).await?;
             let access = bundle.credential.access.clone();
-            coordinator.store_oauth_bundle(server, bundle).await?;
+            coordinator
+                .oauth_metadata()
+                .set(server, bundle.metadata)
+                .await?;
+            coordinator
+                .store()
+                .set_oauth(&config.provider_id(), bundle.credential)
+                .await?;
             Some(access)
         }
         Some(AuthCredential::OAuth(credential)) => Some(credential.access),

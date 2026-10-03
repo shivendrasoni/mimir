@@ -819,6 +819,14 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum EnterpriseCommand {
+    /// Inspect verified environment and prepared local repository facts.
+    Environment,
+    /// Prepare and verify the approved local MCP environment.
+    Prepare,
+    /// Remove unchanged Betterloop-owned local MCP entries.
+    RemoveEnvironment,
+    /// Serve the project-local Betterloop MCP bridge.
+    Bridge,
     /// Show enrollment and active signed-release status.
     Status,
     /// Explain the effective bindings, skills, and metadata categories.
@@ -2285,8 +2293,35 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
                 .await?,
         ),
         Command::Enterprise { action } => {
+            if matches!(action, EnterpriseCommand::Bridge) {
+                return crate::working_environment::serve_bridge(&std::fs::canonicalize(
+                    &cli.workspace,
+                )?)
+                .await;
+            }
             let manager = EnterpriseManager::global()?;
             let value = match action {
+                EnterpriseCommand::Bridge => unreachable!("bridge handled above"),
+                EnterpriseCommand::Environment => crate::working_environment::explanation(
+                    &enterprise::working_environment()?
+                        .ok_or_else(|| MimirError::Configuration("Mimir is not enrolled".into()))?,
+                    &std::fs::canonicalize(&cli.workspace)?,
+                )?,
+                EnterpriseCommand::Prepare => {
+                    crate::working_environment::prepare_native(
+                        &state,
+                        &std::fs::canonicalize(&cli.workspace)?,
+                    )
+                    .await?
+                }
+                EnterpriseCommand::RemoveEnvironment => {
+                    crate::working_environment::remove_native_mcp(
+                        &state,
+                        &std::fs::canonicalize(&cli.workspace)?,
+                    )
+                    .await?;
+                    json!({"removed":true})
+                }
                 EnterpriseCommand::Status => manager.status()?,
                 EnterpriseCommand::Explain => manager.explain()?,
                 EnterpriseCommand::Sync => manager.sync_with_backoff().await?,
@@ -7851,7 +7886,14 @@ async fn build_runtime_for_session(
     skills.extend(resources.skills.clone());
     // Managed skills are part of the signed native policy and intentionally do
     // not honor the local --no-skills compatibility switch.
-    skills.extend(enterprise::managed_skills()?);
+    skills.extend(enterprise::managed_skills_for(&workspace)?);
+    if let Some(environment) = enterprise::working_environment()? {
+        let facts = crate::working_environment::repository_facts(&workspace)?;
+        skills.extend(crate::working_environment::template_skills(
+            &environment,
+            &facts,
+        )?);
+    }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     let has_skills = !skills.is_empty();
     let skill_runtime = SkillRuntime::new(skills);
@@ -7882,6 +7924,7 @@ async fn build_runtime_for_session(
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
     if !build.offline && !build.agent_mode.is_plan() {
+        crate::working_environment::provision_native_mcp(&state, &workspace).await?;
         let mcp_report = tool_registry
             .register_mcp_servers(&state)
             .await

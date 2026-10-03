@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::{
     error::MimirError,
     mcp::{
-        McpClient, McpServerCatalog, McpToolCallOutput, McpToolDescriptor, connect_catalog_client,
+        McpClient, McpServerCatalog, McpToolCallOutput, McpToolDescriptor, connect_catalog_entry,
     },
     model::ToolDefinition,
 };
@@ -64,6 +64,9 @@ struct McpConnection {
     connect_timeout: Duration,
     io_timeout: Duration,
     client: Mutex<Option<McpClient>>,
+    catalog_identity: Value,
+    catalog_entry: crate::mcp::McpCatalogServer,
+    managed_fingerprint: Option<String>,
 }
 
 pub(super) struct RegisteredMcpTool {
@@ -79,7 +82,10 @@ impl RegisteredMcpTool {
     }
 }
 
-pub(super) async fn discover(state_root: &Path) -> Result<McpDiscovery, ToolError> {
+pub(super) async fn discover(
+    state_root: &Path,
+    workspace: &Path,
+) -> Result<McpDiscovery, ToolError> {
     let catalog = McpServerCatalog::new(state_root).map_err(|error| ToolError::Execution {
         tool: "mcp".into(),
         message: error.to_string(),
@@ -91,9 +97,34 @@ pub(super) async fn discover(state_root: &Path) -> Result<McpDiscovery, ToolErro
     let mut tools = Vec::new();
     let mut report = McpRegistrationReport::default();
 
-    let enabled = entries.into_iter().filter(|entry| entry.enabled);
+    let project_state = crate::working_environment::native_mcp_state(state_root, workspace)
+        .map_err(|error| ToolError::Execution {
+            tool: "mcp".into(),
+            message: error.to_string(),
+        })?;
+    let mut catalogs = vec![(catalog, state_root.to_owned(), entries)];
+    if project_state.exists() {
+        let managed =
+            McpServerCatalog::new(&project_state).map_err(|error| ToolError::Execution {
+                tool: "mcp".into(),
+                message: error.to_string(),
+            })?;
+        let entries = managed.list().await.map_err(|error| ToolError::Execution {
+            tool: "mcp".into(),
+            message: error.to_string(),
+        })?;
+        catalogs.push((managed, project_state, entries));
+    }
+    let enabled = catalogs.into_iter().flat_map(|(catalog, state, entries)| {
+        entries
+            .into_iter()
+            .filter(|entry| entry.enabled)
+            .map(move |entry| (catalog.clone(), state.clone(), entry))
+    });
     let discoveries = stream::iter(enabled)
-        .map(|entry| discover_server(&catalog, state_root, entry))
+        .map(|(catalog, state, entry)| async move {
+            discover_server(&catalog, &state, workspace, entry).await
+        })
         .buffered(MAX_PARALLEL_DISCOVERIES);
     futures::pin_mut!(discoveries);
     while let Some(result) = discoveries.next().await {
@@ -115,9 +146,20 @@ pub(super) async fn discover(state_root: &Path) -> Result<McpDiscovery, ToolErro
 async fn discover_server(
     catalog: &McpServerCatalog,
     state_root: &Path,
+    workspace: &Path,
     entry: crate::mcp::McpCatalogServer,
 ) -> Result<DiscoveredMcpServer, McpUnavailableServer> {
     let server = entry.server.clone();
+    let unavailable = || McpUnavailableServer {
+        server: server.clone(),
+        reason: "MCP configuration revoked, changed or unavailable; restart the session".into(),
+    };
+    if server == "betterloop" && !bridge_workspace_matches(&entry, workspace) {
+        return Err(unavailable());
+    }
+    let catalog_identity = serde_json::to_value(&entry).map_err(|_| unavailable())?;
+    let managed_fingerprint = snapshot_managed_identity(state_root, &server, &catalog_identity)
+        .map_err(|_| unavailable())?;
     let connect_timeout = connection_timeout(&entry);
     let io_timeout = entry.remote.as_ref().map_or_else(
         || Duration::from_millis(entry.stdio.io_timeout_ms),
@@ -125,7 +167,7 @@ async fn discover_server(
     );
     let mut client = match tokio::time::timeout(
         connect_timeout,
-        connect_catalog_client(catalog, state_root, &server),
+        connect_catalog_entry(&entry, state_root, managed_fingerprint.is_some()),
     )
     .await
     {
@@ -158,6 +200,22 @@ async fn discover_server(
             });
         }
     };
+    if catalog
+        .get(&server)
+        .await
+        .map_err(|_| unavailable())?
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| unavailable())?
+        .as_ref()
+        != Some(&catalog_identity)
+        || snapshot_managed_identity(state_root, &server, &catalog_identity)
+            .map_err(|_| unavailable())?
+            != managed_fingerprint
+    {
+        return Err(unavailable());
+    }
     let connection = Arc::new(McpConnection {
         catalog: catalog.clone(),
         state_root: state_root.to_owned(),
@@ -165,12 +223,75 @@ async fn discover_server(
         connect_timeout,
         io_timeout,
         client: Mutex::new(Some(client)),
+        catalog_identity,
+        catalog_entry: entry.clone(),
+        managed_fingerprint,
     });
     Ok(DiscoveredMcpServer {
         connection,
         label: entry.label,
         descriptors,
     })
+}
+
+fn bridge_workspace_matches(entry: &crate::mcp::McpCatalogServer, workspace: &Path) -> bool {
+    entry.remote.is_none()
+        && entry.stdio.args.len() == 4
+        && entry.stdio.args[0] == "--workspace"
+        && entry.stdio.args[2..] == ["enterprise", "bridge"]
+        && std::fs::canonicalize(&entry.stdio.args[1]).ok().as_deref() == Some(workspace)
+}
+
+// An owned catalog entry never becomes unmanaged when its signed grant disappears.
+fn snapshot_managed_identity(
+    state: &Path,
+    server: &str,
+    catalog_identity: &Value,
+) -> Result<Option<String>, MimirError> {
+    let marker = state.join("enterprise-owned-mcp.json");
+    let owned: Value = match std::fs::read(marker) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    if owned.get(server).is_none() && server != "betterloop" && !server.starts_with("bl_") {
+        return Ok(None);
+    }
+    let receipts: Value = serde_json::from_slice(&std::fs::read(
+        state.join("enterprise-owned-mcp-grants.json"),
+    )?)?;
+    let receipt = &receipts[server];
+    let identity = crate::working_environment::managed_mcp_fingerprint(server)?;
+    if identity.is_none()
+        || receipt["catalog"] != *catalog_identity
+        || receipt["fingerprint"].as_str() != identity.as_deref()
+    {
+        return Err(MimirError::Configuration(
+            "Owned MCP catalog is not bound to its current signed grant".into(),
+        ));
+    }
+    Ok(identity)
+}
+
+impl McpConnection {
+    async fn verify_identity(&self) -> Result<(), MimirError> {
+        let current = self
+            .catalog
+            .get(&self.server)
+            .await?
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        if current.as_ref() != Some(&self.catalog_identity)
+            || snapshot_managed_identity(&self.state_root, &self.server, &self.catalog_identity)?
+                != self.managed_fingerprint
+        {
+            return Err(MimirError::Configuration(
+                "MCP configuration revoked or replaced; restart the session".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn register_descriptors(
@@ -274,6 +395,13 @@ impl Tool for RegisteredMcpTool {
     }
 
     async fn execute(&self, input: Value) -> Result<ToolObservation, ToolError> {
+        self.connection
+            .verify_identity()
+            .await
+            .map_err(|_| ToolError::Execution {
+                tool: self.definition.name.clone(),
+                message: "MCP configuration revoked or replaced; restart the session".into(),
+            })?;
         if !input.is_object() {
             return Err(ToolError::InvalidArguments {
                 tool: self.definition.name.clone(),
@@ -286,10 +414,10 @@ impl Tool for RegisteredMcpTool {
             Some(client) => client,
             None => tokio::time::timeout(
                 self.connection.connect_timeout,
-                connect_catalog_client(
-                    &self.connection.catalog,
+                connect_catalog_entry(
+                    &self.connection.catalog_entry,
                     &self.connection.state_root,
-                    &self.connection.server,
+                    self.connection.managed_fingerprint.is_some(),
                 ),
             )
             .await
@@ -303,6 +431,14 @@ impl Tool for RegisteredMcpTool {
             })?,
         };
 
+        // Recheck after the slot lock or reconnect await; neither may rebind an old tool.
+        self.connection
+            .verify_identity()
+            .await
+            .map_err(|_| ToolError::Execution {
+                tool: self.definition.name.clone(),
+                message: "MCP configuration revoked or replaced; restart the session".into(),
+            })?;
         let result = tokio::time::timeout(
             self.connection.io_timeout,
             client.call_tool(&self.remote_name, input),
@@ -347,7 +483,7 @@ fn connection_timeout(entry: &crate::mcp::McpCatalogServer) -> Duration {
     )
 }
 
-fn stable_tool_name(server: &str, remote_name: &str) -> String {
+pub(crate) fn stable_tool_name(server: &str, remote_name: &str) -> String {
     let original_server = server;
     let mut server = sanitize_identifier(server);
     server.truncate(20);
@@ -424,6 +560,35 @@ fn bounded_public_text(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_bridge_discovery_requires_the_runtime_workspace() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let entry = crate::mcp::McpCatalogServer::new(
+            "betterloop",
+            "Bridge",
+            crate::mcp::McpCatalogStdio {
+                program: std::env::current_exe().unwrap(),
+                args: vec![
+                    "--workspace".into(),
+                    b.path().to_string_lossy().into_owned(),
+                    "enterprise".into(),
+                    "bridge".into(),
+                ],
+                ..crate::mcp::McpCatalogStdio::default()
+            },
+        )
+        .unwrap();
+        assert!(!bridge_workspace_matches(
+            &entry,
+            &std::fs::canonicalize(a.path()).unwrap()
+        ));
+        assert!(bridge_workspace_matches(
+            &entry,
+            &std::fs::canonicalize(b.path()).unwrap()
+        ));
+    }
 
     #[test]
     fn names_are_stable_bounded_and_collision_safe() {

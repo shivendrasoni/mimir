@@ -8,6 +8,77 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+pub async fn write_json_line<W>(writer: &mut W, value: &impl Serialize) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_vec(value)?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(MimirError::Protocol(
+            "MCP JSON line exceeds hard cap".into(),
+        ));
+    }
+    writer.write_all(&payload).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+async fn read_json_line<R>(reader: &mut R, max_frame_bytes: usize) -> Result<Value>
+where
+    R: AsyncBufRead + Unpin,
+{
+    Ok(read_json_line_frame(reader, max_frame_bytes).await?.0)
+}
+
+async fn read_json_line_frame<R>(reader: &mut R, max_frame_bytes: usize) -> Result<(Value, usize)>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let limit = max_frame_bytes.min(MAX_FRAME_BYTES);
+    let mut payload = Vec::new();
+    let read = reader
+        .take(limit as u64 + 2)
+        .read_until(b'\n', &mut payload)
+        .await?;
+    if read == 0 || !payload.ends_with(b"\n") || payload.len() > limit + 1 {
+        return Err(MimirError::Protocol(
+            "MCP JSON line is incomplete or exceeds limit".into(),
+        ));
+    }
+    Ok((serde_json::from_slice(&payload)?, payload.len()))
+}
+
+pub async fn read_json_line_response<R>(reader: &mut R, max_frame_bytes: usize) -> Result<Value>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut total = 0_usize;
+    for _ in 0..=32 {
+        let (frame, received_bytes) = read_json_line_frame(reader, max_frame_bytes).await?;
+        total = total.saturating_add(received_bytes);
+        if total > MAX_FRAME_BYTES {
+            break;
+        }
+        if frame.get("id").is_some() {
+            return Ok(frame);
+        }
+        if frame["jsonrpc"] != JSONRPC_VERSION
+            || !frame["method"]
+                .as_str()
+                .is_some_and(|method| method.starts_with("notifications/"))
+        {
+            return Err(MimirError::Protocol(
+                "Unexpected MCP message before response".into(),
+            ));
+        }
+    }
+    Err(MimirError::Protocol(
+        "MCP notification budget exceeded".into(),
+    ))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: &'static str,
@@ -96,4 +167,44 @@ where
     let mut payload = vec![0_u8; content_length];
     reader.read_exact(&mut payload).await?;
     Ok(serde_json::from_slice(&payload)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn managed_stdio_accepts_newline_frames_and_rejects_unbounded_input() {
+        let mut valid = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n".as_slice();
+        assert_eq!(read_json_line(&mut valid, 128).await.unwrap()["id"], 1);
+        let mut oversized = b"{\"value\":\"xxxxxxxxxxxxxxxxxxxxxxxx\"}\n".as_slice();
+        assert!(read_json_line(&mut oversized, 8).await.is_err());
+        let mut incomplete = b"{\"id\":1}".as_slice();
+        assert!(read_json_line(&mut incomplete, 128).await.is_err());
+    }
+    #[tokio::test]
+    async fn managed_stdio_skips_notifications_with_a_finite_budget() {
+        let notification =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n";
+        let response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+        let wire = format!("{notification}{response}");
+        assert_eq!(
+            read_json_line_response(&mut wire.as_bytes(), 128)
+                .await
+                .unwrap()["id"],
+            1
+        );
+        let flood = format!("{}{response}", notification.repeat(33));
+        assert!(
+            read_json_line_response(&mut flood.as_bytes(), 128)
+                .await
+                .is_err()
+        );
+        let padded = format!("{}{}", " ".repeat(600_000), notification);
+        let padded_flood = format!("{padded}{padded}{response}");
+        assert!(
+            read_json_line_response(&mut padded_flood.as_bytes(), MAX_FRAME_BYTES)
+                .await
+                .is_err()
+        );
+    }
 }

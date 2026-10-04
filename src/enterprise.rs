@@ -14,6 +14,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode, Url};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
@@ -215,6 +216,8 @@ struct ComplianceEvent {
     schema: u8,
     event_id: Uuid,
     release_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
     binding_key: Option<String>,
     hook: Option<String>,
     action: Option<String>,
@@ -224,6 +227,17 @@ struct ComplianceEvent {
     decision: Option<String>,
     error_code: Option<String>,
     mimir_version: String,
+}
+
+/// Produces an opaque key scoped to this Betterloop installation. The native
+/// Mimir session name is never serialized or sent over the network.
+fn session_alias(enrollment: &Enrollment, session_id: &str) -> Option<String> {
+    (!session_id.trim().is_empty()).then(|| {
+        let mut mac = Hmac::<Sha256>::new_from_slice(enrollment.installation_token.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(session_id.as_bytes());
+        format!("ses_{:x}", mac.finalize().into_bytes())
+    })
 }
 
 #[derive(Debug)]
@@ -862,6 +876,7 @@ impl EnterpriseManager {
             schema: 1,
             event_id: Uuid::new_v4(),
             release_id: profile.release_id,
+            session_id: None,
             binding_key: None,
             hook: None,
             action: None,
@@ -1304,6 +1319,7 @@ fn evaluate_allowlist(
                 schema: 1,
                 event_id: Uuid::new_v4(),
                 release_id: profile.release_id,
+                session_id: None,
                 binding_key: Some(binding.key.clone()),
                 hook: Some(binding.hook.clone()),
                 action: Some(binding.action.clone()),
@@ -1358,6 +1374,7 @@ pub fn observe_lifecycle(
     hook: &str,
     failed: bool,
     duration_bucket: Option<&str>,
+    session_id: &str,
 ) -> Result<ManagedLifecycleEffect> {
     if !is_enrolled()? {
         return Ok(ManagedLifecycleEffect::default());
@@ -1367,7 +1384,14 @@ pub fn observe_lifecycle(
     let profile = manager.load_profile()?;
     enforce_expiry(&profile)?;
     let overrides = manager.load_overrides()?;
-    let (effect, events) = evaluate_lifecycle(&profile, &overrides, hook, failed, duration_bucket);
+    let (effect, events) = evaluate_lifecycle(
+        &profile,
+        &overrides,
+        hook,
+        failed,
+        duration_bucket,
+        session_alias(&enrollment, session_id),
+    );
     manager.report_events_best_effort(enrollment, events);
     Ok(effect)
 }
@@ -1378,9 +1402,35 @@ fn evaluate_lifecycle(
     hook: &str,
     failed: bool,
     duration_bucket: Option<&str>,
+    session_id: Option<String>,
 ) -> (ManagedLifecycleEffect, Vec<ComplianceEvent>) {
     let mut events = Vec::new();
     let mut effect = ManagedLifecycleEffect::default();
+    let has_metadata_binding = profile.bindings.iter().any(|binding| {
+        binding.hook == hook
+            && binding.action == "record_metadata"
+            && !override_disabled(overrides, binding)
+    });
+    if matches!(hook, "session_start" | "session_shutdown")
+        && telemetry_enabled(profile, "session_activity")
+        && !has_metadata_binding
+    {
+        events.push(ComplianceEvent {
+            schema: 1,
+            event_id: Uuid::new_v4(),
+            release_id: profile.release_id,
+            session_id: session_id.clone(),
+            binding_key: None,
+            hook: Some(hook.to_owned()),
+            action: None,
+            event_type: "lifecycle_observed".into(),
+            occurred_at: Utc::now(),
+            duration_bucket: None,
+            decision: None,
+            error_code: None,
+            mimir_version: env!("CARGO_PKG_VERSION").into(),
+        });
+    }
     for binding in profile
         .bindings
         .iter()
@@ -1412,6 +1462,7 @@ fn evaluate_lifecycle(
                 schema: 1,
                 event_id: Uuid::new_v4(),
                 release_id: profile.release_id,
+                session_id: session_id.clone(),
                 binding_key: Some(binding.key.clone()),
                 hook: Some(binding.hook.clone()),
                 action: Some(binding.action.clone()),
@@ -2194,9 +2245,14 @@ mod tests {
             "agent_end",
             true,
             Some("lt_1s"),
+            Some("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         );
         assert!(effect.notify_failure);
         assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].session_id.as_deref(),
+            Some("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(events[0].event_type, "lifecycle_observed");
         assert_eq!(events[0].duration_bucket, None);
         assert_eq!(events[1].event_type, "duration_observed");
@@ -2214,12 +2270,29 @@ mod tests {
             "agent_end",
             true,
             Some("lt_1s"),
+            None,
         );
         assert!(effect.notify_failure);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "lifecycle_observed");
         assert!(events[0].duration_bucket.is_none());
         assert!(events[0].error_code.is_none());
+
+        let session_profile = profile_with(vec![], &["session_activity"]);
+        let (_, events) = evaluate_lifecycle(
+            &session_profile,
+            &OverrideStore::default(),
+            "session_start",
+            false,
+            None,
+            Some("ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].hook.as_deref(), Some("session_start"));
+        assert_eq!(
+            events[0].session_id.as_deref(),
+            Some("ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 
     #[test]

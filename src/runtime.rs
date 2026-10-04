@@ -3748,7 +3748,13 @@ impl AgentRuntime {
                 .and_then(|key| started.remove(&key))
                 .map(|start| duration_bucket(start.elapsed()))
         };
-        match crate::enterprise::observe_lifecycle(hook, failed, duration_bucket.as_deref()) {
+        let session_id = self.extension_session_id.read().await.clone();
+        match crate::enterprise::observe_lifecycle(
+            hook,
+            failed,
+            duration_bucket.as_deref(),
+            &session_id,
+        ) {
             Ok(effect) if effect.notify_failure => {
                 sink.emit(RuntimeEvent::ExtensionUi {
                     extension: "enterprise_policy".into(),

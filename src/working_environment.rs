@@ -22,6 +22,8 @@ pub struct WorkingEnvironment {
     pub context: Vec<Value>,
     pub skills: Vec<EnvironmentSkill>,
     pub mcp_servers: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_reporting: Option<String>,
     pub workflows: Vec<Value>,
     pub disabled_inherited: Vec<String>,
     pub visibility: Value,
@@ -58,6 +60,10 @@ pub fn validate(environment: &WorkingEnvironment) -> Result<()> {
         || environment.mcp_servers.len() > 32
         || environment.workflows.len() > 128
         || !environment.disabled_inherited.is_empty()
+        || environment
+            .repository_reporting
+            .as_deref()
+            .is_some_and(|value| value != "allow_and_report")
     {
         return Err(MimirError::Configuration(
             "Invalid resolved working environment bounds".into(),
@@ -237,6 +243,73 @@ fn validate_value_contract(environment: &WorkingEnvironment) -> Result<()> {
     strict_fields(&environment.delivery, &["mode", "merge", "deploy"])?;
     Ok(())
 }
+fn validate_mcp_auth(item: &Value, credential_pattern: &regex::Regex) -> Result<()> {
+    let invalid =
+        || MimirError::Configuration("Invalid MCP authentication/protocol contract".into());
+    if item
+        .get("protocol_revision")
+        .is_some_and(|value| !matches!(value.as_str(), Some("2025-03-26" | "2026-07-28")))
+    {
+        return Err(invalid());
+    }
+    if let Some(auth) = item.get("authentication") {
+        if item.get("credential_ref").is_some() {
+            return Err(invalid());
+        }
+        match auth["mode"].as_str() {
+            Some("none") => strict_fields(auth, &["mode"])?,
+            Some("bearer") => {
+                strict_fields(auth, &["mode", "credential_ref"])?;
+                if auth["credential_ref"]
+                    .as_str()
+                    .is_none_or(|value| !credential_pattern.is_match(value))
+                {
+                    return Err(invalid());
+                }
+            }
+            Some("oauth") => {
+                strict_fields(
+                    auth,
+                    &[
+                        "mode",
+                        "scopes",
+                        "issuer",
+                        "client_id",
+                        "client_metadata_url",
+                    ],
+                )?;
+                if item["transport"] != "http"
+                    || auth["scopes"].as_array().is_none_or(|scopes| {
+                        scopes.len() > 64
+                            || scopes.iter().any(|scope| {
+                                scope.as_str().is_none_or(|value| {
+                                    value.is_empty()
+                                        || value.len() > 256
+                                        || value.contains(char::is_whitespace)
+                                })
+                            })
+                    })
+                {
+                    return Err(invalid());
+                }
+                for field in ["issuer", "client_metadata_url"] {
+                    if let Some(value) = auth.get(field) {
+                        let url = reqwest::Url::parse(value.as_str().ok_or_else(invalid)?)
+                            .map_err(|_| invalid())?;
+                        if url.scheme() != "https"
+                            || !url.username().is_empty()
+                            || url.password().is_some()
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                }
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(())
+}
 fn validate_mcp_contract(environment: &WorkingEnvironment) -> Result<()> {
     let invalid = || MimirError::Configuration("Invalid MCP environment contract".into());
     let credential_pattern =
@@ -252,6 +325,8 @@ fn validate_mcp_contract(environment: &WorkingEnvironment) -> Result<()> {
                 "args",
                 "url",
                 "credential_ref",
+                "authentication",
+                "protocol_revision",
                 "expected_tools",
                 "enforcement",
             ],
@@ -263,6 +338,7 @@ fn validate_mcp_contract(environment: &WorkingEnvironment) -> Result<()> {
         {
             return Err(invalid());
         }
+        validate_mcp_auth(item, &credential_pattern)?;
         if item.get("credential_ref").is_some_and(|value| {
             value
                 .as_str()
@@ -1013,7 +1089,7 @@ async fn provision_environment_mcp(
     let mut desired = Vec::new();
     let mut fingerprints =
         BTreeMap::from([("betterloop".to_owned(), "local-betterloop-0.2.0".to_owned())]);
-    let bridge_stdio = McpCatalogStdio {
+    let mut bridge_stdio = McpCatalogStdio {
         program: std::env::current_exe()?,
         args: vec![
             "--workspace".into(),
@@ -1028,6 +1104,9 @@ async fn provision_environment_mcp(
             .collect(),
         ..McpCatalogStdio::default()
     };
+    if let Some(broker) = device_broker()? {
+        bridge_stdio = broker_entry(&broker, workspace, "mcp", None)?;
+    }
     desired.push(McpCatalogServer::new(
         "betterloop",
         "Betterloop local bridge",
@@ -1047,7 +1126,18 @@ async fn provision_environment_mcp(
             format!("{:x}", Sha256::digest(serde_json::to_vec(server)?)),
         );
         let label = server["label"].as_str().unwrap_or(key);
-        let mut entry = if server["transport"] == "http" {
+        let broker = device_broker()?;
+        let mut entry = if let Some(broker) = broker {
+            McpCatalogServer::new(
+                native_key,
+                label,
+                broker_entry(&broker, workspace, "mcp-server", Some(key))?,
+            )?
+        } else if server["protocol_revision"] == "2026-07-28"
+            || server["authentication"]["mode"] == "oauth"
+        {
+            return Err(MimirError::Configuration("This MCP definition requires the Betterloop device broker; run betterloop setup --harness mimir".into()));
+        } else if server["transport"] == "http" {
             let remote = McpCatalogHttp::new(server["url"].as_str().unwrap_or_default())?;
             McpCatalogServer::remote(native_key, label, remote)?
         } else {
@@ -1076,7 +1166,7 @@ async fn provision_environment_mcp(
             }
             McpCatalogServer::new(native_key, label, stdio)?
         };
-        if server["transport"] == "http" {
+        if server["transport"] == "http" && device_broker()?.is_none() {
             entry.bearer_token_env_var = server["credential_ref"].as_str().map(str::to_owned);
         }
         desired.push(entry);
@@ -1277,6 +1367,96 @@ pub fn managed_mcp_fingerprint(server: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn device_broker() -> Result<Option<Value>> {
+    let file = crate::enterprise::enterprise_state_dir()?.join("device-broker.json");
+    match std::fs::read(&file) {
+        Ok(bytes) if bytes.len() <= 8192 => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Ok(_) => Err(MimirError::Configuration(
+            "Device broker exceeds limit".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+fn broker_entry(
+    broker: &Value,
+    workspace: &Path,
+    operation: &str,
+    server: Option<&str>,
+) -> Result<crate::mcp::McpCatalogStdio> {
+    let mut args = vec![
+        broker["runner"]
+            .as_str()
+            .ok_or_else(|| MimirError::Configuration("Invalid device broker".into()))?
+            .to_owned(),
+        operation.into(),
+        "--harness".into(),
+        "mimir".into(),
+        "--project".into(),
+        workspace.to_string_lossy().into_owned(),
+    ];
+    if let Some(server) = server {
+        args.extend(["--server".into(), server.into()]);
+    }
+    if let Some(installation) = crate::enterprise::session_installation_id()? {
+        args.extend(["--installation".into(), installation.to_string()]);
+    }
+    Ok(crate::mcp::McpCatalogStdio {
+        program: PathBuf::from(broker["executable"].as_str().unwrap_or_default()),
+        args,
+        env: ["HOME", "PATH", "TMPDIR", "BETTERLOOP_HOME"]
+            .into_iter()
+            .filter(|key| std::env::var_os(key).is_some())
+            .map(|key| (key.to_owned(), key.to_owned()))
+            .collect(),
+        ..crate::mcp::McpCatalogStdio::default()
+    })
+}
+/// Queue repository-use evidence through the shared device broker at native startup.
+///
+/// # Errors
+/// Reports invalid owned broker configuration; unavailable delivery is diagnostic only.
+pub async fn observe_device_repository(
+    workspace: &Path,
+    session: &str,
+    offline: bool,
+) -> Result<()> {
+    let Some(broker) = device_broker()? else {
+        return Ok(());
+    };
+    let entry = broker_entry(&broker, workspace, "repository-session", None)?;
+    let mut command = tokio::process::Command::new(&entry.program);
+    command
+        .args(&entry.args)
+        .args(["--session", session, "--background"])
+        .current_dir(workspace)
+        .kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            if !output.stderr.is_empty() {
+                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            if !offline {
+                let sync = broker_entry(&broker, workspace, "sync", None)?;
+                if std::process::Command::new(&sync.program)
+                    .args(&sync.args)
+                    .arg("--background")
+                    .current_dir(workspace)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_err()
+                {
+                    eprintln!("Repository preparation pending; run betterloop doctor.");
+                }
+            }
+        }
+        _ => eprintln!("Repository reporting pending; run betterloop doctor."),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Reviewed registry artifacts consumed from the signed profile, never arbitrary repository files.
 use crate::error::{MimirError, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,90 @@ pub struct RegistryArtifact {
     pub enforcement: String,
     pub content: String,
     pub source: RegistrySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<RegistryFile>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RegistryOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<Vec<RegistryDependency>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_clients: Option<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryFile {
+    pub path: String,
+    pub sha256: String,
+    pub encoding: String,
+    pub content: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryOrigin {
+    pub catalog_id: String,
+    pub version: String,
+    pub parameters: Option<std::collections::BTreeMap<String, String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryDependency {
+    pub id: String,
+    pub version: String,
+}
+fn safe_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value.len() <= 1024
+        && value.split('/').all(|part| {
+            !matches!(part, "" | "." | "..")
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        })
+}
+fn validate_bundle(item: &RegistryArtifact, prefix: &str) -> Result<usize> {
+    let Some(files) = &item.files else {
+        return Ok(0);
+    };
+    if files.is_empty() || files.len() > 512 {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    let mut total = 0;
+    for file in files {
+        if !safe_path(&file.path) || !seen.insert(file.path.clone()) {
+            return Err(invalid());
+        }
+        let bytes = match file.encoding.as_str() {
+            "utf8" => file.content.as_bytes().to_vec(),
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(&file.content)
+                .map_err(|_| invalid())?,
+            _ => return Err(invalid()),
+        };
+        total += bytes.len();
+        if bytes.len() > 96 * 1024
+            || total > 16 * 1024 * 1024
+            || file.sha256 != format!("{:x}", Sha256::digest(&bytes))
+        {
+            return Err(invalid());
+        }
+    }
+    if files.iter().any(|file| {
+        seen.iter()
+            .any(|other| other.starts_with(&format!("{}/", file.path)))
+    }) {
+        return Err(invalid());
+    }
+    let entry = files
+        .iter()
+        .find(|file| format!("{prefix}{}", file.path) == item.path)
+        .ok_or_else(invalid)?;
+    if entry.encoding != "utf8" || entry.content != item.content || entry.sha256 != item.sha256 {
+        return Err(invalid());
+    }
+    Ok(total)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +143,7 @@ fn invalid() -> MimirError {
 ///
 /// # Errors
 /// Returns an error for unrecognized, duplicate or inconsistent artifacts.
+#[allow(clippy::too_many_lines)]
 pub fn validate(artifacts: &[RegistryArtifact]) -> Result<()> {
     if artifacts.len() > 128 {
         return Err(invalid());
@@ -75,21 +161,53 @@ pub fn validate(artifacts: &[RegistryArtifact]) -> Result<()> {
         let directory = match item.kind.as_str() {
             "skill" => "skills",
             "agent" => "agents",
-            "rule" => "rules",
+            "rule" | "advisory_rule" => "rules",
+            "workflow" => "workflows",
+            "reference" => "references",
             "hook_script" => "hooks",
             _ => return Err(invalid()),
         };
         let prefix = format!("registry/{directory}/{}/{}/", item.id, item.version);
+        total += validate_bundle(item, &prefix)?;
+        if item.supported_clients.as_ref().is_some_and(|clients| {
+            !clients.iter().any(|client| client == "mimir") || clients.len() > 3
+        }) {
+            return Err(invalid());
+        }
+        if let Some(origin) = &item.origin
+            && (!ids.is_match(&origin.catalog_id)
+                || crate::enterprise::compare_versions(&origin.version, "0.0.0").is_err()
+                || origin.parameters.as_ref().is_some_and(|values| {
+                    values.len() > 128
+                        || values
+                            .iter()
+                            .any(|(key, value)| key.len() > 128 || value.len() > 1024)
+                }))
+        {
+            return Err(invalid());
+        }
+        if let Some(dependencies) = &item.dependencies
+            && (dependencies.len() > 128
+                || dependencies.iter().any(|dependency| {
+                    !artifacts.iter().any(|candidate| {
+                        candidate.id == dependency.id && candidate.version == dependency.version
+                    })
+                }))
+        {
+            return Err(invalid());
+        }
         if !ids.is_match(&item.id)
             || !seen.insert(&item.id)
             || !item.path.starts_with(&prefix)
-            || item.path[prefix.len()..].contains('/')
-            || !file_pattern.is_match(&item.path[prefix.len()..])
+            || !safe_path(&item.path)
+            || (item.files.is_none()
+                && (item.path[prefix.len()..].contains('/')
+                    || !file_pattern.is_match(&item.path[prefix.len()..])))
             || !repositories.is_match(&item.source.repository)
             || !revisions.is_match(&item.source.commit_sha)
             || item.content.is_empty()
             || item.content.len() > 96 * 1024
-            || total > 1024 * 1024
+            || total > 16 * 1024 * 1024
             || item.sha256 != format!("{:x}", Sha256::digest(item.content.as_bytes()))
             || !matches!(item.enforcement.as_str(), "default" | "mandatory")
             || item.name.is_empty()
@@ -376,6 +494,10 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
             content,
             enforcement: "mandatory".into(),
+            files: None,
+            origin: None,
+            dependencies: None,
+            supported_clients: None,
             source: RegistrySource {
                 repository: "test/rules".into(),
                 commit_sha: "a".repeat(40),

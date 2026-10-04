@@ -8,6 +8,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -35,6 +36,32 @@ const CONFIG_FILE: &str = "enrollment.json";
 const PROFILE_FILE: &str = "profile.json";
 const PREVIOUS_PROFILE_FILE: &str = "profile.previous.json";
 const OVERRIDES_FILE: &str = "overrides.json";
+const REVOKED_FILE: &str = "revoked.json";
+#[derive(Clone, PartialEq, Eq)]
+struct ConnectionIdentity {
+    installation_id: Uuid,
+    organization_id: Uuid,
+    team_id: Uuid,
+    profile_id: Uuid,
+    endpoint: String,
+    credential_digest: String,
+}
+impl From<&Enrollment> for ConnectionIdentity {
+    fn from(enrollment: &Enrollment) -> Self {
+        Self {
+            installation_id: enrollment.installation_id,
+            organization_id: enrollment.organization_id,
+            team_id: enrollment.team_id,
+            profile_id: enrollment.profile_id,
+            endpoint: enrollment.endpoint.clone(),
+            credential_digest: format!(
+                "{:x}",
+                Sha256::digest(enrollment.installation_token.as_bytes())
+            ),
+        }
+    }
+}
+static SESSION_CONNECTION: OnceLock<Option<ConnectionIdentity>> = OnceLock::new();
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Enrollment {
@@ -252,6 +279,7 @@ impl EnterpriseManager {
         Ok(Self {
             root,
             client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -259,6 +287,87 @@ impl EnterpriseManager {
                     MimirError::Configuration(format!("enterprise HTTP client: {error}"))
                 })?,
         })
+    }
+
+    /// Attach a device-issued restricted credential after verifying its signed profile.
+    ///
+    /// # Errors
+    /// Rejects invalid credentials, profiles or replacement of an unrelated enrollment.
+    pub fn attach_device(&self, input: &Value) -> Result<Value> {
+        if input.as_object().is_none_or(|value| {
+            value.len() != 3
+                || value
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "endpoint" | "registration" | "broker"))
+        }) {
+            return Err(MimirError::Configuration(
+                "Invalid device attachment fields".into(),
+            ));
+        }
+        let endpoint = validate_endpoint(input["endpoint"].as_str().unwrap_or_default())?;
+        let response: EnrollmentResponse = serde_json::from_value(input["registration"].clone())?;
+        if response.schema != 1
+            || !response.installation_token.starts_with("bli_")
+            || response.installation_token.len() < 32
+        {
+            return Err(MimirError::Configuration(
+                "Invalid device runtime credential".into(),
+            ));
+        }
+        let profile = verify_envelope(&response.profile, &response.signing_public_key_base64)?;
+        validate_profile(&profile)?;
+        if self.root.join(CONFIG_FILE).exists() {
+            let prior = self.load_enrollment()?;
+            if prior.installation_id != response.installation_id
+                || prior.organization_id != response.organization_id
+                || prior.team_id != response.team_id
+                || prior.profile_id != response.profile_id
+                || prior.endpoint != endpoint.as_str().trim_end_matches('/')
+            {
+                return Err(MimirError::Configuration(
+                    "Disconnect the existing native enrollment before attaching this device".into(),
+                ));
+            }
+        }
+        let enrollment = Enrollment {
+            schema: 1,
+            endpoint: endpoint.as_str().trim_end_matches('/').to_owned(),
+            installation_id: response.installation_id,
+            installation_token: response.installation_token,
+            organization_id: response.organization_id,
+            team_id: response.team_id,
+            profile_id: response.profile_id,
+            channel: response.channel,
+            signing_public_key_base64: response.signing_public_key_base64,
+            etag: None,
+        };
+        validate_enrollment_scope(&profile, &enrollment)?;
+        let broker = input["broker"].clone();
+        if broker.as_object().is_none_or(|value| {
+            value.len() != 2
+                || value
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "executable" | "runner"))
+        }) {
+            return Err(MimirError::Configuration(
+                "Invalid device broker fields".into(),
+            ));
+        }
+        for key in ["executable", "runner"] {
+            let value = broker[key]
+                .as_str()
+                .ok_or_else(|| MimirError::Configuration("Missing device broker".into()))?;
+            if !Path::new(value).is_absolute() || !Path::new(value).is_file() {
+                return Err(MimirError::Configuration(
+                    "Device broker must use existing absolute files".into(),
+                ));
+            }
+        }
+        ensure_owner_only_dir(&self.root)?;
+        write_secure_json(&self.root.join(CONFIG_FILE), &enrollment)?;
+        self.activate_envelope(&response.profile)?;
+        write_secure_json(&self.root.join("device-broker.json"), &broker)?;
+        Ok(status_json(&enrollment, &profile, true))
     }
 
     #[cfg(test)]
@@ -392,6 +501,10 @@ impl EnterpriseManager {
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
+            write_secure_json(
+                &self.root.join(REVOKED_FILE),
+                &json!({"installation_id":enrollment.installation_id}),
+            )?;
             return Err(MimirError::Configuration(
                 "enterprise installation credential was revoked".into(),
             ));
@@ -470,6 +583,14 @@ impl EnterpriseManager {
             return Ok(json!({"schema": 1, "enrolled": false}));
         }
         let enrollment = self.load_enrollment()?;
+        if self.root.join(REVOKED_FILE).exists() {
+            let marker: Value = serde_json::from_slice(&fs::read(self.root.join(REVOKED_FILE))?)?;
+            if marker["installation_id"] == json!(enrollment.installation_id) {
+                return Ok(
+                    json!({"schema":1,"enrolled":true,"installation_id":enrollment.installation_id,"organization_id":enrollment.organization_id,"team_id":enrollment.team_id,"profile_id":enrollment.profile_id,"revoked":true,"expired":true}),
+                );
+            }
+        }
         let profile = self.load_profile()?;
         Ok(status_json(&enrollment, &profile, false))
     }
@@ -592,15 +713,47 @@ impl EnterpriseManager {
                 .send()
                 .await
                 .map_err(http_error)?;
-            if !response.status().is_success() {
+            if !response.status().is_success()
+                && !matches!(response.status().as_u16(), 401 | 403 | 410)
+            {
                 return Err(server_error("unenrollment", response).await);
             }
+        }
+        let known_files = [
+            CONFIG_FILE,
+            PROFILE_FILE,
+            PREVIOUS_PROFILE_FILE,
+            OVERRIDES_FILE,
+            "device-broker.json",
+            REVOKED_FILE,
+        ];
+        let backup = self
+            .root
+            .parent()
+            .unwrap_or(&self.root)
+            .join(format!("removed-enterprise-{}", Uuid::new_v4()));
+        for name in known_files {
+            let file = self.root.join(name);
+            if !file.exists() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&file)?;
+            if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+                return Err(MimirError::Configuration(
+                    "Enterprise removal encountered an unexpected file".into(),
+                ));
+            }
+            ensure_owner_only_dir(&backup)?;
+            fs::copy(&file, backup.join(name))?;
+            set_owner_only(&backup.join(name))?;
         }
         for name in [
             CONFIG_FILE,
             PROFILE_FILE,
             PREVIOUS_PROFILE_FILE,
             OVERRIDES_FILE,
+            "device-broker.json",
+            REVOKED_FILE,
         ] {
             match fs::remove_file(self.root.join(name)) {
                 Ok(()) => {}
@@ -625,6 +778,16 @@ impl EnterpriseManager {
         })?;
         let envelope: SignedHarnessProfileEnvelope = serde_json::from_slice(&bytes)?;
         let enrollment = self.load_enrollment()?;
+        let revoked = self.root.join(REVOKED_FILE);
+        if revoked.exists() {
+            let marker: Value = serde_json::from_slice(&fs::read(&revoked)?)?;
+            if marker["installation_id"] == json!(enrollment.installation_id) {
+                return Err(MimirError::Configuration(
+                    "enterprise installation credential was revoked; reconnect this device harness"
+                        .into(),
+                ));
+            }
+        }
         let profile = verify_envelope(&envelope, &enrollment.signing_public_key_base64)?;
         validate_profile(&profile)?;
         validate_enrollment_scope(&profile, &enrollment)?;
@@ -639,6 +802,13 @@ impl EnterpriseManager {
         if enrollment.schema != 1 {
             return Err(MimirError::Configuration(
                 "unsupported enrollment schema".into(),
+            ));
+        }
+        if let Some(expected) = SESSION_CONNECTION.get()
+            && expected.as_ref() != Some(&ConnectionIdentity::from(&enrollment))
+        {
+            return Err(MimirError::Configuration(
+                "Enterprise connection changed; start a fresh session".into(),
             ));
         }
         Ok(enrollment)
@@ -663,7 +833,13 @@ impl EnterpriseManager {
             fs::copy(&current, &previous)?;
             set_owner_only(&previous)?;
         }
-        write_secure_json(&current, envelope)
+        write_secure_json(&current, envelope)?;
+        match fs::remove_file(self.root.join(REVOKED_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     async fn report_event(
@@ -871,7 +1047,16 @@ pub fn report_tool_inventory_best_effort(
 
 /// Synchronizes an enrollment at startup, then verifies offline-expiry policy.
 pub async fn prepare_runtime(offline: bool) -> Result<Option<CompiledHarnessProfile>> {
-    if !is_enrolled()? {
+    let enrolled = is_enrolled()?;
+    let identity = if enrolled {
+        Some(ConnectionIdentity::from(
+            &EnterpriseManager::global()?.load_enrollment()?,
+        ))
+    } else {
+        None
+    };
+    let _ = SESSION_CONNECTION.set(identity);
+    if !enrolled {
         return Ok(None);
     }
     let manager = EnterpriseManager::global()?;
@@ -889,6 +1074,16 @@ pub async fn prepare_runtime(offline: bool) -> Result<Option<CompiledHarnessProf
     let profile = manager.load_profile()?;
     enforce_expiry(&profile)?;
     Ok(Some(profile))
+}
+pub(crate) fn session_installation_id() -> Result<Option<Uuid>> {
+    if !is_enrolled()? {
+        return Ok(None);
+    }
+    Ok(Some(
+        EnterpriseManager::global()?
+            .load_enrollment()?
+            .installation_id,
+    ))
 }
 
 /// Keeps the signed cache fresh for long-running sessions. Runtime tool gates read the
@@ -1516,6 +1711,15 @@ fn status_json(enrollment: &Enrollment, profile: &CompiledHarnessProfile, update
 
 fn validate_endpoint(value: &str) -> Result<Url> {
     let mut url = Url::parse(value).map_err(configuration_error)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(MimirError::Configuration(
+            "Enterprise endpoint must exclude credentials, query and fragment".into(),
+        ));
+    }
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
     if url.scheme() != "https" && !(url.scheme() == "http" && local) {
         return Err(MimirError::Configuration(
@@ -1556,7 +1760,15 @@ fn is_enrolled() -> Result<bool> {
     if std::env::var_os("MIMIR_ENTERPRISE_STATE_DIR").is_none() {
         return Ok(false);
     }
-    Ok(enterprise_state_dir()?.join(CONFIG_FILE).is_file())
+    let enrolled = enterprise_state_dir()?.join(CONFIG_FILE).is_file();
+    if let Some(expected) = SESSION_CONNECTION.get()
+        && expected.is_some() != enrolled
+    {
+        return Err(MimirError::Configuration(
+            "Enterprise connection changed; start a fresh session".into(),
+        ));
+    }
+    Ok(enrolled)
 }
 
 fn ensure_owner_only_dir(path: &Path) -> Result<()> {
@@ -1848,6 +2060,59 @@ mod tests {
             parameters: json!({"allowed": []}),
         };
         assert!(!override_disabled(&store, &binding));
+    }
+    #[test]
+    fn device_attachment_checks_signed_scope_before_writing_and_preserves_conflicting_enrollment() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let manager = EnterpriseManager::at(root.path().to_path_buf()).expect("manager");
+        let profile = profile_with(Vec::new(), &[]);
+        let payload = serde_json::to_vec(&profile).expect("profile");
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("key document");
+        let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("key");
+        let envelope = SignedHarnessProfileEnvelope {
+            schema: 1,
+            payload_base64: BASE64.encode(&payload),
+            sha256: format!("{:x}", Sha256::digest(&payload)),
+            key_id: Uuid::new_v4(),
+            signature: BASE64.encode(key.sign(&payload).as_ref()),
+        };
+        let installation = Uuid::new_v4();
+        let executable = std::env::current_exe().expect("executable");
+        let mut input = json!({"endpoint":"http://127.0.0.1:8088","registration":{"schema":1,"installation_id":installation,"installation_token":format!("bli_{}",Uuid::new_v4().simple()),"organization_id":profile.organization_id,"team_id":profile.team_id,"profile_id":Uuid::new_v4(),"channel":"stable","signing_public_key_base64":BASE64.encode(key.public_key().as_ref()),"profile":envelope},"broker":{"executable":executable,"runner":executable}});
+        input["registration"]["team_id"] = json!(Uuid::new_v4());
+        assert!(manager.attach_device(&input).is_err());
+        assert!(!root.path().join(CONFIG_FILE).exists());
+        input["registration"]["team_id"] = json!(profile.team_id);
+        assert_eq!(
+            manager.attach_device(&input).expect("attach")["installation_id"],
+            json!(installation)
+        );
+        let original = manager.load_enrollment().expect("enrollment");
+        let mut changed = original.clone();
+        changed.team_id = Uuid::new_v4();
+        assert!(ConnectionIdentity::from(&original) != ConnectionIdentity::from(&changed));
+        changed = original.clone();
+        changed.installation_token.push('x');
+        assert!(ConnectionIdentity::from(&original) != ConnectionIdentity::from(&changed));
+        write_secure_json(
+            &root.path().join(REVOKED_FILE),
+            &json!({"installation_id":installation}),
+        )
+        .expect("revocation marker");
+        assert!(manager.load_profile().is_err());
+        assert_eq!(
+            manager.status().expect("diagnostics")["revoked"],
+            json!(true)
+        );
+        input["registration"]["installation_id"] = json!(Uuid::new_v4());
+        assert!(manager.attach_device(&input).is_err());
+        assert_eq!(
+            manager
+                .load_enrollment()
+                .expect("retained enrollment")
+                .installation_id,
+            installation
+        );
     }
 
     #[test]

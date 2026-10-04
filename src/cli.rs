@@ -819,6 +819,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum EnterpriseCommand {
+    /// Attach a restricted device credential and signed profile from bounded stdin.
+    AttachDevice,
     /// Inspect verified environment and prepared local repository facts.
     Environment,
     /// Prepare and verify the approved local MCP environment.
@@ -2301,6 +2303,19 @@ async fn run_management(cli: &Cli, command: &Command) -> Result<()> {
             }
             let manager = EnterpriseManager::global()?;
             let value = match action {
+                EnterpriseCommand::AttachDevice => {
+                    let mut input = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut std::io::Read::take(io::stdin(), 5 * 1024 * 1024 + 1),
+                        &mut input,
+                    )?;
+                    if input.len() > 5 * 1024 * 1024 {
+                        return Err(MimirError::Configuration(
+                            "Device attachment exceeds limit".into(),
+                        ));
+                    }
+                    manager.attach_device(&serde_json::from_slice(&input)?)?
+                }
                 EnterpriseCommand::Bridge => unreachable!("bridge handled above"),
                 EnterpriseCommand::Environment => crate::working_environment::explanation(
                     &enterprise::working_environment()?
@@ -7923,6 +7938,8 @@ async fn build_runtime_for_session(
             .register_extension_tools(extensions, &workspace)
             .map_err(|error| MimirError::Tool(error.to_string()))?;
     }
+    crate::working_environment::observe_device_repository(&workspace, session, build.offline)
+        .await?;
     if !build.offline && !build.agent_mode.is_plan() {
         crate::working_environment::provision_native_mcp(&state, &workspace).await?;
         let mcp_report = tool_registry

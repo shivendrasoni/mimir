@@ -805,7 +805,11 @@ impl EnterpriseManager {
         let profile = verify_envelope(&envelope, &enrollment.signing_public_key_base64)?;
         validate_profile(&profile)?;
         validate_enrollment_scope(&profile, &enrollment)?;
-        Ok(profile)
+        Ok(crate::optional_resources::load(
+            profile,
+            &enrollment.signing_public_key_base64,
+            enrollment.installation_id,
+        ))
     }
 
     fn load_enrollment(&self) -> Result<Enrollment> {
@@ -1513,7 +1517,7 @@ fn verify_envelope(
     Ok(serde_json::from_slice(&payload)?)
 }
 
-fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
+pub(crate) fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
     if ![1, 3].contains(&profile.schema) || (profile.schema == 3) != profile.environment.is_some() {
         return Err(MimirError::Configuration(
             "unsupported compiled profile schema".into(),

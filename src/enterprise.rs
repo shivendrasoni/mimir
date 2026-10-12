@@ -218,6 +218,8 @@ struct ComplianceEvent {
     release_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_context: Option<Value>,
     binding_key: Option<String>,
     hook: Option<String>,
     action: Option<String>,
@@ -881,6 +883,7 @@ impl EnterpriseManager {
             event_id: Uuid::new_v4(),
             release_id: profile.release_id,
             session_id: None,
+            policy_context: None,
             binding_key: None,
             hook: None,
             action: None,
@@ -1290,6 +1293,33 @@ fn evaluate_allowlist_policy(
     Ok(allowed)
 }
 
+fn policy_target_context(
+    action: &str,
+    candidate: &str,
+    allowed: bool,
+    blocked_code: &str,
+) -> Value {
+    let mut context =
+        json!({"reason_code": if allowed { "allowed_by_policy" } else { blocked_code }});
+    let (field, value, pattern) = match action {
+        "restrict_tools" => (
+            "tool_name",
+            candidate,
+            r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$",
+        ),
+        "restrict_shell_programs" => (
+            "program",
+            candidate.rsplit('/').next().unwrap_or(candidate),
+            r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$",
+        ),
+        _ => return context,
+    };
+    if regex::Regex::new(pattern).is_ok_and(|pattern| pattern.is_match(value)) {
+        context[field] = Value::String(value.to_owned());
+    }
+    context
+}
+
 fn evaluate_allowlist(
     profile: &CompiledHarnessProfile,
     bindings: &[&HarnessBinding],
@@ -1324,6 +1354,12 @@ fn evaluate_allowlist(
                 event_id: Uuid::new_v4(),
                 release_id: profile.release_id,
                 session_id: None,
+                policy_context: Some(policy_target_context(
+                    action,
+                    candidate,
+                    binding_allowed,
+                    blocked_error_code,
+                )),
                 binding_key: Some(binding.key.clone()),
                 hook: Some(binding.hook.clone()),
                 action: Some(binding.action.clone()),
@@ -1424,6 +1460,7 @@ fn evaluate_lifecycle(
             event_id: Uuid::new_v4(),
             release_id: profile.release_id,
             session_id: session_id.clone(),
+            policy_context: None,
             binding_key: None,
             hook: Some(hook.to_owned()),
             action: None,
@@ -1467,6 +1504,7 @@ fn evaluate_lifecycle(
                 event_id: Uuid::new_v4(),
                 release_id: profile.release_id,
                 session_id: session_id.clone(),
+                policy_context: None,
                 binding_key: Some(binding.key.clone()),
                 hook: Some(binding.hook.clone()),
                 action: Some(binding.action.clone()),
@@ -2449,6 +2487,21 @@ mod tests {
         assert_eq!(allowed.events[0].event_type, "policy_allowed");
         assert_eq!(allowed.events[0].decision.as_deref(), Some("allow"));
         assert_eq!(allowed.events[0].error_code, None);
+        assert_eq!(
+            allowed.events[0].policy_context,
+            Some(json!({
+                "tool_name": "read_file", "reason_code": "allowed_by_policy"
+            }))
+        );
+        assert_eq!(
+            policy_target_context(
+                "restrict_shell_programs",
+                "/usr/bin/curl",
+                false,
+                "shell_program_not_allowed"
+            ),
+            json!({"program": "curl", "reason_code": "shell_program_not_allowed"})
+        );
 
         let private_attempt = "write_file:/private/customer/secret.txt";
         let blocked = evaluate_allowlist(

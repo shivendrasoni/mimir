@@ -1985,6 +1985,7 @@ pub async fn entrypoint() -> Result<()> {
     if let Some(command) = &cli.command {
         return run_management(&cli, command).await;
     }
+    enterprise::bind_repository(&cli.workspace)?;
     let _ = enterprise::prepare_runtime(cli.offline).await?;
     if !cli.offline {
         enterprise::spawn_periodic_sync();
@@ -2103,6 +2104,30 @@ async fn dispatch_run_with_diagnostics(
         recorder.finish_open();
     });
     let result = dispatch_run(cli, Arc::clone(&runtime), initial_prompt).await;
+    // A one-shot command also has a session-end lifecycle. Observers run before
+    // the process exits, and cannot replace its already completed result.
+    let mut shutdown_events = runtime.subscribe_events();
+    if runtime
+        .shutdown_extension_session("process_exit")
+        .await
+        .is_err()
+    {
+        eprintln!("warning: session-end observation unavailable");
+    }
+    while let Ok(envelope) = shutdown_events.try_recv() {
+        if let RuntimeEvent::SessionEvent { ref event } = envelope.event {
+            if event["type"] != "extension_ui_request" {
+                continue;
+            }
+            if cli.output == OutputMode::Json {
+                StdoutEventSink { enabled: true }.emit(envelope.event).await;
+            } else if cli.output == OutputMode::Text {
+                if let Some(message) = event["request"]["message"].as_str() {
+                    eprintln!("{message}");
+                }
+            }
+        }
+    }
     let _ = stop_sender.send(());
     let _ = collector.await;
     if let Err(error) = ingest_learning_diagnostics(cli, &state).await {

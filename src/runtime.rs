@@ -3768,6 +3768,34 @@ impl AgentRuntime {
             Ok(_) => {}
             Err(error) => eprintln!("warning: managed lifecycle observation failed: {error}"),
         }
+        // These boundaries observe lifecycle activity. They do not grant or
+        // prevent operations; policies declaring denial remain inactive here.
+        // Session start and canonical tool gates execute at their owning paths.
+        if hook != "session_start" {
+            match crate::policy::evaluate(
+                self.tools.workspace_root(),
+                serde_json::json!({
+                    "event":hook,"session_id":session_id,"failed":failed,
+                }),
+            )
+            .await
+            {
+                Ok(message) if !message.is_empty() => {
+                    sink.emit(RuntimeEvent::ExtensionUi {
+                        extension: "enterprise_policy".into(),
+                        request: UiRequest::Notify {
+                            level: "info".into(),
+                            message,
+                        },
+                    })
+                    .await;
+                }
+                Ok(_) => {}
+                Err(_) => eprintln!(
+                    "warning: lifecycle policy evaluation unavailable; inspect Betterloop readiness"
+                ),
+            }
+        }
     }
 
     async fn start_extension_session_with_sink(
@@ -3780,11 +3808,9 @@ impl AgentRuntime {
         if session_id.is_empty() || self.extension_session_started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let registry_context = match crate::registry::run_hooks(
+        let registry_context = match crate::policy::evaluate(
             self.tools.workspace_root(),
-            "session",
-            "session_start",
-            false,
+            serde_json::json!({"event":"session_start","session_id":session_id}),
         )
         .await
         {

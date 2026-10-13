@@ -1394,6 +1394,9 @@ fn validate_fleet_endpoint(endpoint: &str, label: &str, allow_insecure_local: bo
 }
 
 pub async fn load_active_fleet_pack(state_root: &Path) -> Result<Option<SignedLearningPack>> {
+    if crate::enterprise::report_only_repository()? {
+        return Ok(None);
+    }
     let path = active_fleet_pack_path(state_root);
     load_verified_cached_pack(state_root, &path, false).await
 }
@@ -1434,6 +1437,9 @@ pub async fn load_fleet_pack(
     state_root: &Path,
     pinned_version: Option<&str>,
 ) -> Result<Option<SignedLearningPack>> {
+    if crate::enterprise::report_only_repository()? {
+        return Ok(None);
+    }
     let Some(version) = pinned_version else {
         return load_active_fleet_pack(state_root).await;
     };

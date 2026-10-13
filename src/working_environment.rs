@@ -24,6 +24,8 @@ pub struct WorkingEnvironment {
     pub mcp_servers: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_reporting: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unapproved_repository_behavior: Option<String>,
     pub workflows: Vec<Value>,
     pub disabled_inherited: Vec<String>,
     pub visibility: Value,
@@ -54,7 +56,11 @@ pub fn defaults() -> WorkingEnvironment {
 /// # Errors
 /// Returns an error for invalid verified configuration or unavailable local resources.
 pub fn validate(environment: &WorkingEnvironment) -> Result<()> {
-    if environment.schema != 1
+    if environment
+        .unapproved_repository_behavior
+        .as_deref()
+        .is_some_and(|v| !matches!(v, "report_only" | "apply_team_defaults"))
+        || environment.schema != 1
         || environment.context.len() > 32
         || environment.skills.len() > 128
         || environment.mcp_servers.len() > 32
@@ -77,6 +83,23 @@ pub fn validate(environment: &WorkingEnvironment) -> Result<()> {
         ));
     }
     validate_value_contract(environment)?;
+    if environment.unapproved_repository_behavior.is_some()
+        && (environment.repository_reporting.as_deref() != Some("allow_and_report")
+            || crate::enterprise::compare_versions(&environment.minimum_adapter_version, "0.7.0")?
+                < 0
+            || crate::enterprise::compare_versions(
+                environment
+                    .minimum_runtime_versions
+                    .get("mimir")
+                    .map_or("0.0.0", String::as_str),
+                "0.27.0",
+            )? < 0)
+    {
+        return Err(MimirError::Configuration(
+            "Unapproved repository behavior requires reporting, setup 0.7.0 and Mimir 0.27.0"
+                .into(),
+        ));
+    }
     let templates = fixture()["templates"]
         .as_array()
         .cloned()
@@ -165,7 +188,10 @@ fn validate_value_contract(environment: &WorkingEnvironment) -> Result<()> {
     let invalid = || MimirError::Configuration("Invalid shared environment contract".into());
     crate::enterprise::compare_versions(&environment.minimum_adapter_version, "0.2.0")?;
     for (harness, minimum) in &environment.minimum_runtime_versions {
-        if !matches!(harness.as_str(), "mimir" | "claude-code" | "codex") {
+        if !matches!(
+            harness.as_str(),
+            "mimir" | "claude-code" | "codex" | "cursor"
+        ) {
             return Err(invalid());
         }
         crate::enterprise::compare_versions(minimum, "0.0.0")?;
@@ -1370,6 +1396,10 @@ pub fn managed_mcp_fingerprint(server: &str) -> Result<Option<String>> {
 }
 
 fn device_broker() -> Result<Option<Value>> {
+    // Orphaned or unavailable Betterloop files never affect standalone use.
+    if crate::enterprise::policy_enrollment()?.is_none() {
+        return Ok(None);
+    }
     let file = crate::enterprise::enterprise_state_dir()?.join("device-broker.json");
     match std::fs::read(&file) {
         Ok(bytes) if bytes.len() <= 8192 => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -1467,6 +1497,18 @@ mod tests {
         let release = uuid::Uuid::new_v4();
         assert!(ensure_preparation_release(release, release).is_ok());
         assert!(ensure_preparation_release(release, uuid::Uuid::new_v4()).is_err());
+    }
+    #[test]
+    fn accepts_cursor_minimum_version_in_shared_enrolled_environment() {
+        let mut environment = defaults();
+        environment
+            .minimum_runtime_versions
+            .insert("cursor".into(), "2.0.0".into());
+        validate(&environment).unwrap();
+        environment
+            .minimum_runtime_versions
+            .insert("unknown".into(), "1.0.0".into());
+        assert!(validate(&environment).is_err());
     }
     #[test]
     fn shared_defaults_render_five_starter_skills() {

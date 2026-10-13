@@ -33,6 +33,7 @@
 
 ## Invariants
 
+- **P0 — Betterloop independence:** Mimir's core harness must remain fully usable without Betterloop installation, setup, an account, enrollment, credentials, or service availability. Betterloop integration requires explicit opt-in and must never become a mandatory build or runtime service dependency. Enrolled enterprise controls remain scoped to explicitly enrolled installations; their enforcement must not gate standalone users. An explicit unenrollment path restores standalone operation. See [AGENTS.md](AGENTS.md) for contributor requirements.
 - The crate forbids unsafe Rust.
 - Provider configuration cannot be constructed with blank URL, model, or key; debug output redacts the key.
 - Tools are registered explicitly. File operations cannot escape the canonical workspace.

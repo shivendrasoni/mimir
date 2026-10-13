@@ -732,9 +732,9 @@ impl ToolRegistry {
             tool: name.into(),
             message: "tool is not registered".into(),
         })?;
-        self.run_registry_before().await?;
+        self.run_registry_before(name, &input).await?;
         let result = tool.execute(input).await;
-        self.run_registry_after(result).await
+        self.run_registry_after(name, result).await
     }
 
     /// Executes a registered tool while propagating runtime cancellation to
@@ -755,13 +755,13 @@ impl ToolRegistry {
             tool: name.into(),
             message: "tool is not registered".into(),
         })?;
-        self.run_registry_before().await?;
+        self.run_registry_before(name, &input).await?;
         let result = tool.execute_cancellable(input, cancellation).await;
-        self.run_registry_after(result).await
+        self.run_registry_after(name, result).await
     }
 
-    async fn run_registry_before(&self) -> Result<(), ToolError> {
-        crate::registry::run_hooks(self.workspace_root(), "before_action", "tool_call", false)
+    async fn run_registry_before(&self, name: &str, input: &Value) -> Result<(), ToolError> {
+        crate::policy::evaluate(self.workspace_root(), serde_json::json!({"event":"tool_call","tool":crate::enterprise::local_bridge_policy_alias(name),"tool_input":input}))
             .await
             .map_err(|error| ToolError::Execution {
                 tool: "registry_hook".into(),
@@ -771,16 +771,19 @@ impl ToolRegistry {
     }
     async fn run_registry_after(
         &self,
+        name: &str,
         mut result: Result<ToolObservation, ToolError>,
     ) -> Result<ToolObservation, ToolError> {
-        let context = crate::registry::run_hooks(
-            self.workspace_root(),
-            "after_action",
-            "tool_result",
-            result.as_ref().map_or(true, |observation| {
-                observation.status == ObservationStatus::Error
-            }),
-        )
+        let failed = result.as_ref().map_or(true, |observation| {
+            observation.status == ObservationStatus::Error
+        });
+        // Preserve bounded actual result facts locally. Large results are explicitly unavailable.
+        let tool_result = result
+            .as_ref()
+            .ok()
+            .and_then(|observation| serde_json::to_value(observation).ok())
+            .filter(|value| value.to_string().len() <= 256 * 1024);
+        let context = crate::policy::evaluate(self.workspace_root(), serde_json::json!({"event":"tool_result","tool":crate::enterprise::local_bridge_policy_alias(name),"failed":failed,"tool_result":tool_result}))
         .await
         .map_err(|error| ToolError::Execution {
             tool: "registry_hook".into(),

@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -29,7 +29,7 @@ use crate::{
     tools::ToolInventoryItem,
 };
 
-const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_INVENTORY_ITEMS: usize = 2_048;
 const MAX_INVENTORY_ALLOWED_PROGRAMS: usize = 256;
 const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -63,6 +63,135 @@ impl From<&Enrollment> for ConnectionIdentity {
     }
 }
 static SESSION_CONNECTION: OnceLock<Option<ConnectionIdentity>> = OnceLock::new();
+static SESSION_WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
+fn runtime_workspace() -> Result<PathBuf> {
+    SESSION_WORKSPACE
+        .get()
+        .cloned()
+        .map_or_else(|| Ok(std::env::current_dir()?), Ok)
+}
+/// Capture repository identity before any native company policy is evaluated.
+pub fn bind_repository(workspace: &Path) -> Result<()> {
+    let canonical = fs::canonicalize(workspace)?;
+    if let Some(existing) = SESSION_WORKSPACE.get() {
+        if existing != &canonical {
+            return Err(MimirError::Configuration(
+                "Repository changed; start a fresh agent session".into(),
+            ));
+        }
+    } else {
+        let _ = SESSION_WORKSPACE.set(canonical);
+    }
+    Ok(())
+}
+pub(crate) fn current_repository_approved(profile: &CompiledHarnessProfile) -> bool {
+    let path = SESSION_WORKSPACE
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_dir().ok());
+    let Some(path) = path else {
+        return false;
+    };
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(path)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let remote = String::from_utf8_lossy(&output.stdout);
+    let identity = if remote.contains("://") {
+        Url::parse(remote.trim()).ok().and_then(|url| {
+            url.host_str().map(|host| {
+                (
+                    host.to_lowercase(),
+                    url.path().trim_start_matches('/').to_owned(),
+                )
+            })
+        })
+    } else {
+        remote.trim().split_once(':').map(|(host, repo)| {
+            (
+                host.rsplit('@').next().unwrap_or(host).to_lowercase(),
+                repo.to_owned(),
+            )
+        })
+    };
+    let Some((host, repo)) = identity else {
+        return false;
+    };
+    if !host.contains('.') {
+        return false;
+    }
+    let repo = repo
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_lowercase();
+    profile.source_metadata["knowledge_map"]["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|project| {
+            project["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|entry| {
+                    let entry = entry.to_lowercase();
+                    entry == format!("{host}/{repo}") || (host == "github.com" && entry == repo)
+                })
+        })
+}
+fn project_repository_policy(
+    mut profile: CompiledHarnessProfile,
+    approved: bool,
+) -> CompiledHarnessProfile {
+    if approved {
+        return profile;
+    }
+    let mode = profile
+        .environment
+        .as_ref()
+        .and_then(|env| env.unapproved_repository_behavior.as_deref());
+    if mode == Some("report_only") {
+        profile
+            .instances
+            .retain(|instance| instance.requirement == "required");
+        profile.skills.clear();
+        profile.registry_artifacts.clear();
+        profile.telemetry.clear();
+        if let Some(env) = &mut profile.environment {
+            env.context.clear();
+            env.skills.clear();
+            env.mcp_servers.clear();
+            env.workflows.clear();
+        }
+        if let Some(metadata) = profile.source_metadata.as_object_mut() {
+            metadata.remove("knowledge_map");
+        }
+    } else if mode == Some("apply_team_defaults") {
+        profile
+            .instances
+            .retain(|instance| instance.requirement == "required");
+    }
+    profile
+}
+pub fn report_only_repository() -> Result<bool> {
+    if !is_enrolled()? {
+        return Ok(false);
+    }
+    let profile = EnterpriseManager::global()?.load_runtime_profile()?;
+    Ok(profile
+        .environment
+        .as_ref()
+        .and_then(|e| e.unapproved_repository_behavior.as_deref())
+        == Some("report_only")
+        && !current_repository_approved(&profile))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Enrollment {
@@ -150,31 +279,19 @@ pub struct CompiledHarnessProfile {
     pub team_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
     pub profile_name: String,
-    pub catalog_version: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub minimum_mimir_version: String,
-    pub bindings: Vec<HarnessBinding>,
-    pub skills: Vec<ManagedSkill>,
-    pub telemetry: Vec<String>,
+    pub minimum_setup_version: String,
+    pub minimum_runtime_versions: BTreeMap<String, String>,
+    pub policies: Vec<crate::policy::PolicyArtifact>,
+    pub instances: Vec<crate::policy::PolicyInstance>,
+    pub native_constraints: crate::policy::NativeConstraints,
     #[serde(default)]
     pub revoked_catalog_items: Vec<String>,
+    pub skills: Vec<ManagedSkill>,
+    pub telemetry: Vec<String>,
     #[serde(flatten)]
     pub source_metadata: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HarnessBinding {
-    pub key: String,
-    pub hook: String,
-    pub action: String,
-    pub catalog_version: String,
-    pub enforcement: Enforcement,
-    pub order: u32,
-    #[serde(default)]
-    pub critical: bool,
-    #[serde(default)]
-    pub parameters: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,9 +337,7 @@ struct ComplianceEvent {
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy_context: Option<Value>,
-    binding_key: Option<String>,
     hook: Option<String>,
-    action: Option<String>,
     event_type: String,
     occurred_at: DateTime<Utc>,
     duration_bucket: Option<String>,
@@ -240,12 +355,6 @@ fn session_alias(enrollment: &Enrollment, session_id: &str) -> Option<String> {
         mac.update(session_id.as_bytes());
         format!("ses_{:x}", mac.finalize().into_bytes())
     })
-}
-
-#[derive(Debug)]
-struct PolicyEvaluation {
-    allowed: bool,
-    events: Vec<ComplianceEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -360,10 +469,17 @@ impl EnterpriseManager {
         validate_enrollment_scope(&profile, &enrollment)?;
         let broker = input["broker"].clone();
         if broker.as_object().is_none_or(|value| {
-            value.len() != 2
-                || value
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "executable" | "runner"))
+            value.len() != 5
+                || value.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "executable"
+                            | "runner"
+                            | "policy_runtime"
+                            | "policy_activation"
+                            | "policy_activation_root"
+                    )
+                })
         }) {
             return Err(MimirError::Configuration(
                 "Invalid device broker fields".into(),
@@ -379,6 +495,7 @@ impl EnterpriseManager {
                 ));
             }
         }
+        crate::policy::verify_broker(&broker)?;
         ensure_owner_only_dir(&self.root)?;
         write_secure_json(&self.root.join(CONFIG_FILE), &enrollment)?;
         self.activate_envelope(&response.profile)?;
@@ -614,7 +731,6 @@ impl EnterpriseManager {
     pub fn explain(&self) -> Result<Value> {
         let enrollment = self.load_enrollment()?;
         let profile = self.load_profile()?;
-        let overrides = self.load_overrides()?;
         Ok(json!({
             "schema": 1,
             "organization_id": enrollment.organization_id,
@@ -622,18 +738,10 @@ impl EnterpriseManager {
             "profile_id": enrollment.profile_id,
             "release_id": profile.release_id,
             "profile_name": profile.profile_name,
-            "minimum_mimir_version": profile.minimum_mimir_version,
+            "minimum_runtime_versions": profile.minimum_runtime_versions,
             "expires_at": profile.expires_at,
-            "bindings": profile.bindings.iter().map(|binding| json!({
-                "key": binding.key,
-                "hook": binding.hook,
-                "action": binding.action,
-                "enforcement": binding.enforcement,
-                "critical": binding.critical,
-                "disabled": override_disabled(&overrides, binding),
-                "order": binding.order,
-                "parameters": binding.parameters,
-            })).collect::<Vec<_>>(),
+            "policies": profile.instances,
+            "native_constraints": profile.native_constraints,
             "skills": profile.skills.iter().map(|skill| json!({
                 "id": skill.id,
                 "version": skill.version,
@@ -658,15 +766,15 @@ impl EnterpriseManager {
         let enrollment = self.load_enrollment()?;
         let profile = self.load_profile()?;
         let binding = profile
-            .bindings
+            .instances
             .iter()
-            .find(|binding| binding.key == binding_key)
+            .find(|instance| instance.id == binding_key)
             .ok_or_else(|| {
-                MimirError::Configuration(format!("unknown managed binding: {binding_key}"))
+                MimirError::Configuration(format!("unknown managed policy: {binding_key}"))
             })?;
-        if binding.enforcement == Enforcement::Mandatory {
+        if binding.requirement == "required" {
             return Err(MimirError::Configuration(
-                "mandatory enterprise bindings cannot be overridden".into(),
+                "required enterprise policies cannot be overridden".into(),
             ));
         }
         let reason = reason.trim();
@@ -697,7 +805,7 @@ impl EnterpriseManager {
             .bearer_auth(&enrollment.installation_token)
             .json(&json!({
                 "release_id": profile.release_id,
-                "binding_key": binding_key,
+                "instance_id": binding_key,
                 "disabled": disabled,
                 "reason_code": "user_requested",
             }))
@@ -710,7 +818,9 @@ impl EnterpriseManager {
                 "warning: enterprise override is active locally but its metadata report was not accepted"
             );
         }
-        Ok(json!({"binding_key": binding_key, "disabled": disabled}))
+        Ok(json!({"instance_id": binding_key, "disabled": disabled,
+            "native_constraints_authoritative": true,
+            "notice": "This override changes the optional script policy. Signed native bounds remain active; changing them requires a reviewed company release."}))
     }
 
     /// Removes only the known enterprise credential and cache files.
@@ -784,6 +894,31 @@ impl EnterpriseManager {
             Err(error) => return Err(error.into()),
         }
         Ok(json!({"unenrolled": true}))
+    }
+
+    pub fn load_runtime_profile(&self) -> Result<CompiledHarnessProfile> {
+        let profile = match self.load_profile() {
+            Ok(profile) => profile,
+            Err(original) => {
+                let enrollment = self.load_enrollment()?;
+                if self.root.join(REVOKED_FILE).exists() {
+                    return Err(original);
+                }
+                let Some(envelope) =
+                    crate::policy::captured_envelope(&runtime_workspace()?, &enrollment)?
+                else {
+                    return Err(original);
+                };
+                let profile = verify_envelope(&envelope, &enrollment.signing_public_key_base64)?;
+                validate_profile(&profile)?;
+                validate_enrollment_scope(&profile, &enrollment)?;
+                // Recovered descriptors preserve native gates. Customer code is
+                // never evaluated while the primary cache is unverifiable.
+                profile
+            }
+        };
+        let approved = current_repository_approved(&profile);
+        Ok(project_repository_policy(profile, approved))
     }
 
     pub fn load_profile(&self) -> Result<CompiledHarnessProfile> {
@@ -884,9 +1019,8 @@ impl EnterpriseManager {
             release_id: profile.release_id,
             session_id: None,
             policy_context: None,
-            binding_key: None,
             hook: None,
-            action: None,
+
             event_type: event_type.to_owned(),
             occurred_at: Utc::now(),
             duration_bucket: None,
@@ -1093,8 +1227,7 @@ pub async fn prepare_runtime(offline: bool) -> Result<Option<CompiledHarnessProf
             "warning: enterprise profile sync failed; using last known good profile: {error}"
         );
     }
-    let profile = manager.load_profile()?;
-    enforce_expiry(&profile)?;
+    let profile = manager.load_runtime_profile()?;
     Ok(Some(profile))
 }
 pub(crate) fn session_installation_id() -> Result<Option<Uuid>> {
@@ -1128,20 +1261,44 @@ pub fn spawn_periodic_sync() {
     });
 }
 
-/// Returns enabled bindings from the currently verified profile and local default overrides.
-pub fn active_bindings() -> Result<Vec<HarnessBinding>> {
+/// Returns the current verified enrolled release. Standalone execution has no policy dependency.
+pub(crate) fn policy_release() -> Result<Option<CompiledHarnessProfile>> {
     if !is_enrolled()? {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let manager = EnterpriseManager::global()?;
-    let profile = manager.load_profile()?;
-    enforce_expiry(&profile)?;
+    let mut profile = manager.load_runtime_profile()?;
     let overrides = manager.load_overrides()?;
-    Ok(profile
-        .bindings
-        .into_iter()
-        .filter(|binding| !override_disabled(&overrides, binding))
-        .collect())
+    profile.instances.retain(|instance| {
+        instance.requirement == "required"
+            || !overrides
+                .overrides
+                .iter()
+                .any(|item| item.binding_key == instance.id && item.disabled)
+    });
+    Ok(Some(profile))
+}
+pub(crate) fn policy_enrollment() -> Result<Option<Enrollment>> {
+    if !is_enrolled()? {
+        return Ok(None);
+    }
+    Ok(Some(EnterpriseManager::global()?.load_enrollment()?))
+}
+pub(crate) fn policy_envelope() -> Result<SignedHarnessProfileEnvelope> {
+    let manager = EnterpriseManager::global()?;
+    if manager.load_profile().is_ok() {
+        return Ok(serde_json::from_slice(&fs::read(
+            enterprise_state_dir()?.join(PROFILE_FILE),
+        )?)?);
+    }
+    let enrollment = manager.load_enrollment()?;
+    crate::policy::captured_envelope(&runtime_workspace()?, &enrollment)?
+        .ok_or_else(|| MimirError::Configuration("Verified policy release unavailable".into()))
+}
+pub(crate) fn policy_primary_cache_verified() -> bool {
+    EnterpriseManager::global()
+        .and_then(|manager| manager.load_profile())
+        .is_ok()
 }
 
 /// Final native per-tool gate. It is independent of extensions and CLI disable switches.
@@ -1150,7 +1307,8 @@ pub fn tool_allowed(tool: &str) -> Result<bool> {
         return Ok(true);
     }
     let normalized = local_bridge_policy_alias(tool);
-    evaluate_allowlist_policy("restrict_tools", "allowed", &normalized, "tool_not_allowed")
+    Ok(allowed_values("restrict_tools", "allowed")?
+        .is_none_or(|values| values.contains(&normalized)))
 }
 
 /// Content-free visibility check used while constructing provider tool lists.
@@ -1171,12 +1329,8 @@ pub fn model_allowed(provider: &str, model: &str) -> Result<bool> {
 
 /// Final native shell-program gate. The attempted command and its arguments never leave Mimir.
 pub fn shell_program_allowed(program: &str) -> Result<bool> {
-    evaluate_allowlist_policy(
-        "restrict_shell_programs",
-        "allowed",
-        program,
-        "shell_program_not_allowed",
-    )
+    Ok(allowed_values("restrict_shell_programs", "allowed")?
+        .is_none_or(|values| values.contains(program)))
 }
 
 /// Reads bounded reviewed artifacts from the active signed profile.
@@ -1187,8 +1341,10 @@ pub fn registry_artifacts() -> Result<Vec<crate::registry::RegistryArtifact>> {
     if !is_enrolled()? {
         return Ok(Vec::new());
     }
-    let profile = EnterpriseManager::global()?.load_profile()?;
-    enforce_expiry(&profile)?;
+    let profile = EnterpriseManager::global()?.load_runtime_profile()?;
+    if enforce_expiry(&profile).is_err() {
+        return Ok(Vec::new());
+    }
     Ok(profile.registry_artifacts)
 }
 
@@ -1208,8 +1364,10 @@ fn managed_skills_inner(workspace: Option<&Path>) -> Result<Vec<Skill>> {
         return Ok(Vec::new());
     }
     let manager = EnterpriseManager::global()?;
-    let profile = manager.load_profile()?;
-    enforce_expiry(&profile)?;
+    let profile = manager.load_runtime_profile()?;
+    if enforce_expiry(&profile).is_err() {
+        return Ok(Vec::new());
+    }
     profile
         .skills
         .into_iter()
@@ -1241,171 +1399,98 @@ fn managed_skills_inner(workspace: Option<&Path>) -> Result<Vec<Skill>> {
         .collect()
 }
 
-pub fn allowed_values(action: &str, parameter: &str) -> Result<Option<BTreeSet<String>>> {
-    let mut restrictions = active_bindings()?
-        .into_iter()
-        .filter(|binding| binding.action == action)
-        .filter_map(|binding| binding.parameters.get(parameter)?.as_array().cloned())
-        .map(|values| {
-            values
-                .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .collect::<BTreeSet<_>>()
-        });
-    let Some(mut intersection) = restrictions.next() else {
+pub fn allowed_values(action: &str, _parameter: &str) -> Result<Option<BTreeSet<String>>> {
+    let Some(profile) = policy_release()? else {
         return Ok(None);
     };
-    for restriction in restrictions {
-        intersection = intersection.intersection(&restriction).cloned().collect();
-    }
-    Ok(Some(intersection))
-}
-
-fn evaluate_allowlist_policy(
-    action: &str,
-    parameter: &str,
-    candidate: &str,
-    blocked_error_code: &str,
-) -> Result<bool> {
-    if !is_enrolled()? {
-        return Ok(true);
-    }
-    let manager = EnterpriseManager::global()?;
-    let enrollment = manager.load_enrollment()?;
-    let profile = manager.load_profile()?;
-    enforce_expiry(&profile)?;
-    let overrides = manager.load_overrides()?;
-    let bindings = profile
-        .bindings
-        .iter()
-        .filter(|binding| !override_disabled(&overrides, binding))
-        .collect::<Vec<_>>();
-    let evaluation = evaluate_allowlist(
-        &profile,
-        &bindings,
-        action,
-        parameter,
-        candidate,
-        blocked_error_code,
-    );
-    let allowed = evaluation.allowed;
-    manager.report_events_best_effort(enrollment, evaluation.events);
-    Ok(allowed)
-}
-
-fn policy_target_context(
-    action: &str,
-    candidate: &str,
-    allowed: bool,
-    blocked_code: &str,
-) -> Value {
-    let mut context =
-        json!({"reason_code": if allowed { "allowed_by_policy" } else { blocked_code }});
-    let (field, value, pattern) = match action {
-        "restrict_tools" => (
-            "tool_name",
-            candidate,
-            r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$",
-        ),
-        "restrict_shell_programs" => (
-            "program",
-            candidate.rsplit('/').next().unwrap_or(candidate),
-            r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$",
-        ),
-        _ => return context,
+    let values = match action {
+        "restrict_tools" => profile
+            .native_constraints
+            .allowed_tools
+            .get("mimir")
+            .cloned(),
+        "restrict_shell_programs" => profile
+            .native_constraints
+            .allowed_shell_programs
+            .get("mimir")
+            .cloned(),
+        "restrict_models" => profile
+            .native_constraints
+            .approved_models
+            .get("mimir")
+            .cloned(),
+        _ => None,
     };
-    if regex::Regex::new(pattern).is_ok_and(|pattern| pattern.is_match(value)) {
-        context[field] = Value::String(value.to_owned());
+    if values.is_some() {
+        enforce_expiry(&profile)?;
     }
-    context
-}
-
-fn evaluate_allowlist(
-    profile: &CompiledHarnessProfile,
-    bindings: &[&HarnessBinding],
-    action: &str,
-    parameter: &str,
-    candidate: &str,
-    blocked_error_code: &str,
-) -> PolicyEvaluation {
-    let policy_decision = telemetry_enabled(profile, "policy_decision");
-    let failure_code = telemetry_enabled(profile, "failure_code");
-    let mut matched = false;
-    let mut allowed = true;
-    let mut events = Vec::new();
-
-    for binding in bindings
-        .iter()
-        .copied()
-        .filter(|binding| binding.action == action)
-    {
-        let Some(values) = binding.parameters.get(parameter).and_then(Value::as_array) else {
-            continue;
-        };
-        matched = true;
-        let binding_allowed = values
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|value| value == candidate);
-        allowed &= binding_allowed;
-        if policy_decision || (!binding_allowed && failure_code) {
-            events.push(ComplianceEvent {
-                schema: 1,
-                event_id: Uuid::new_v4(),
-                release_id: profile.release_id,
-                session_id: None,
-                policy_context: Some(policy_target_context(
-                    action,
-                    candidate,
-                    binding_allowed,
-                    blocked_error_code,
-                )),
-                binding_key: Some(binding.key.clone()),
-                hook: Some(binding.hook.clone()),
-                action: Some(binding.action.clone()),
-                event_type: if binding_allowed {
-                    "policy_allowed".into()
-                } else {
-                    "policy_blocked".into()
-                },
-                occurred_at: Utc::now(),
-                duration_bucket: None,
-                decision: policy_decision.then(|| {
-                    if binding_allowed {
-                        "allow".into()
-                    } else {
-                        "block".into()
-                    }
-                }),
-                error_code: (!binding_allowed && failure_code)
-                    .then(|| blocked_error_code.to_owned()),
-                mimir_version: env!("CARGO_PKG_VERSION").to_owned(),
-            });
-        }
-    }
-
-    PolicyEvaluation {
-        allowed: !matched || allowed,
-        events,
-    }
+    Ok(values.map(|values| values.into_iter().collect()))
 }
 
 fn telemetry_enabled(profile: &CompiledHarnessProfile, category: &str) -> bool {
     profile.telemetry.iter().any(|value| value == category)
 }
 
+fn policy_result_events(
+    profile: &CompiledHarnessProfile,
+    enrollment: &Enrollment,
+    event: &Value,
+    result: &Value,
+) -> Vec<ComplianceEvent> {
+    let decisions = telemetry_enabled(profile, "policy_decision");
+    let failures = telemetry_enabled(profile, "failure_code");
+    result["results"].as_array().into_iter().flatten().filter_map(|result| {
+        if !matches!(result["status"].as_str(), Some("evaluated" | "failed")) { return None; }
+        let instance = profile.instances.iter().find(|instance| result["instance_id"] == instance.id)?;
+        let failed = result["status"] == "failed";
+        let denied = result["outcome"] == "deny";
+        if !decisions && !(failures && (failed || denied)) { return None; }
+        let reason = result["reason_code"].as_str()?;
+        if reason.len() > 80 || !reason.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte,b'_'|b'.'|b'-')) { return None; }
+        let context = decisions.then(|| {
+            let mut context = json!({"instance_id":instance.id,"definition_id":instance.definition.id,
+                "definition_version":instance.definition.version,"definition_digest":instance.definition.sha256,
+                "mode":instance.mode,"reason_code":reason});
+            if failed { context["error_code"] = json!(reason); }
+            context
+        });
+        Some(ComplianceEvent { schema:1,event_id:Uuid::new_v4(),release_id:profile.release_id,
+            session_id:session_alias(enrollment,event["session_id"].as_str().unwrap_or_default()),policy_context:context,
+            hook:event["event"].as_str().map(str::to_owned),event_type:if failed {"policy_evaluation_failed"} else {
+                match result["outcome"].as_str() {Some("deny")=>"policy_blocked",Some("guidance")=>"policy_guidance",_=>"policy_allowed"}
+            }.into(),occurred_at:Utc::now(),duration_bucket:None,decision:decisions.then(||result["outcome"].as_str().unwrap_or("allow").to_owned()),
+            error_code:(failures && (failed || denied)).then(||reason.to_owned()),mimir_version:env!("CARGO_PKG_VERSION").into() })
+    }).collect()
+}
+pub(crate) fn report_policy_results(
+    profile: &CompiledHarnessProfile,
+    enrollment: &Enrollment,
+    event: &Value,
+    result: &Value,
+) {
+    let events = policy_result_events(profile, enrollment, event, result);
+    if let Ok(manager) = EnterpriseManager::global() {
+        manager.report_events_best_effort(enrollment.clone(), events);
+    }
+}
+
 pub fn maximum_thinking_level() -> Result<Option<ThinkingLevel>> {
-    active_bindings()?
-        .iter()
-        .filter(|binding| binding.action == "limit_thinking_level")
-        .filter_map(|binding| binding.parameters.get("maximum")?.as_str())
-        .map(parse_thinking_level)
-        .try_fold(None, |current, next| {
-            let next = next?;
-            Ok(Some(
-                current.map_or(next, |value: ThinkingLevel| value.min(next)),
-            ))
-        })
+    let Some(profile) = policy_release()? else {
+        return Ok(None);
+    };
+    if profile
+        .native_constraints
+        .maximum_reasoning_level
+        .contains_key("mimir")
+    {
+        enforce_expiry(&profile)?;
+    }
+    profile
+        .native_constraints
+        .maximum_reasoning_level
+        .get("mimir")
+        .map(|value| parse_thinking_level(value))
+        .transpose()
 }
 
 /// Applies content-free managed observability bindings for one lifecycle event.
@@ -1421,7 +1506,7 @@ pub fn observe_lifecycle(
     }
     let manager = EnterpriseManager::global()?;
     let enrollment = manager.load_enrollment()?;
-    let profile = manager.load_profile()?;
+    let profile = manager.load_runtime_profile()?;
     enforce_expiry(&profile)?;
     let overrides = manager.load_overrides()?;
     let (effect, events) = evaluate_lifecycle(
@@ -1438,84 +1523,45 @@ pub fn observe_lifecycle(
 
 fn evaluate_lifecycle(
     profile: &CompiledHarnessProfile,
-    overrides: &OverrideStore,
+    _overrides: &OverrideStore,
     hook: &str,
     failed: bool,
     duration_bucket: Option<&str>,
     session_id: Option<String>,
 ) -> (ManagedLifecycleEffect, Vec<ComplianceEvent>) {
     let mut events = Vec::new();
-    let mut effect = ManagedLifecycleEffect::default();
-    let has_metadata_binding = profile.bindings.iter().any(|binding| {
-        binding.hook == hook
-            && binding.action == "record_metadata"
-            && !override_disabled(overrides, binding)
-    });
-    if matches!(hook, "session_start" | "session_shutdown")
-        && telemetry_enabled(profile, "session_activity")
-        && !has_metadata_binding
-    {
-        events.push(ComplianceEvent {
+    let effect = ManagedLifecycleEffect {
+        notify_failure: failed && telemetry_enabled(profile, "failure_code"),
+    };
+    let make_event =
+        |event_type: &str, duration: Option<&str>, code: Option<&str>| ComplianceEvent {
             schema: 1,
             event_id: Uuid::new_v4(),
             release_id: profile.release_id,
             session_id: session_id.clone(),
             policy_context: None,
-            binding_key: None,
             hook: Some(hook.to_owned()),
-            action: None,
-            event_type: "lifecycle_observed".into(),
+            event_type: event_type.into(),
             occurred_at: Utc::now(),
-            duration_bucket: None,
+            duration_bucket: duration.map(str::to_owned),
             decision: None,
-            error_code: None,
+            error_code: code.map(str::to_owned),
             mimir_version: env!("CARGO_PKG_VERSION").into(),
-        });
-    }
-    for binding in profile
-        .bindings
-        .iter()
-        .filter(|binding| binding.hook == hook && !override_disabled(overrides, binding))
-    {
-        let (event_type, reported_duration, error_code) = match binding.action.as_str() {
-            "record_metadata" => (Some("lifecycle_observed"), None, None),
-            "measure_duration"
-                if duration_bucket.is_some() && telemetry_enabled(profile, "duration_bucket") =>
-            {
-                (Some("duration_observed"), duration_bucket, None)
-            }
-            "notify_failure" if failed => {
-                effect.notify_failure = true;
-                if telemetry_enabled(profile, "failure_code") {
-                    (
-                        Some("failure_observed"),
-                        None,
-                        Some("managed_lifecycle_failure"),
-                    )
-                } else {
-                    (None, None, None)
-                }
-            }
-            _ => (None, None, None),
         };
-        if let Some(event_type) = event_type {
-            events.push(ComplianceEvent {
-                schema: 1,
-                event_id: Uuid::new_v4(),
-                release_id: profile.release_id,
-                session_id: session_id.clone(),
-                policy_context: None,
-                binding_key: Some(binding.key.clone()),
-                hook: Some(binding.hook.clone()),
-                action: Some(binding.action.clone()),
-                event_type: event_type.into(),
-                occurred_at: Utc::now(),
-                duration_bucket: reported_duration.map(str::to_owned),
-                decision: None,
-                error_code: error_code.map(str::to_owned),
-                mimir_version: env!("CARGO_PKG_VERSION").into(),
-            });
-        }
+    if matches!(hook, "session_start" | "session_shutdown")
+        && telemetry_enabled(profile, "session_activity")
+    {
+        events.push(make_event("lifecycle_observed", None, None));
+    }
+    if duration_bucket.is_some() && telemetry_enabled(profile, "duration_bucket") {
+        events.push(make_event("duration_observed", duration_bucket, None));
+    }
+    if effect.notify_failure {
+        events.push(make_event(
+            "failure_observed",
+            None,
+            Some("managed_lifecycle_failure"),
+        ));
     }
     (effect, events)
 }
@@ -1524,7 +1570,7 @@ fn verify_envelope(
     envelope: &SignedHarnessProfileEnvelope,
     public_key_base64: &str,
 ) -> Result<CompiledHarnessProfile> {
-    if envelope.schema != 1 {
+    if envelope.schema != 2 {
         return Err(MimirError::Configuration(
             "unsupported signed profile schema".into(),
         ));
@@ -1556,45 +1602,22 @@ fn verify_envelope(
 }
 
 pub(crate) fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
-    if ![1, 3].contains(&profile.schema) || (profile.schema == 3) != profile.environment.is_some() {
+    if profile.schema != 4 || profile.source_metadata.get("bindings").is_some() {
         return Err(MimirError::Configuration(
-            "unsupported compiled profile schema".into(),
+            "unsupported compiled rules release schema".into(),
         ));
     }
-    if compare_versions(env!("CARGO_PKG_VERSION"), &profile.minimum_mimir_version)? < 0 {
+    if let Some(minimum) = profile.minimum_runtime_versions.get("mimir")
+        && compare_versions(env!("CARGO_PKG_VERSION"), minimum)? < 0
+    {
         return Err(MimirError::Configuration(format!(
-            "profile requires Mimir {} or newer",
-            profile.minimum_mimir_version
+            "release requires Mimir {minimum} or newer"
         )));
     }
+    crate::policy::validate_release(profile)?;
     crate::registry::validate(&profile.registry_artifacts)?;
     if let Some(environment) = &profile.environment {
         crate::working_environment::validate(environment)?;
-    }
-    let mut keys = BTreeSet::new();
-    for binding in &profile.bindings {
-        if !keys.insert(binding.key.as_str()) {
-            return Err(MimirError::Configuration(format!(
-                "compiled profile repeats binding key {}",
-                binding.key
-            )));
-        }
-        if binding.key.len() > 128 || binding.order > 10_000 {
-            return Err(MimirError::Configuration(
-                "compiled binding exceeds bounds".into(),
-            ));
-        }
-        validate_binding(binding)?;
-        if profile.revoked_catalog_items.contains(&format!(
-            "{}@{}",
-            binding.action.replace('_', "-"),
-            binding.catalog_version
-        )) {
-            return Err(MimirError::Configuration(format!(
-                "binding {} references a revoked catalog item",
-                binding.key
-            )));
-        }
     }
     let mut skills = BTreeSet::new();
     for skill in &profile.skills {
@@ -1607,168 +1630,19 @@ pub(crate) fn validate_profile(profile: &CompiledHarnessProfile) -> Result<()> {
                 "Invalid or duplicate managed skill".into(),
             ));
         }
-        if profile
-            .revoked_catalog_items
-            .contains(&format!("{}@{}", skill.id, skill.version))
-        {
-            return Err(MimirError::Configuration(format!(
-                "skill {} references a revoked catalog item",
-                skill.id
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_binding(binding: &HarnessBinding) -> Result<()> {
-    let version_supported = binding.catalog_version == "1.0.0";
-    if !version_supported {
-        return Err(MimirError::Configuration(format!(
-            "compiled binding {} uses unsupported {} catalog version {}",
-            binding.key, binding.action, binding.catalog_version
-        )));
-    }
-    let compatible = match binding.action.as_str() {
-        "record_metadata" => &[
-            "session_start",
-            "session_shutdown",
-            "agent_start",
-            "agent_end",
-            "turn_start",
-            "turn_end",
-            "tool_execution_start",
-            "tool_execution_end",
-            "after_provider_response",
-            "refine_complete",
-        ][..],
-        "measure_duration" => &[
-            "agent_end",
-            "turn_end",
-            "tool_execution_end",
-            "after_provider_response",
-        ][..],
-        "notify_failure" => &["agent_end", "tool_execution_end", "after_provider_response"][..],
-        "restrict_tools" => &["tool_call"][..],
-        "restrict_shell_programs" => &["user_bash"][..],
-        "restrict_models" => &["model_select"][..],
-        "limit_thinking_level" => &["thinking_level_select"][..],
-        unsupported => {
-            return Err(MimirError::Configuration(format!(
-                "compiled binding {} uses unsupported action {unsupported}",
-                binding.key
-            )));
-        }
-    };
-    if !compatible.contains(&binding.hook.as_str()) {
-        return Err(MimirError::Configuration(format!(
-            "compiled binding {} uses action {} on incompatible hook {}",
-            binding.key, binding.action, binding.hook
-        )));
-    }
-    validate_binding_parameters(binding)
-}
-
-fn validate_binding_parameters(binding: &HarnessBinding) -> Result<()> {
-    match binding.action.as_str() {
-        "record_metadata" | "measure_duration" | "notify_failure" => {
-            if binding
-                .parameters
-                .as_object()
-                .is_none_or(|value| !value.is_empty())
-            {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} must use empty parameters",
-                    binding.key
-                )));
-            }
-        }
-        "restrict_tools" | "restrict_shell_programs" | "restrict_models" => {
-            let Some(values) = binding.parameters.get("allowed").and_then(Value::as_array) else {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} requires an allowed array",
-                    binding.key
-                )));
-            };
-            if values.len() > 1_024
-                || values.iter().any(|value| {
-                    value
-                        .as_str()
-                        .is_none_or(|value| value.is_empty() || value.len() > 256)
-                })
-            {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} has an invalid allowed array",
-                    binding.key
-                )));
-            }
-            let unique = values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<BTreeSet<_>>();
-            if unique.len() != values.len()
-                || binding.parameters.as_object().is_none_or(|o| o.len() != 1)
-            {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} has duplicate or unknown allowlist parameters",
-                    binding.key
-                )));
-            }
-        }
-        "limit_thinking_level" => {
-            let Some(maximum) = binding.parameters.get("maximum").and_then(Value::as_str) else {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} requires maximum",
-                    binding.key
-                )));
-            };
-            parse_thinking_level(maximum)?;
-            if binding.parameters.as_object().is_none_or(|o| o.len() != 1) {
-                return Err(MimirError::Configuration(format!(
-                    "compiled binding {} has unknown thinking parameters",
-                    binding.key
-                )));
-            }
-        }
-        _ => unreachable!("supported action match is exhaustive"),
     }
     Ok(())
 }
 
 fn enforce_expiry(profile: &CompiledHarnessProfile) -> Result<()> {
-    if profile.schema == 3
-        && (profile.expires_at <= Utc::now()
-            || profile.created_at > Utc::now() + chrono::Duration::minutes(5))
+    if profile.expires_at <= Utc::now()
+        || profile.created_at > Utc::now() + chrono::Duration::minutes(5)
     {
         return Err(MimirError::Configuration(
-            "Signed working environment is expired or not yet valid; sync before continuing".into(),
+            "Signed rules release is expired or not yet valid; sync before continuing".into(),
         ));
     }
-    if profile.expires_at >= Utc::now() {
-        return Ok(());
-    }
-    if profile
-        .bindings
-        .iter()
-        .any(|binding| binding.enforcement == Enforcement::Mandatory && binding.critical)
-    {
-        return Err(MimirError::Configuration(
-            "enterprise profile expired and contains critical mandatory controls; refusing to run"
-                .into(),
-        ));
-    }
-    eprintln!(
-        "warning: enterprise profile is expired; continuing only noncritical cached defaults"
-    );
     Ok(())
-}
-
-fn override_disabled(store: &OverrideStore, binding: &HarnessBinding) -> bool {
-    binding.enforcement == Enforcement::Default
-        && store
-            .overrides
-            .iter()
-            .find(|entry| entry.binding_key == binding.key)
-            .is_some_and(|entry| entry.disabled)
 }
 
 fn validate_enrollment_scope(
@@ -1981,8 +1855,10 @@ pub fn working_environment() -> Result<Option<crate::working_environment::Workin
     if !is_enrolled()? {
         return Ok(None);
     }
-    let profile = EnterpriseManager::global()?.load_profile()?;
-    enforce_expiry(&profile)?;
+    let profile = EnterpriseManager::global()?.load_runtime_profile()?;
+    if enforce_expiry(&profile).is_err() {
+        return Ok(None);
+    }
     Ok(Some(
         profile
             .environment
@@ -1990,7 +1866,7 @@ pub fn working_environment() -> Result<Option<crate::working_environment::Workin
     ))
 }
 
-fn local_bridge_policy_alias(tool: &str) -> String {
+pub(crate) fn local_bridge_policy_alias(tool: &str) -> String {
     for name in [
         "environment_status",
         "repository_context",
@@ -2010,14 +1886,42 @@ fn local_bridge_policy_alias(tool: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{NativeConstraints, PolicyArtifact, PolicyInstance, PolicyReference};
     use ring::{
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
     };
 
-    fn profile_with(bindings: Vec<HarnessBinding>, telemetry: &[&str]) -> CompiledHarnessProfile {
+    fn instance(id: &str, requirement: &str) -> PolicyInstance {
+        PolicyInstance {
+            id: id.into(),
+            definition: PolicyReference {
+                id: "example.policy".into(),
+                version: "1.0.0".into(),
+                sha256: "a".repeat(64),
+            },
+            parameters: json!({}),
+            target_agents: vec!["mimir".into()],
+            requirement: requirement.into(),
+            mode: "enforce".into(),
+            on_error: "deny".into(),
+            order: 100,
+        }
+    }
+    fn profile_with(instances: Vec<PolicyInstance>, telemetry: &[&str]) -> CompiledHarnessProfile {
+        let program = "var __betterloopPolicy = { evaluate() { return {outcome:'allow',reason_code:'allowed'}; } };";
+        let policies = if instances.is_empty() {
+            Vec::new()
+        } else {
+            vec![PolicyArtifact {
+                manifest: json!({"schema":1,"id":"example.policy","version":"1.0.0","description":"Reviewed example","sdk_version":"1.0.0","match":{"events":["tool_call"]},"parameters":{"type":"object","additionalProperties":false},"requires":[],"effects":["allow","deny"],"reason_codes":["allowed","blocked"]}),
+                program: program.into(),
+                sha256: format!("{:x}", Sha256::digest(program.as_bytes())),
+                definition_sha256: "a".repeat(64),
+            }]
+        };
         CompiledHarnessProfile {
-            schema: 1,
+            schema: 4,
             environment: None,
             registry_artifacts: Vec::new(),
             release_id: Uuid::new_v4(),
@@ -2025,56 +1929,22 @@ mod tests {
             team_id: Some(Uuid::new_v4()),
             project_id: None,
             profile_name: "Test".into(),
-            catalog_version: "1".into(),
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
-            minimum_mimir_version: env!("CARGO_PKG_VERSION").into(),
-            bindings,
+            minimum_setup_version: "1.0.0".into(),
+            minimum_runtime_versions: BTreeMap::from([(
+                "mimir".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            )]),
+            policies,
+            instances,
+            native_constraints: NativeConstraints::default(),
             skills: Vec::new(),
             telemetry: telemetry.iter().map(ToString::to_string).collect(),
             revoked_catalog_items: Vec::new(),
             source_metadata: json!({}),
         }
     }
-
-    #[test]
-    fn enrollment_scope_rejects_other_team_or_organization_before_activation() {
-        let mut profile = profile_with(Vec::new(), &[]);
-        let enrollment = enrollment("http://127.0.0.1".into(), &profile);
-        assert!(validate_enrollment_scope(&profile, &enrollment).is_ok());
-        profile.team_id = Some(Uuid::new_v4());
-        assert!(validate_enrollment_scope(&profile, &enrollment).is_err());
-        profile.team_id = Some(enrollment.team_id);
-        profile.organization_id = Uuid::new_v4();
-        assert!(validate_enrollment_scope(&profile, &enrollment).is_err());
-    }
-
-    fn restriction(key: &str, hook: &str, action: &str, allowed: &[&str]) -> HarnessBinding {
-        HarnessBinding {
-            key: key.into(),
-            hook: hook.into(),
-            action: action.into(),
-            catalog_version: "1.0.0".into(),
-            enforcement: Enforcement::Mandatory,
-            order: 100,
-            critical: true,
-            parameters: json!({"allowed": allowed}),
-        }
-    }
-
-    fn observation(key: &str, hook: &str, action: &str) -> HarnessBinding {
-        HarnessBinding {
-            key: key.into(),
-            hook: hook.into(),
-            action: action.into(),
-            catalog_version: "1.0.0".into(),
-            enforcement: Enforcement::Default,
-            order: 100,
-            critical: false,
-            parameters: json!({}),
-        }
-    }
-
     fn enrollment(endpoint: String, profile: &CompiledHarnessProfile) -> Enrollment {
         Enrollment {
             schema: 1,
@@ -2089,92 +1959,140 @@ mod tests {
             etag: None,
         }
     }
-
-    #[test]
-    fn verifies_exact_signed_payload_bytes_and_rejects_tampering() {
-        let release_id = Uuid::new_v4();
-        let payload = serde_json::to_vec(&json!({
-            "schema": 1,
-            "release_id": release_id,
-            "organization_id": Uuid::new_v4(),
-            "team_id": Uuid::new_v4(),
-            "project_id": null,
-            "profile_name": "Payments",
-            "source": {},
-            "source_revisions": [],
-            "catalog_version": "1",
-            "created_at": Utc::now(),
-            "expires_at": Utc::now() + chrono::Duration::hours(1),
-            "minimum_mimir_version": env!("CARGO_PKG_VERSION"),
-            "bindings": [],
-            "skills": [],
-            "telemetry": ["profile_application"],
-            "revoked_catalog_items": [],
-        }))
-        .expect("payload");
-        let random = SystemRandom::new();
-        let document = Ed25519KeyPair::generate_pkcs8(&random).expect("key document");
-        let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("key");
-        let envelope = SignedHarnessProfileEnvelope {
-            schema: 1,
+    fn signing_key() -> Ed25519KeyPair {
+        Ed25519KeyPair::from_pkcs8(
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .expect("key document")
+                .as_ref(),
+        )
+        .expect("key")
+    }
+    fn signed(
+        profile: &CompiledHarnessProfile,
+        key: &Ed25519KeyPair,
+    ) -> SignedHarnessProfileEnvelope {
+        let payload = serde_json::to_vec(profile).expect("profile");
+        SignedHarnessProfileEnvelope {
+            schema: 2,
             payload_base64: BASE64.encode(&payload),
             sha256: format!("{:x}", Sha256::digest(&payload)),
             key_id: Uuid::new_v4(),
             signature: BASE64.encode(key.sign(&payload).as_ref()),
-        };
-        let verified = verify_envelope(&envelope, &BASE64.encode(key.public_key().as_ref()))
-            .expect("verified payload");
-        assert_eq!(verified.release_id, release_id);
+        }
+    }
+    fn installed(manager: &EnterpriseManager, profile: &CompiledHarnessProfile) -> Enrollment {
+        let key = signing_key();
+        let mut connection = enrollment("http://127.0.0.1:1".into(), profile);
+        connection.signing_public_key_base64 = BASE64.encode(key.public_key().as_ref());
+        write_secure_json(&manager.root.join(CONFIG_FILE), &connection).expect("enrollment");
+        write_secure_json(&manager.root.join(PROFILE_FILE), &signed(profile, &key))
+            .expect("release");
+        connection
+    }
+    fn verified_broker(root: &Path) -> Value {
+        let root = fs::canonicalize(root).expect("root");
+        let executable =
+            fs::canonicalize(std::env::current_exe().expect("exe")).expect("absolute exe");
+        let runner = root.join("policy-child.mjs");
+        fs::write(&runner, "// verified test runner asset").expect("asset");
+        let manifest = serde_json::to_vec(&json!({"schema":1,"files":[{"path":"policy-child.mjs","sha256":format!("{:x}",Sha256::digest(fs::read(&runner).expect("runner bytes")))}]})).expect("manifest");
+        fs::write(root.join("runtime-manifest.json"), &manifest).expect("manifest file");
+        json!({"executable":executable,"runner":runner,"policy_runtime":{"schema":1,"executable":executable,"executable_sha256":format!("{:x}",Sha256::digest(fs::read(&executable).expect("exe bytes"))),"node_version":"22.0.0","runner":runner,"manifest_sha256":format!("{:x}",Sha256::digest(&manifest))},"policy_activation":root.join("policy-activation.json"),"policy_activation_root":root.join("policy-activations")})
+    }
 
-        let mut tampered = envelope;
+    #[test]
+    fn unapproved_repository_retains_required_prevention_and_removes_optional_resources() {
+        let mut profile = profile_with(
+            vec![
+                instance("required.policy", "required"),
+                instance("optional.policy", "optional"),
+            ],
+            &["session_activity"],
+        );
+        let mut environment = crate::working_environment::defaults();
+        environment.repository_reporting = Some("allow_and_report".into());
+        environment.unapproved_repository_behavior = Some("report_only".into());
+        profile.environment = Some(environment);
+        profile.source_metadata["knowledge_map"] =
+            json!({"schema":1,"references":[],"projects":[]});
+        let restricted = project_repository_policy(profile.clone(), false);
+        assert_eq!(restricted.instances.len(), 1);
+        assert_eq!(restricted.instances[0].id, "required.policy");
+        assert!(restricted.skills.is_empty());
+        assert!(restricted.telemetry.is_empty());
+        assert!(
+            restricted
+                .environment
+                .as_ref()
+                .expect("environment")
+                .skills
+                .is_empty()
+        );
+        assert!(restricted.source_metadata.get("knowledge_map").is_none());
+        assert_eq!(project_repository_policy(profile, true).instances.len(), 2);
+    }
+    #[test]
+    fn enrollment_scope_rejects_other_team_or_organization_before_activation() {
+        let mut profile = profile_with(Vec::new(), &[]);
+        let connection = enrollment("http://127.0.0.1".into(), &profile);
+        assert!(validate_enrollment_scope(&profile, &connection).is_ok());
+        profile.team_id = Some(Uuid::new_v4());
+        assert!(validate_enrollment_scope(&profile, &connection).is_err());
+        profile.team_id = Some(connection.team_id);
+        profile.organization_id = Uuid::new_v4();
+        assert!(validate_enrollment_scope(&profile, &connection).is_err());
+    }
+    #[test]
+    fn verifies_exact_new_format_signature_and_rejects_tampering_and_old_envelopes() {
+        let profile = profile_with(Vec::new(), &["profile_application"]);
+        let key = signing_key();
+        let public = BASE64.encode(key.public_key().as_ref());
+        let envelope = signed(&profile, &key);
+        assert_eq!(
+            verify_envelope(&envelope, &public)
+                .expect("verified")
+                .release_id,
+            profile.release_id
+        );
+        let mut tampered = envelope.clone();
         tampered.sha256 = "0".repeat(64);
-        assert!(verify_envelope(&tampered, &BASE64.encode(key.public_key().as_ref())).is_err());
+        assert!(verify_envelope(&tampered, &public).is_err());
+        let mut altered = envelope.clone();
+        altered.payload_base64 = BASE64.encode(b"{}");
+        altered.sha256 = format!("{:x}", Sha256::digest(b"{}"));
+        assert!(verify_envelope(&altered, &public).is_err());
+        let mut old = envelope;
+        old.schema = 1;
+        assert!(verify_envelope(&old, &public).is_err());
     }
-
-    #[test]
-    fn local_overrides_cannot_disable_mandatory_bindings() {
-        let store = OverrideStore {
-            schema: 1,
-            overrides: vec![LocalOverride {
-                binding_key: "policy.tools".into(),
-                disabled: true,
-                reason: "test".into(),
-                changed_at: Utc::now(),
-            }],
-        };
-        let binding = HarnessBinding {
-            key: "policy.tools".into(),
-            hook: "tool_call".into(),
-            action: "restrict_tools".into(),
-            catalog_version: "1.0.0".into(),
-            enforcement: Enforcement::Mandatory,
-            order: 1,
-            critical: true,
-            parameters: json!({"allowed": []}),
-        };
-        assert!(!override_disabled(&store, &binding));
+    #[tokio::test]
+    async fn local_overrides_cannot_disable_required_policies_or_write_override_state() {
+        let root = tempfile::tempdir().expect("root");
+        let manager = EnterpriseManager::at(root.path().join("enterprise")).expect("manager");
+        installed(
+            &manager,
+            &profile_with(vec![instance("policy.tools", "required")], &[]),
+        );
+        assert!(
+            manager
+                .set_override("policy.tools", true, "test")
+                .await
+                .is_err()
+        );
+        assert!(!manager.root.join(OVERRIDES_FILE).exists());
     }
     #[test]
-    fn device_attachment_checks_signed_scope_before_writing_and_preserves_conflicting_enrollment() {
-        let root = tempfile::tempdir().expect("temporary directory");
-        let manager = EnterpriseManager::at(root.path().to_path_buf()).expect("manager");
+    fn device_attachment_checks_scope_before_writing_and_preserves_enrollment_identity() {
+        let root = tempfile::tempdir().expect("root");
+        let manager = EnterpriseManager::at(root.path().join("enterprise")).expect("manager");
         let profile = profile_with(Vec::new(), &[]);
-        let payload = serde_json::to_vec(&profile).expect("profile");
-        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("key document");
-        let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("key");
-        let envelope = SignedHarnessProfileEnvelope {
-            schema: 1,
-            payload_base64: BASE64.encode(&payload),
-            sha256: format!("{:x}", Sha256::digest(&payload)),
-            key_id: Uuid::new_v4(),
-            signature: BASE64.encode(key.sign(&payload).as_ref()),
-        };
+        let key = signing_key();
         let installation = Uuid::new_v4();
-        let executable = std::env::current_exe().expect("executable");
-        let mut input = json!({"endpoint":"http://127.0.0.1:8088","registration":{"schema":1,"installation_id":installation,"installation_token":format!("bli_{}",Uuid::new_v4().simple()),"organization_id":profile.organization_id,"team_id":profile.team_id,"profile_id":Uuid::new_v4(),"channel":"stable","signing_public_key_base64":BASE64.encode(key.public_key().as_ref()),"profile":envelope},"broker":{"executable":executable,"runner":executable}});
+        let assets = tempfile::tempdir().expect("assets");
+        let mut input = json!({"endpoint":"http://127.0.0.1:8088","registration":{"schema":1,"installation_id":installation,"installation_token":format!("bli_{}",Uuid::new_v4().simple()),"organization_id":profile.organization_id,"team_id":profile.team_id,"profile_id":Uuid::new_v4(),"channel":"stable","signing_public_key_base64":BASE64.encode(key.public_key().as_ref()),"profile":signed(&profile,&key)},"broker":verified_broker(assets.path())});
         input["registration"]["team_id"] = json!(Uuid::new_v4());
         assert!(manager.attach_device(&input).is_err());
-        assert!(!root.path().join(CONFIG_FILE).exists());
+        assert!(!manager.root.join(CONFIG_FILE).exists());
         input["registration"]["team_id"] = json!(profile.team_id);
         assert_eq!(
             manager.attach_device(&input).expect("attach")["installation_id"],
@@ -2188,163 +2106,181 @@ mod tests {
         changed.installation_token.push('x');
         assert!(ConnectionIdentity::from(&original) != ConnectionIdentity::from(&changed));
         write_secure_json(
-            &root.path().join(REVOKED_FILE),
+            &manager.root.join(REVOKED_FILE),
             &json!({"installation_id":installation}),
         )
-        .expect("revocation marker");
+        .expect("marker");
         assert!(manager.load_profile().is_err());
-        assert_eq!(
-            manager.status().expect("diagnostics")["revoked"],
-            json!(true)
-        );
+        assert_eq!(manager.status().expect("status")["revoked"], json!(true));
         input["registration"]["installation_id"] = json!(Uuid::new_v4());
         assert!(manager.attach_device(&input).is_err());
         assert_eq!(
-            manager
-                .load_enrollment()
-                .expect("retained enrollment")
-                .installation_id,
+            manager.load_enrollment().expect("retained").installation_id,
             installation
         );
     }
-
     #[test]
-    fn profile_validation_rejects_advertised_but_unsupported_actions() {
-        let mut profile = profile_with(
-            vec![HarnessBinding {
-                key: "unsupported.block".into(),
-                hook: "tool_call".into(),
-                action: "block".into(),
-                catalog_version: "1.0.0".into(),
-                enforcement: Enforcement::Mandatory,
-                order: 1,
-                critical: true,
-                parameters: json!({"reason_code": "denied"}),
-            }],
-            &[],
-        );
-        assert!(validate_profile(&profile).is_err());
-        profile.bindings[0] = restriction(
-            "policy.tools",
-            "tool_call",
-            "restrict_tools",
-            &["read_file", "read_file"],
-        );
-        assert!(validate_profile(&profile).is_err());
+    fn attachment_rejects_tampered_assets_before_enrollment() {
+        let root = tempfile::tempdir().expect("root");
+        let assets = tempfile::tempdir().expect("assets");
+        let manager = EnterpriseManager::at(root.path().join("enterprise")).expect("manager");
+        let profile = profile_with(Vec::new(), &[]);
+        let key = signing_key();
+        let broker = verified_broker(assets.path());
+        fs::write(
+            broker["policy_runtime"]["runner"].as_str().expect("runner"),
+            "changed",
+        )
+        .expect("tamper");
+        let input = json!({"endpoint":"http://127.0.0.1:8088","registration":{"schema":1,"installation_id":Uuid::new_v4(),"installation_token":format!("bli_{}",Uuid::new_v4().simple()),"organization_id":profile.organization_id,"team_id":profile.team_id,"profile_id":Uuid::new_v4(),"channel":"stable","signing_public_key_base64":BASE64.encode(key.public_key().as_ref()),"profile":signed(&profile,&key)},"broker":broker});
+        assert!(manager.attach_device(&input).is_err());
+        assert!(!manager.root.join(CONFIG_FILE).exists());
     }
-
     #[test]
-    fn profile_validation_accepts_dormant_future_tool_selections() {
-        let profile = profile_with(
-            vec![restriction(
-                "policy.tools",
-                "tool_call",
-                "restrict_tools",
-                &["read_file", "future_unavailable_tool"],
-            )],
-            &[],
-        );
+    fn profile_validation_rejects_old_rules_unpinned_instances_and_program_tampering() {
+        let mut profile = profile_with(vec![instance("policy.tools", "required")], &[]);
         assert!(validate_profile(&profile).is_ok());
+        profile.schema = 3;
+        assert!(validate_profile(&profile).is_err());
+        profile.schema = 4;
+        profile.source_metadata["bindings"] = json!([]);
+        assert!(validate_profile(&profile).is_err());
+        profile
+            .source_metadata
+            .as_object_mut()
+            .expect("metadata")
+            .remove("bindings");
+        profile.instances[0].definition.sha256 = "b".repeat(64);
+        assert!(validate_profile(&profile).is_err());
+        profile.instances[0].definition.sha256 = "a".repeat(64);
+        profile.policies[0].program.push(' ');
+        assert!(validate_profile(&profile).is_err());
     }
-
     #[test]
-    fn expired_critical_profiles_fail_closed_but_noncritical_defaults_do_not() {
-        let mut critical = profile_with(
-            vec![restriction(
-                "policy.tools",
-                "tool_call",
-                "restrict_tools",
-                &["read_file"],
-            )],
-            &[],
+    fn native_constraints_are_scoped_by_agent_and_accept_dormant_tool_identifiers() {
+        let mut profile = profile_with(Vec::new(), &[]);
+        profile.native_constraints.allowed_tools.insert(
+            "mimir".into(),
+            vec!["read_file".into(), "future_unavailable_tool".into()],
         );
-        critical.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        assert!(enforce_expiry(&critical).is_err());
-
-        let mut noncritical = profile_with(
-            vec![observation(
-                "observe.lifecycle",
-                "agent_end",
-                "record_metadata",
-            )],
-            &[],
+        profile
+            .native_constraints
+            .allowed_tools
+            .insert("claude-code".into(), vec!["different_tool".into()]);
+        profile
+            .native_constraints
+            .allowed_shell_programs
+            .insert("mimir".into(), vec!["git".into()]);
+        profile
+            .native_constraints
+            .approved_models
+            .insert("mimir".into(), vec!["provider/model".into()]);
+        profile
+            .native_constraints
+            .maximum_reasoning_level
+            .insert("mimir".into(), "medium".into());
+        assert!(validate_profile(&profile).is_ok());
+        assert_eq!(
+            profile.native_constraints.allowed_tools["mimir"],
+            vec!["read_file", "future_unavailable_tool"]
         );
-        noncritical.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        assert!(enforce_expiry(&noncritical).is_ok());
+        profile
+            .native_constraints
+            .maximum_reasoning_level
+            .insert("mimir".into(), "unbounded".into());
+        assert!(validate_profile(&profile).is_err());
     }
-
     #[test]
-    fn observability_events_match_wire_contract_and_privacy_gates() {
-        let bindings = vec![
-            observation("observe.lifecycle", "agent_end", "record_metadata"),
-            observation("observe.duration", "agent_end", "measure_duration"),
-            observation("observe.failure", "agent_end", "notify_failure"),
-        ];
-        let profile = profile_with(bindings.clone(), &["duration_bucket", "failure_code"]);
+    fn minimum_runtime_version_and_expiry_are_verified() {
+        let mut profile = profile_with(Vec::new(), &[]);
+        assert!(validate_profile(&profile).is_ok());
+        assert!(enforce_expiry(&profile).is_ok());
+        profile
+            .minimum_runtime_versions
+            .insert("mimir".into(), "999.0.0".into());
+        assert!(validate_profile(&profile).is_err());
+        profile
+            .minimum_runtime_versions
+            .insert("mimir".into(), env!("CARGO_PKG_VERSION").into());
+        profile.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(enforce_expiry(&profile).is_err());
+        profile.expires_at = Utc::now() + chrono::Duration::hours(1);
+        profile.created_at = Utc::now() + chrono::Duration::hours(1);
+        assert!(enforce_expiry(&profile).is_err());
+    }
+    #[test]
+    fn lifecycle_observations_keep_duration_and_failure_categories_independent() {
+        let profile = profile_with(Vec::new(), &["duration_bucket", "failure_code"]);
         let (effect, events) = evaluate_lifecycle(
             &profile,
             &OverrideStore::default(),
             "agent_end",
             true,
             Some("lt_1s"),
-            Some("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            Some("ses_opaque".into()),
         );
         assert!(effect.notify_failure);
-        assert_eq!(events.len(), 3);
-        assert_eq!(
-            events[0].session_id.as_deref(),
-            Some("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "duration_observed"
+                    && event.duration_bucket.as_deref() == Some("lt_1s"))
         );
-        assert_eq!(events[0].event_type, "lifecycle_observed");
-        assert_eq!(events[0].duration_bucket, None);
-        assert_eq!(events[1].event_type, "duration_observed");
-        assert_eq!(events[1].duration_bucket.as_deref(), Some("lt_1s"));
-        assert_eq!(events[2].event_type, "failure_observed");
-        assert_eq!(
-            events[2].error_code.as_deref(),
-            Some("managed_lifecycle_failure")
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "failure_observed"
+                    && event.error_code.as_deref() == Some("managed_lifecycle_failure"))
         );
-
-        let private_profile = profile_with(bindings, &[]);
-        let (effect, events) = evaluate_lifecycle(
-            &private_profile,
+        let (_, events) = evaluate_lifecycle(
+            &profile_with(Vec::new(), &["session_activity"]),
+            &OverrideStore::default(),
+            "session_start",
+            false,
+            None,
+            Some("ses_opaque".into()),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].hook.as_deref(), Some("session_start"));
+    }
+    #[test]
+    fn lifecycle_privacy_optout_does_not_export_duration_or_failure() {
+        let (_, failure_only) = evaluate_lifecycle(
+            &profile_with(Vec::new(), &["failure_code"]),
             &OverrideStore::default(),
             "agent_end",
             true,
             Some("lt_1s"),
             None,
         );
-        assert!(effect.notify_failure);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "lifecycle_observed");
-        assert!(events[0].duration_bucket.is_none());
-        assert!(events[0].error_code.is_none());
-
-        let session_profile = profile_with(vec![], &["session_activity"]);
-        let (_, events) = evaluate_lifecycle(
-            &session_profile,
+        assert_eq!(failure_only.len(), 1);
+        assert!(failure_only[0].duration_bucket.is_none());
+        let (effect, silent) = evaluate_lifecycle(
+            &profile_with(Vec::new(), &[]),
             &OverrideStore::default(),
-            "session_start",
-            false,
+            "agent_end",
+            true,
+            Some("lt_1s"),
             None,
-            Some("ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
         );
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].hook.as_deref(), Some("session_start"));
-        assert_eq!(
-            events[0].session_id.as_deref(),
-            Some("ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        );
+        assert!(!effect.notify_failure);
+        assert!(silent.is_empty());
     }
-
     #[test]
-    fn observability_catalog_version_is_exact() {
-        let mut binding = observation("observe.lifecycle", "agent_end", "record_metadata");
-        assert!(validate_binding(&binding).is_ok());
-        binding.catalog_version = "1.1.0".into();
-        assert!(validate_binding(&binding).is_err());
+    fn session_aliases_are_opaque_installation_scoped_and_never_echo_private_names() {
+        let profile = profile_with(Vec::new(), &[]);
+        let mut connection = enrollment("http://localhost".into(), &profile);
+        let private = "/private/customer/secrets/transcript";
+        let alias = session_alias(&connection, private).expect("alias");
+        assert!(alias.starts_with("ses_"));
+        assert!(!alias.contains("customer"));
+        assert_eq!(alias.len(), 68);
+        assert_eq!(Some(alias.clone()), session_alias(&connection, private));
+        connection.installation_token.push('x');
+        assert_ne!(Some(alias), session_alias(&connection, private));
+        assert!(session_alias(&connection, " ").is_none());
     }
-
     #[test]
     fn enterprise_state_files_are_owner_only() {
         let temporary = tempfile::tempdir().expect("tempdir");
@@ -2357,21 +2293,21 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(manager.root.join(OVERRIDES_FILE))
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
+            assert_eq!(
+                fs::metadata(manager.root.join(OVERRIDES_FILE))
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
-
     #[test]
     fn endpoint_rejects_unencrypted_remote_control_planes() {
         assert!(validate_endpoint("http://example.com").is_err());
         assert!(validate_endpoint("http://localhost:3000").is_ok());
     }
-
     #[test]
     fn tool_inventory_bounds_match_the_control_plane_contract() {
         let fingerprint = "a".repeat(64);
@@ -2379,7 +2315,7 @@ mod tests {
             validate_tool_inventory_bounds(
                 &fingerprint,
                 MAX_TOOL_INVENTORY_ITEMS,
-                MAX_INVENTORY_ALLOWED_PROGRAMS,
+                MAX_INVENTORY_ALLOWED_PROGRAMS
             )
             .is_ok()
         );
@@ -2387,7 +2323,7 @@ mod tests {
             validate_tool_inventory_bounds(
                 &fingerprint,
                 MAX_TOOL_INVENTORY_ITEMS + 1,
-                MAX_INVENTORY_ALLOWED_PROGRAMS,
+                MAX_INVENTORY_ALLOWED_PROGRAMS
             )
             .is_err()
         );
@@ -2395,16 +2331,15 @@ mod tests {
             validate_tool_inventory_bounds(
                 &fingerprint,
                 MAX_TOOL_INVENTORY_ITEMS,
-                MAX_INVENTORY_ALLOWED_PROGRAMS + 1,
+                MAX_INVENTORY_ALLOWED_PROGRAMS + 1
             )
             .is_err()
         );
         assert!(validate_tool_inventory_bounds(&"z".repeat(64), 0, 0).is_err());
     }
-
     #[test]
     fn tool_inventory_json_matches_the_frozen_wire_shape() {
-        let tool = ToolInventoryItem {
+        let tools = vec![ToolInventoryItem {
             id: "read_file".into(),
             label: "Read file".into(),
             source: crate::tools::ToolInventorySource {
@@ -2417,10 +2352,9 @@ mod tests {
             availability: "available".into(),
             availability_reason_code: None,
             required_by_runtime: false,
-        };
+        }];
         let fingerprint = "a".repeat(64);
-        let tools = vec![tool];
-        let report = ToolInventoryReport {
+        let value = serde_json::to_value(ToolInventoryReport {
             schema: 1,
             release_id: Uuid::nil(),
             mimir_version: env!("CARGO_PKG_VERSION"),
@@ -2430,23 +2364,31 @@ mod tests {
                 enabled: true,
                 allowed_programs: vec!["git".into()],
             },
-        };
-        let value = serde_json::to_value(report).expect("inventory json");
-        let top = value.as_object().expect("top-level object");
+        })
+        .expect("inventory");
         assert_eq!(
-            top.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            value
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "fingerprint",
                 "local_process",
                 "mimir_version",
                 "release_id",
                 "schema",
-                "tools",
+                "tools"
             ])
         );
-        let item = value["tools"][0].as_object().expect("tool object");
         assert_eq!(
-            item.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            value["tools"][0]
+                .as_object()
+                .expect("tool")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "availability",
                 "capabilities",
@@ -2454,178 +2396,87 @@ mod tests {
                 "label",
                 "required_by_runtime",
                 "risk",
-                "source",
+                "source"
             ])
         );
-        assert_eq!(value["tools"][0]["risk"], "read_only");
-        assert_eq!(value["tools"][0]["source"]["kind"], "builtin");
-        assert_eq!(value["tools"][0]["availability"], "available");
         assert_eq!(value["local_process"]["allowed_programs"][0], "git");
     }
-
-    #[test]
-    fn policy_payloads_are_content_free_for_allow_and_block() {
-        let binding = restriction(
-            "policy.tools",
-            "tool_call",
-            "restrict_tools",
-            &["read_file"],
-        );
-        let profile = profile_with(vec![binding], &["policy_decision", "failure_code"]);
-        let bindings = profile.bindings.iter().collect::<Vec<_>>();
-
-        let allowed = evaluate_allowlist(
-            &profile,
-            &bindings,
-            "restrict_tools",
-            "allowed",
-            "read_file",
-            "tool_not_allowed",
-        );
-        assert!(allowed.allowed);
-        assert_eq!(allowed.events.len(), 1);
-        assert_eq!(allowed.events[0].event_type, "policy_allowed");
-        assert_eq!(allowed.events[0].decision.as_deref(), Some("allow"));
-        assert_eq!(allowed.events[0].error_code, None);
-        assert_eq!(
-            allowed.events[0].policy_context,
-            Some(json!({
-                "tool_name": "read_file", "reason_code": "allowed_by_policy"
-            }))
-        );
-        assert_eq!(
-            policy_target_context(
-                "restrict_shell_programs",
-                "/usr/bin/curl",
-                false,
-                "shell_program_not_allowed"
-            ),
-            json!({"program": "curl", "reason_code": "shell_program_not_allowed"})
-        );
-
-        let private_attempt = "write_file:/private/customer/secret.txt";
-        let blocked = evaluate_allowlist(
-            &profile,
-            &bindings,
-            "restrict_tools",
-            "allowed",
-            private_attempt,
-            "tool_not_allowed",
-        );
-        assert!(!blocked.allowed);
-        assert_eq!(blocked.events.len(), 1);
-        let event = &blocked.events[0];
-        assert_eq!(event.binding_key.as_deref(), Some("policy.tools"));
-        assert_eq!(event.hook.as_deref(), Some("tool_call"));
-        assert_eq!(event.action.as_deref(), Some("restrict_tools"));
-        assert_eq!(event.event_type, "policy_blocked");
-        assert_eq!(event.decision.as_deref(), Some("block"));
-        assert_eq!(event.error_code.as_deref(), Some("tool_not_allowed"));
-        let payload = serde_json::to_string(&blocked.events).expect("payload");
-        assert!(!payload.contains(private_attempt));
-        assert!(!payload.contains("customer"));
-        assert!(!payload.contains("secret.txt"));
-    }
-
-    #[test]
-    fn decision_and_failure_telemetry_are_independent() {
-        let binding = restriction(
-            "policy.shell",
-            "user_bash",
-            "restrict_shell_programs",
-            &["git"],
-        );
-        let decision_profile = profile_with(vec![binding.clone()], &["policy_decision"]);
-        let decision_bindings = decision_profile.bindings.iter().collect::<Vec<_>>();
-        let blocked = evaluate_allowlist(
-            &decision_profile,
-            &decision_bindings,
-            "restrict_shell_programs",
-            "allowed",
-            "printf",
-            "shell_program_not_allowed",
-        );
-        assert_eq!(blocked.events[0].decision.as_deref(), Some("block"));
-        assert_eq!(blocked.events[0].error_code, None);
-
-        let failure_profile = profile_with(vec![binding], &["failure_code"]);
-        let failure_bindings = failure_profile.bindings.iter().collect::<Vec<_>>();
-        let blocked = evaluate_allowlist(
-            &failure_profile,
-            &failure_bindings,
-            "restrict_shell_programs",
-            "allowed",
-            "printf",
-            "shell_program_not_allowed",
-        );
-        assert_eq!(blocked.events[0].decision, None);
-        assert_eq!(
-            blocked.events[0].error_code.as_deref(),
-            Some("shell_program_not_allowed")
-        );
-        let allowed = evaluate_allowlist(
-            &failure_profile,
-            &failure_bindings,
-            "restrict_shell_programs",
-            "allowed",
-            "git",
-            "shell_program_not_allowed",
-        );
-        assert!(allowed.allowed);
-        assert!(allowed.events.is_empty());
-
-        let silent_profile = profile_with(
-            vec![restriction(
-                "policy.tools",
-                "tool_call",
-                "restrict_tools",
-                &[],
-            )],
-            &[],
-        );
-        let silent_bindings = silent_profile.bindings.iter().collect::<Vec<_>>();
-        let blocked = evaluate_allowlist(
-            &silent_profile,
-            &silent_bindings,
-            "restrict_tools",
-            "allowed",
-            "write_file",
-            "tool_not_allowed",
-        );
-        assert!(!blocked.allowed);
-        assert!(blocked.events.is_empty());
-    }
-
     #[tokio::test]
-    async fn failed_delivery_cannot_change_the_policy_result() {
+    async fn failed_telemetry_delivery_cannot_change_a_recorded_denial() {
         let profile = profile_with(
-            vec![restriction(
-                "policy.tools",
-                "tool_call",
-                "restrict_tools",
-                &[],
-            )],
-            &["policy_decision", "failure_code"],
+            vec![instance("policy.tools", "required")],
+            &["policy_decision"],
         );
-        let bindings = profile.bindings.iter().collect::<Vec<_>>();
-        let evaluation = evaluate_allowlist(
-            &profile,
-            &bindings,
-            "restrict_tools",
-            "allowed",
-            "write_file",
-            "tool_not_allowed",
-        );
-        assert!(!evaluation.allowed);
         let manager =
             EnterpriseManager::at(tempfile::tempdir().expect("tempdir").keep()).expect("manager");
-        let delivery = manager
-            .send_events(
-                &enrollment("not a control-plane URL".into(), &profile),
-                &evaluation.events,
-            )
-            .await;
-        assert!(delivery.is_err());
-        assert!(!evaluation.allowed);
+        let connection = enrollment("not a control-plane URL".into(), &profile);
+        let result = json!({"outcome":"deny","results":[{"instance_id":"policy.tools","status":"evaluated","outcome":"deny","reason_code":"blocked","message":"Local recovery instructions"}]});
+        let events = policy_result_events(
+            &profile,
+            &connection,
+            &json!({"event":"tool_call"}),
+            &result,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision.as_deref(), Some("deny"));
+        assert!(manager.send_events(&connection, &events).await.is_err());
+        assert_eq!(result["outcome"], "deny");
+        assert_eq!(events[0].decision.as_deref(), Some("deny"));
+    }
+    #[test]
+    fn policy_decision_records_are_content_free_for_allow_deny_and_guidance() {
+        let profile = profile_with(
+            vec![instance("policy.tools", "required")],
+            &["policy_decision", "failure_code"],
+        );
+        let connection = enrollment("http://localhost".into(), &profile);
+        let private = "/private/customer/secret-file";
+        let event = json!({"event":"tool_call","tool":"bash","session_id":private,"tool_input":{"command":private},"tool_result":private});
+        for outcome in ["allow", "deny", "guidance"] {
+            let result = json!({"results":[{"instance_id":"policy.tools","status":"evaluated","outcome":outcome,"reason_code":"allowed","message":private}]});
+            let events = policy_result_events(&profile, &connection, &event, &result);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].decision.as_deref(), Some(outcome));
+            assert_eq!(
+                events[0].policy_context.as_ref().expect("context")["definition_digest"],
+                "a".repeat(64)
+            );
+            let payload = serde_json::to_string(&events).expect("wire payload");
+            assert!(!payload.contains(private));
+            assert!(!payload.contains("customer"));
+            assert!(!payload.contains("secret-file"));
+            assert!(!payload.contains("tool_input"));
+            assert!(!payload.contains("tool_result"));
+            assert!(!payload.contains("message"));
+        }
+    }
+    #[test]
+    fn decision_and_failure_telemetry_are_independent_and_ignore_inactive_results() {
+        let event = json!({"event":"tool_call"});
+        let denied = json!({"results":[{"instance_id":"policy.tools","status":"evaluated","outcome":"deny","reason_code":"blocked"}]});
+        let mut profile = profile_with(
+            vec![instance("policy.tools", "required")],
+            &["policy_decision"],
+        );
+        let connection = enrollment("http://localhost".into(), &profile);
+        let events = policy_result_events(&profile, &connection, &event, &denied);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision.as_deref(), Some("deny"));
+        assert!(events[0].error_code.is_none());
+        profile.telemetry = vec!["failure_code".into()];
+        let events = policy_result_events(&profile, &connection, &event, &denied);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].decision.is_none());
+        assert!(events[0].policy_context.is_none());
+        assert_eq!(events[0].error_code.as_deref(), Some("blocked"));
+        let allowed = json!({"results":[{"instance_id":"policy.tools","status":"evaluated","outcome":"allow","reason_code":"allowed"}]});
+        assert!(policy_result_events(&profile, &connection, &event, &allowed).is_empty());
+        profile.telemetry.clear();
+        assert!(policy_result_events(&profile, &connection, &event, &denied).is_empty());
+        profile.telemetry = vec!["policy_decision".into()];
+        let inactive = json!({"results":[{"instance_id":"policy.tools","status":"inactive","outcome":"allow","reason_code":"not_supported"}]});
+        assert!(policy_result_events(&profile, &connection, &event, &inactive).is_empty());
+        let unbounded = json!({"results":[{"instance_id":"policy.tools","status":"failed","outcome":"deny","reason_code":"/private/customer/secret"}]});
+        assert!(policy_result_events(&profile, &connection, &event, &unbounded).is_empty());
     }
 }

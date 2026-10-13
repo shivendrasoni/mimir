@@ -20,6 +20,7 @@ pub mod migration;
 pub mod model;
 pub mod observation;
 pub mod orchestration;
+pub mod policy;
 pub mod provider;
 pub mod refinement;
 pub mod resources;

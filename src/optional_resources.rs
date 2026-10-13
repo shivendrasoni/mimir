@@ -1,9 +1,6 @@
 //! Device-wide personal choices, authenticated separately from the shared profile.
 use crate::{
-    enterprise::{
-        CompiledHarnessProfile, Enforcement, HarnessBinding, ManagedSkill,
-        SignedHarnessProfileEnvelope,
-    },
+    enterprise::{CompiledHarnessProfile, Enforcement, ManagedSkill, SignedHarnessProfileEnvelope},
     error::{MimirError, Result},
     registry::RegistryArtifact,
 };
@@ -175,9 +172,9 @@ fn apply(
                 && !base.contains_key(&item.id)
                 && !profile.skills.iter().any(|skill| skill.id == item.id)
                 && !profile
-                    .bindings
+                    .instances
                     .iter()
-                    .any(|binding| binding.key == item.id)
+                    .any(|instance| instance.id == item.id)
                 && item
                     .supported_clients
                     .as_ref()
@@ -208,22 +205,8 @@ fn apply(
         }
     }
     for item in optional.into_values() {
-        if item.kind == "rule" {
-            let mut binding: HarnessBinding = serde_json::from_str(&item.content)?;
-            if binding.key != item.id
-                || ![
-                    "block",
-                    "restrict_tools",
-                    "restrict_shell_programs",
-                    "restrict_models",
-                ]
-                .contains(&binding.action.as_str())
-            {
-                return Err(invalid());
-            }
-            binding.enforcement = Enforcement::Mandatory;
-            binding.critical = true;
-            profile.bindings.push(binding);
+        if matches!(item.kind.as_str(), "policy" | "rule" | "hook_script") {
+            return Err(invalid());
         }
         if item.kind == "skill" {
             profile.skills.push(ManagedSkill {
@@ -299,7 +282,7 @@ mod tests {
     fn fixture() -> (CompiledHarnessProfile, Value, Ed25519KeyPair) {
         let now = Utc::now();
         let revision = "a".repeat(40);
-        let profile:CompiledHarnessProfile=serde_json::from_value(json!({"schema":3,"environment":crate::working_environment::defaults(),"release_id":uuid::Uuid::new_v4(),"organization_id":uuid::Uuid::new_v4(),"team_id":uuid::Uuid::new_v4(),"project_id":null,"profile_name":"Team","catalog_version":"1","created_at":now,"expires_at":now+chrono::Duration::hours(1),"minimum_mimir_version":"0.0.0","bindings":[],"skills":[],"telemetry":[],"source_revisions":[{"commit_sha":revision}]})).unwrap();
+        let profile:CompiledHarnessProfile=serde_json::from_value(json!({"schema":4,"environment":crate::working_environment::defaults(),"release_id":uuid::Uuid::new_v4(),"organization_id":uuid::Uuid::new_v4(),"team_id":uuid::Uuid::new_v4(),"project_id":null,"profile_name":"Team","created_at":now,"expires_at":now+chrono::Duration::hours(1),"minimum_setup_version":"1.0.0","minimum_runtime_versions":{"mimir":"0.0.0"},"policies":[],"instances":[],"native_constraints":{},"skills":[],"telemetry":[],"source_revisions":[{"commit_sha":revision}]})).unwrap();
         let content = "# Approved guide\nRead the repository before making changes.";
         let manifest = json!({"schema":1,"kind":"betterloop_optional_resources","release_id":profile.release_id,"organization_id":profile.organization_id,"team_id":profile.team_id,"organization_revision":revision,"created_at":now,"expires_at":profile.expires_at,"registry_artifacts":[{"id":"org.guide","version":"1.0.0","kind":"skill","name":"Guide","description":"Reviewed guidance","path":"registry/skills/org.guide/1.0.0/SKILL.md","sha256":format!("{:x}",Sha256::digest(content.as_bytes())),"content":content,"enforcement":"default","source":{"repository":"org/config","commit_sha":revision}}],"mcp_servers":[]});
         let key = Ed25519KeyPair::from_pkcs8(
@@ -333,23 +316,40 @@ mod tests {
     #[test]
     fn choices_preserve_shared_policy_and_revocations_disable_only_optional() {
         let (mut profile, manifest, key) = fixture();
-        profile.bindings.push(HarnessBinding {
-            key: "policy.tools".into(),
-            hook: "tool_call".into(),
-            action: "restrict_tools".into(),
-            catalog_version: "1.0.0".into(),
-            enforcement: Enforcement::Mandatory,
+        profile.instances.push(crate::policy::PolicyInstance {
+            id: "policy.tools".into(),
+            definition: crate::policy::PolicyReference {
+                id: "standard.allowed-tools".into(),
+                version: "1.0.0".into(),
+                sha256: "a".repeat(64),
+            },
+            target_agents: vec!["mimir".into()],
+            requirement: "required".into(),
+            mode: "enforce".into(),
+            on_error: "deny".into(),
             order: 10,
-            critical: true,
             parameters: json!({"allowed":["read_file"]}),
+        });
+        profile
+            .native_constraints
+            .allowed_tools
+            .insert("mimir".into(), vec!["read_file".into()]);
+        let program = "var __betterloopPolicy = {evaluate(){return {outcome:'allow',reason_code:'allowed'};}};";
+        profile.policies.push(crate::policy::PolicyArtifact {
+            manifest: json!({"schema":1,"id":"standard.allowed-tools","version":"1.0.0","sdk_version":"1.0.0","description":"Reviewed tool rule","match":{"events":["tool_call"]},"parameters":{"type":"object","properties":{"allowed":{"type":"array","items":{"type":"string"}}},"required":["allowed"],"additionalProperties":false},"requires":[],"effects":["allow","deny"],"reason_codes":["allowed","blocked"]}),
+            program: program.into(), sha256: format!("{:x}", Sha256::digest(program.as_bytes())), definition_sha256: "a".repeat(64),
         });
         let public = BASE64.encode(key.public_key().as_ref());
         let parsed = verified(&signed(&manifest, &key), &public, &profile).unwrap();
         let result = apply(profile.clone(), parsed, choices("org.guide"), &[]).unwrap();
         assert_eq!(result.skills.len(), 1);
         assert_eq!(
-            result.bindings[0].parameters,
-            profile.bindings[0].parameters
+            result.instances[0].parameters,
+            profile.instances[0].parameters
+        );
+        assert_eq!(
+            result.native_constraints.allowed_tools["mimir"],
+            vec!["read_file"]
         );
         let parsed = verified(&signed(&manifest, &key), &public, &profile).unwrap();
         let revoked = apply(
@@ -363,7 +363,11 @@ mod tests {
         )
         .unwrap();
         assert!(revoked.skills.is_empty());
-        assert_eq!(revoked.bindings.len(), 1);
+        assert_eq!(revoked.instances.len(), 1);
+        assert_eq!(
+            revoked.native_constraints.allowed_tools["mimir"],
+            vec!["read_file"]
+        );
     }
     #[test]
     fn rejects_expiry_required_resources_and_missing_dependencies() {

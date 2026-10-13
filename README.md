@@ -69,6 +69,8 @@ Inside the TUI, `/help` lists commands, `/quit` exits, and typing `@` opens the 
 
 ## Enterprise harness enrollment
 
+**Betterloop is optional.** Mimir's core harness works independently: installation, provider login, CLI/TUI use, tools, sessions, and RLM capabilities never require Betterloop setup or enrollment. Keeping Mimir independent is a P0 product and architecture rule. Enterprise enrollment is an explicit opt-in to organization-managed policies; use `mimir enterprise unenroll` to return to standalone operation.
+
 An administrator can issue a 15-minute, single-use enrollment code from Betterloop. Mimir needs only that code; it never reads the organization's Git configuration repository:
 
 ```bash

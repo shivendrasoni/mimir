@@ -335,7 +335,7 @@ fn failed_policy_result(
 
 /// Evaluates a bounded native event only after explicit enrollment and activation.
 /// Unsupported/unavailable-before-activation policies do not affect the agent.
-pub async fn evaluate(workspace: &Path, event: Value) -> Result<String> {
+pub async fn evaluate(workspace: &Path, mut event: Value) -> Result<String> {
     let Some(profile) = crate::enterprise::policy_release()? else {
         return Ok(String::new());
     };
@@ -407,6 +407,7 @@ pub async fn evaluate(workspace: &Path, event: Value) -> Result<String> {
         return Ok(String::new());
     }
     let request_id = Uuid::new_v4().to_string();
+    event["operation_id"] = json!(request_id);
     let identity = json!({"request_id":request_id,"installation_id":enrollment.installation_id,"organization_id":enrollment.organization_id,
         "team_id":enrollment.team_id,"project_alias":alias,"release_id":profile.release_id,"release_digest":envelope.sha256,
         "event":event["event"],"session_id":event.get("session_id").unwrap_or(&Value::Null)});
@@ -421,7 +422,14 @@ pub async fn evaluate(workspace: &Path, event: Value) -> Result<String> {
     } else if snapshot["runtime_manifest_sha256"] != broker["policy_runtime"]["manifest_sha256"] {
         Err(error("Activated policy runtime changed"))
     } else {
-        invoke(&broker["policy_runtime"], &project, &identity, request).await
+        invoke(
+            &broker["policy_runtime"],
+            &project,
+            &identity,
+            request,
+            &enrollment,
+        )
+        .await
     };
     let result = match result {
         Ok(result) => result,
@@ -497,9 +505,13 @@ async fn invoke(
     project: &Path,
     identity: &Value,
     request: Value,
+    enrollment: &crate::enterprise::Enrollment,
 ) -> Result<Value> {
     let (executable, runner) = verify_installation(descriptor)?;
-    let input = serde_json::to_vec(&json!({"identity":identity,"request":request}))?;
+    let input = serde_json::to_vec(
+        &json!({"identity":identity,"request":request,"native_collector":true,
+        "native_context":{"api_url":enrollment.endpoint,"installation_token":enrollment.installation_token}}),
+    )?;
     if input.len() > 2 * 1024 * 1024
         || serde_json::to_vec(&json!({"event": request["event"], "facts": request["facts"]}))?.len()
             > 1024 * 1024
@@ -515,7 +527,30 @@ async fn invoke(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let result = tokio::time::timeout(Duration::from_millis(2500), async {
+    // Only the trusted broker performs authenticated semantic collection. The
+    // restricted evaluator still has its independent two-second aggregate cap.
+    let semantic = request["policies"].as_array().is_some_and(|policies| {
+        policies.iter().any(|policy| {
+            policy["manifest"]["requires"]
+                .as_array()
+                .is_some_and(|facts| {
+                    [
+                        "semantic.classification",
+                        "ci.checks",
+                        "git.pull_request",
+                        "git.mergeability",
+                        "git.remote",
+                    ]
+                    .iter()
+                    .any(|name| facts.contains(&json!(name)))
+                })
+                && policy["manifest"]["match"]["events"]
+                    .as_array()
+                    .is_some_and(|events| events.contains(&request["event"]["event"]))
+        })
+    });
+    let deadline = if semantic { 8000 } else { 2500 };
+    let result = tokio::time::timeout(Duration::from_millis(deadline), async {
         let mut stdin = child.stdin.take().ok_or_else(invalid)?;
         stdin.write_all(&input).await?;
         stdin.shutdown().await?;

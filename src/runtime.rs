@@ -2608,6 +2608,7 @@ impl AgentRuntime {
             self.persist_message(prompt).await?;
         }
         let mut usage = BudgetUsage::default();
+        let mut completion_attempts = 0_u8;
 
         loop {
             if let Err(error) = usage.check(&self.operational_budget()) {
@@ -2915,6 +2916,18 @@ impl AgentRuntime {
                     active_skill_context = self
                         .skill_context_for_messages(&steering)
                         .map_err(|error| skill_invocation_error(&error))?;
+                    continue;
+                }
+                if self
+                    .managed_completion_requires_retry(
+                        &session_id,
+                        &final_text,
+                        &mut completion_attempts,
+                        &cancellation,
+                        sink,
+                    )
+                    .await?
+                {
                     continue;
                 }
                 sink.emit(RuntimeEvent::TurnCompleted {
@@ -3299,6 +3312,22 @@ impl AgentRuntime {
             .await;
             if let Some(completion) = self.tools.task_completion().await {
                 let text = completion.summary;
+                let gate = self
+                    .managed_completion_requires_retry(
+                        &session_id,
+                        &text,
+                        &mut completion_attempts,
+                        &cancellation,
+                        sink,
+                    )
+                    .await;
+                if gate.is_err() {
+                    self.tools.clear_task_completion().await;
+                }
+                if gate? {
+                    self.tools.clear_task_completion().await;
+                    continue;
+                }
                 sink.emit(RuntimeEvent::Completed { text: text.clone() })
                     .await;
                 self.dispatch_extension_event(
@@ -3334,6 +3363,66 @@ impl AgentRuntime {
                 active_skill_context = self
                     .skill_context_for_messages(&steering)
                     .map_err(|error| skill_invocation_error(&error))?;
+            }
+        }
+    }
+
+    /// A denied prospective completion keeps the same run working, with a
+    /// bounded number of attempts. Actual cancellation never enters remediation.
+    async fn managed_completion_requires_retry(
+        &self,
+        session_id: &str,
+        text: &str,
+        attempts: &mut u8,
+        cancellation: &CancellationToken,
+        sink: &dyn EventSink,
+    ) -> Result<bool> {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let event = serde_json::json!({
+            "event":"before_turn_end", "session_id":session_id,
+            "completion_kind":"normal", "completion_attempt":*attempts,
+            "assistant_message":text.chars().take(64 * 1024).collect::<String>(),
+        });
+        match crate::policy::evaluate(self.tools.workspace_root(), event).await {
+            Ok(guidance) => {
+                if !guidance.is_empty() {
+                    sink.emit(RuntimeEvent::ExtensionUi {
+                        extension: "enterprise_policy".into(),
+                        request: UiRequest::Notify {
+                            level: "info".into(),
+                            message: guidance,
+                        },
+                    })
+                    .await;
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    return Ok(false);
+                }
+                if *attempts >= 3 {
+                    return Err(MimirError::Configuration(
+                        "Completion remains blocked by the reviewed policy after three remediation attempts. Inspect the outstanding checks or explicitly stop the run.".into(),
+                    ));
+                }
+                *attempts += 1;
+                self.persist_message(Message::user(format!(
+                    "[Reviewed completion policy, remediation attempt {attempts}/3] Completion was blocked: {error}. Address the outstanding requirement and then finish again. User cancellation or an explicit stop always ends the run.",
+                ))).await?;
+                sink.emit(RuntimeEvent::ExtensionUi {
+                    extension: "enterprise_policy".into(),
+                    request: UiRequest::Notify {
+                        level: "warning".into(),
+                        message: format!(
+                            "Completion blocked; continuing remediation attempt {attempts}/3."
+                        ),
+                    },
+                })
+                .await;
+                Ok(true)
             }
         }
     }

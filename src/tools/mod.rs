@@ -777,18 +777,24 @@ impl ToolRegistry {
         let failed = result.as_ref().map_or(true, |observation| {
             observation.status == ObservationStatus::Error
         });
-        // Preserve bounded actual result facts locally. Large results are explicitly unavailable.
-        let tool_result = result
-            .as_ref()
-            .ok()
-            .and_then(|observation| serde_json::to_value(observation).ok())
-            .filter(|value| value.to_string().len() <= 256 * 1024);
-        let context = crate::policy::evaluate(self.workspace_root(), serde_json::json!({"event":"tool_result","tool":crate::enterprise::local_bridge_policy_alias(name),"failed":failed,"tool_result":tool_result}))
-        .await
-        .map_err(|error| ToolError::Execution {
-            tool: "registry_hook".into(),
-            message: error.to_string(),
-        })?;
+        // This gate runs before the caller can persist, display, extend or send
+        // the original observation to a provider. Deny returns only a policy
+        // error, withholding both successful output and tool error details.
+        let inspected = match &result {
+            Ok(observation) => serde_json::to_value(observation).ok(),
+            Err(error) => Some(serde_json::json!({"error":error.to_string()})),
+        };
+        let tool_result = inspected.filter(|value| value.to_string().len() <= 256 * 1024);
+        let mut event = serde_json::json!({"event":"tool_result","tool":crate::enterprise::local_bridge_policy_alias(name),"failed":failed,"tool_result":tool_result});
+        if tool_result.is_none() {
+            event["result_unavailable_reason"] = serde_json::json!("result_limit_exceeded");
+        }
+        let context = crate::policy::evaluate(self.workspace_root(), event)
+            .await
+            .map_err(|error| ToolError::Execution {
+                tool: "registry_hook".into(),
+                message: error.to_string(),
+            })?;
         if let Ok(observation) = &mut result
             && !context.is_empty()
         {

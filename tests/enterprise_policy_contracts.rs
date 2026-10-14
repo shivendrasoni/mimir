@@ -409,7 +409,7 @@ fn authenticated_recovery_fixture(
         "organization_id":organization,"team_id":team,"project_alias":alias,
         "release_digest":envelope["sha256"],"envelope":envelope,
         "activation":{"schema":1,"release_id":release,"release_digest":envelope["sha256"],
-            "runtime":{"harness":"mimir","harness_version":"0.28.0","adapter_version":"1.0.0"},
+            "runtime":{"harness":"mimir","harness_version":env!("CARGO_PKG_VERSION"),"adapter_version":"1.0.0"},
             "policies":[{"instance_id":"protected-bash-instance","state":"active","reason_code":"activated"}]}});
     if mutation == Some("scope") {
         snapshot["team_id"] = serde_json::json!(uuid::Uuid::new_v4());
@@ -657,4 +657,275 @@ fn damaged_primary_cache_rejects_untrusted_or_wrong_scope_recovery_snapshots() {
             mutation,
         );
     }
+}
+
+#[cfg(unix)]
+fn boundary_fixture(fixture: &StandaloneFixture, event: &str) {
+    let key = Ed25519KeyPair::from_pkcs8(
+        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("key")
+            .as_ref(),
+    )
+    .expect("key");
+    let organization = uuid::Uuid::new_v4();
+    let team = uuid::Uuid::new_v4();
+    let installation = uuid::Uuid::new_v4();
+    let release = uuid::Uuid::new_v4();
+    let enrollment_fixture = "bli_local_boundary_fixture";
+    let workspace = fixture.workspace.path().canonicalize().expect("workspace");
+    let state = fixture.enterprise.path().canonicalize().expect("state");
+    let alias = format!(
+        "{:x}",
+        Sha256::digest(workspace.to_string_lossy().as_bytes())
+    );
+    let now = chrono::Utc::now();
+    let program = "var __betterloopPolicy={evaluate:()=>({outcome:'deny',reason_code:'blocked'})}";
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema":4,"release_id":release,"organization_id":organization,"team_id":team,"project_id":null,
+        "profile_name":"Boundary fixture","created_at":now,"expires_at":now+chrono::Duration::hours(1),
+        "minimum_setup_version":"1.0.0","minimum_runtime_versions":{"mimir":"0.29.0"},
+        "policies":[{"manifest":{"schema":1,"id":"boundary","version":"1.0.0","sdk_version":"1.0.0",
+            "description":"Boundary fixture","match":{"events":[event]},"parameters":{"type":"object"},
+            "requires":[],"effects":["allow","deny"],"reason_codes":["allowed","blocked"]},
+            "program":program,"sha256":format!("{:x}",Sha256::digest(program)),"definition_sha256":"d".repeat(64)}],
+        "instances":[{"id":"boundary-instance","definition":{"id":"boundary","version":"1.0.0","sha256":"d".repeat(64)},
+            "parameters":{},"target_agents":["mimir"],"requirement":"required","mode":"enforce","on_error":"deny","order":0}],
+        "native_constraints":{},"skills":[],"telemetry":[]
+    })).expect("release");
+    let envelope = serde_json::json!({"schema":2,"payload_base64":BASE64.encode(&payload),"sha256":format!("{:x}",Sha256::digest(&payload)),
+        "key_id":uuid::Uuid::new_v4(),"signature":BASE64.encode(key.sign(&payload).as_ref())});
+    let enrollment = serde_json::json!({"schema":1,"endpoint":"http://127.0.0.1:1","installation_id":installation,
+        "installation_token":enrollment_fixture,"organization_id":organization,"team_id":team,"profile_id":uuid::Uuid::new_v4(),
+        "channel":"stable","signing_public_key_base64":BASE64.encode(key.public_key().as_ref()),"etag":null});
+    let runner = state.join("policy-child.mjs");
+    // Deterministic broker fixture, not a replacement for actual-host QuickJS
+    // conformance: inspect the exact result/completion boundary and bind replies.
+    let script = r#"IFS= read -r input || :
+identity=$(printf '%s' "$input" | /usr/bin/sed -n 's/^{"identity":\({[^}]*}\),.*/\1/p')
+request=$(printf '%s' "$identity" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+release=$(printf '%s' "$identity" | /usr/bin/sed -n 's/.*"release_id":"\([^"]*\)".*/\1/p')
+digest=$(printf '%s' "$identity" | /usr/bin/sed -n 's/.*"release_digest":"\([^"]*\)".*/\1/p')
+outcome=deny
+case "$input" in *'"assistant_message":"verified"'*) outcome=allow ;; esac
+printf '{"identity":%s,"result":{"schema":1,"request_id":"%s","release_id":"%s","release_digest":"%s","outcome":"%s","results":[{"instance_id":"boundary-instance","outcome":"%s","message":"Complete the reviewed checks","reason_code":"blocked","status":"evaluated"}],"guidance":[]}}' "$identity" "$request" "$release" "$digest" "$outcome" "$outcome"
+"#;
+    std::fs::write(&runner, script).expect("runner");
+    let manifest=serde_json::to_vec(&serde_json::json!({"files":[{"path":"policy-child.mjs","sha256":format!("{:x}",Sha256::digest(script))}]})).expect("manifest");
+    std::fs::write(state.join("runtime-manifest.json"), &manifest).expect("manifest");
+    let executable = std::fs::canonicalize("/bin/sh").expect("shell fixture");
+    let descriptor = serde_json::json!({"schema":1,"executable":executable,"runner":runner,"node_version":"22.0.0",
+        "executable_sha256":format!("{:x}",Sha256::digest(std::fs::read(&executable).expect("executable"))),
+        "manifest_sha256":format!("{:x}",Sha256::digest(&manifest))});
+    let mut snapshot = serde_json::json!({"schema":1,"installation_id":installation,"organization_id":organization,"team_id":team,
+        "project_alias":alias,"release_digest":envelope["sha256"],"envelope":envelope,"runtime_manifest_sha256":descriptor["manifest_sha256"],
+        "activation":{"schema":1,"release_id":release,"release_digest":envelope["sha256"],
+            "runtime":{"harness":"mimir","harness_version":env!("CARGO_PKG_VERSION"),"adapter_version":"1.0.0"},
+            "policies":[{"instance_id":"boundary-instance","state":"active","reason_code":"ready"}]}});
+    let bytes = serde_json::to_vec(&snapshot).expect("snapshot");
+    let mut mac = Hmac::<Sha256>::new_from_slice(enrollment_fixture.as_bytes()).expect("HMAC");
+    mac.update(&bytes);
+    snapshot["authentication_input"] = serde_json::json!(BASE64.encode(&bytes));
+    snapshot["authentication"] = serde_json::json!(format!("{:x}", mac.finalize().into_bytes()));
+    let projects = state.join("projects");
+    let activation = projects.join(alias).join("mimir/policy-activation.json");
+    std::fs::create_dir_all(activation.parent().expect("parent")).expect("activation dir");
+    for (file, value) in [
+        (&activation, snapshot),
+        (&state.join("enrollment.json"), enrollment),
+        (&state.join("profile.json"), envelope),
+        (
+            &state.join("device-broker.json"),
+            serde_json::json!({"policy_activation_root":projects,"policy_activation":activation,"policy_runtime":descriptor}),
+        ),
+    ] {
+        std::fs::write(file, serde_json::to_vec(&value).expect("JSON")).expect("fixture file");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn enrolled_result_denial_withholds_original_from_provider_and_history() {
+    if std::env::var_os("MIMIR_BOUNDARY_CHILD").is_some() {
+        use mimir::{
+            model::{Content, Message, ModelResponse, StopReason, ToolCall},
+            provider::FakeProvider,
+            runtime::{AgentRuntime, RuntimeConfig, VecEventSink},
+            session::InMemorySessionStore,
+            tools::{ToolPolicy, ToolRegistry},
+        };
+        use std::sync::Arc;
+        let workspace = std::path::PathBuf::from(
+            std::env::var_os("MIMIR_BOUNDARY_WORKSPACE").expect("workspace"),
+        );
+        let sensitive_fixture = "synthetic-secret-must-never-enter-model";
+        std::fs::write(workspace.join("sensitive.txt"), sensitive_fixture).expect("file");
+        let provider = Arc::new(FakeProvider::new(vec![
+            ModelResponse {
+                message: Message::assistant(
+                    vec![Content::ToolCall(ToolCall {
+                        id: "read-1".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path":"sensitive.txt"}),
+                    })],
+                    StopReason::ToolUse,
+                ),
+                response_id: None,
+            },
+            ModelResponse {
+                message: Message::assistant(
+                    vec![Content::Text {
+                        text: "verified".into(),
+                    }],
+                    StopReason::Stop,
+                ),
+                response_id: None,
+            },
+        ]));
+        let runtime = AgentRuntime::resume(
+            provider.clone(),
+            Arc::new(
+                ToolRegistry::with_default_tools(&workspace, ToolPolicy::default()).expect("tools"),
+            ),
+            Arc::new(InMemorySessionStore::default()),
+            RuntimeConfig::default_for_model("fake-model"),
+        )
+        .await
+        .expect("runtime");
+        assert_eq!(
+            runtime
+                .run("read fixture", &VecEventSink::default())
+                .await
+                .expect("run"),
+            "verified"
+        );
+        assert_eq!(provider.requests().await.len(), 2);
+        for request in provider.requests().await {
+            assert!(!format!("{request:?}").contains(sensitive_fixture));
+        }
+        assert!(!format!("{:?}", runtime.messages_snapshot().await).contains(sensitive_fixture));
+        assert!(
+            format!("{:?}", runtime.messages_snapshot().await)
+                .contains("Complete the reviewed checks")
+        );
+        return;
+    }
+    let fixture = StandaloneFixture::new();
+    boundary_fixture(&fixture, "tool_result");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .env_clear()
+        .env("HOME", fixture.home.path())
+        .env("PATH", fixture.empty_path.path())
+        .env(
+            "MIMIR_ENTERPRISE_STATE_DIR",
+            fixture
+                .enterprise
+                .path()
+                .canonicalize()
+                .expect("canonical state"),
+        )
+        .env("MIMIR_BOUNDARY_CHILD", "1")
+        .env("MIMIR_BOUNDARY_WORKSPACE", fixture.workspace.path())
+        .args([
+            "--exact",
+            "enrolled_result_denial_withholds_original_from_provider_and_history",
+            "--nocapture",
+        ])
+        .output()
+        .expect("child");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn enrolled_completion_denial_remediates_and_bounds_retries() {
+    if std::env::var_os("MIMIR_COMPLETION_BOUNDARY_CHILD").is_some() {
+        use mimir::{
+            model::{Content, Message, ModelResponse, StopReason},
+            provider::FakeProvider,
+            runtime::{AgentRuntime, RuntimeConfig, VecEventSink},
+            session::InMemorySessionStore,
+            tools::{ToolPolicy, ToolRegistry},
+        };
+        use std::sync::Arc;
+        let workspace = std::path::PathBuf::from(
+            std::env::var_os("MIMIR_BOUNDARY_WORKSPACE").expect("workspace"),
+        );
+        for (texts, success, requests) in [
+            (vec!["unchecked", "verified"], true, 2),
+            (vec!["unchecked"; 4], false, 4),
+        ] {
+            let provider = Arc::new(FakeProvider::new(
+                texts
+                    .into_iter()
+                    .map(|text| ModelResponse {
+                        message: Message::assistant(
+                            vec![Content::Text { text: text.into() }],
+                            StopReason::Stop,
+                        ),
+                        response_id: None,
+                    })
+                    .collect(),
+            ));
+            let runtime = AgentRuntime::resume(
+                provider.clone(),
+                Arc::new(
+                    ToolRegistry::with_default_tools(&workspace, ToolPolicy::default())
+                        .expect("tools"),
+                ),
+                Arc::new(InMemorySessionStore::default()),
+                RuntimeConfig::default_for_model("fake-model"),
+            )
+            .await
+            .expect("runtime");
+            let sink = VecEventSink::default();
+            let result = runtime.run("finish fixture", &sink).await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            assert_eq!(provider.requests().await.len(), requests);
+            if success {
+                assert_eq!(result.expect("completed"), "verified");
+            } else {
+                assert!(
+                    !sink.events().await.iter().any(|event| matches!(
+                        event,
+                        mimir::runtime::RuntimeEvent::Completed { .. }
+                    ))
+                );
+            }
+        }
+        return;
+    }
+    let fixture = StandaloneFixture::new();
+    boundary_fixture(&fixture, "before_turn_end");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .env_clear()
+        .env("HOME", fixture.home.path())
+        .env("PATH", fixture.empty_path.path())
+        .env(
+            "MIMIR_ENTERPRISE_STATE_DIR",
+            fixture
+                .enterprise
+                .path()
+                .canonicalize()
+                .expect("canonical state"),
+        )
+        .env("MIMIR_COMPLETION_BOUNDARY_CHILD", "1")
+        .env("MIMIR_BOUNDARY_WORKSPACE", fixture.workspace.path())
+        .args([
+            "--exact",
+            "enrolled_completion_denial_remediates_and_bounds_retries",
+            "--nocapture",
+        ])
+        .output()
+        .expect("child");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

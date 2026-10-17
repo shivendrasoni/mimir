@@ -26,10 +26,27 @@ pub struct WorkingEnvironment {
     pub repository_reporting: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unapproved_repository_behavior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_learning: Option<PrivateLearningSettings>,
     pub workflows: Vec<Value>,
     pub disabled_inherited: Vec<String>,
     pub visibility: Value,
     pub delivery: Value,
+}
+/// Native-adapter settings retained for shared signed-environment compatibility.
+/// Mimir's standalone learning runtime does not consume these settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateLearningSettings {
+    pub enabled: bool,
+    pub reporting: PrivateLearningReporting,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateLearningReporting {
+    Off,
+    Metadata,
+    Summary,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1492,6 +1509,54 @@ pub async fn observe_device_repository(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_private_learning_preserves_legacy_environment_bytes() {
+        let legacy = r#"{"schema":1,"minimum_adapter_version":"0.2.0","minimum_runtime_versions":{},"context":[],"skills":[],"mcp_servers":[],"workflows":[],"disabled_inherited":[],"visibility":{"developer_activity":true,"startup_characters":6000},"delivery":{"deploy":"explicit_authorization","merge":"explicit_authorization","mode":"developer_authorized_pr"}}"#;
+        let environment: WorkingEnvironment = serde_json::from_str(legacy).unwrap();
+        validate(&environment).unwrap();
+        assert!(environment.private_learning.is_none());
+        assert_eq!(serde_json::to_string(&environment).unwrap(), legacy);
+        assert!(defaults().private_learning.is_none());
+    }
+    #[test]
+    fn accepts_typed_private_learning_settings_without_changing_startup_context() {
+        let baseline = defaults();
+        let facts = RepositoryFacts {
+            guidance: vec![],
+            documents: vec![],
+            packages: vec![],
+            fingerprint: String::new(),
+            truncated: false,
+        };
+        let expected_context = startup_context(&baseline, &facts);
+        for enabled in [false, true] {
+            for reporting in ["off", "metadata", "summary"] {
+                let mut value = serde_json::to_value(&baseline).unwrap();
+                value["private_learning"] = json!({"enabled": enabled, "reporting": reporting});
+                value["minimum_runtime_versions"]["mimir"] = json!("0.29.1");
+                let environment: WorkingEnvironment =
+                    serde_json::from_value(value.clone()).unwrap();
+                validate(&environment).unwrap();
+                assert_eq!(serde_json::to_value(&environment).unwrap(), value);
+                assert_eq!(startup_context(&environment, &facts), expected_context);
+            }
+        }
+    }
+    #[test]
+    fn private_learning_rejects_unknown_fields_values_and_incomplete_settings() {
+        for settings in [
+            json!({"enabled": true, "reporting": "all"}),
+            json!({"enabled": true, "reporting": "Summary"}),
+            json!({"enabled": "true", "reporting": "summary"}),
+            json!({"enabled": true, "reporting": "summary", "execute_scripts": true}),
+            json!({"enabled": true}),
+            json!({"reporting": "off"}),
+        ] {
+            let mut value = serde_json::to_value(defaults()).unwrap();
+            value["private_learning"] = settings;
+            assert!(serde_json::from_value::<WorkingEnvironment>(value).is_err());
+        }
+    }
     #[test]
     fn preparation_evidence_cannot_be_relabelled_after_sync() {
         let release = uuid::Uuid::new_v4();
